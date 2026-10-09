@@ -1,0 +1,47 @@
+providers:
+  gemma:
+    type: ollama
+    model: "gemma4:e4b"
+    rate_limit:
+      max_rpm: 120
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 3
+      cooldown_seconds: 30
+
+  openrouter:
+    type: openai_compatible
+    base_url: "https://openrouter.ai/api/v1"
+    model: "google/gemini-2.0-flash-exp:free"
+    api_key_env: "OPENROUTER_API_KEY"
+    rate_limit:
+      max_rpm: 20
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 5
+      cooldown_seconds: 60
+
+  gemini:
+    type: google_genai
+    model: "gemini-2.0-flash"
+    api_key_env: "GOOGLE_API_KEY"
+    rate_limit:
+      max_rpm: 15
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 5
+      cooldown_seconds: 60
+
+task_routing:
+  board_ocr:
+    - gemma
+    - openrouter
+    - gemini
+  structuring:
+    - gemma
+    - openrouter
+    - gemini
+  qa:
+    - gemma
+    - openrouter
+    - gemini

@@ -1,0 +1,15 @@
+output/
+export_output/
+yt_test_v2_export/
+*.egg-info/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.pytest_cache/
+*.sqlite3
+*.db
+*.apkg
+*.wav
+*.bin

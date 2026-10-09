@@ -1,0 +1,11 @@
+version: "3.8"
+
+services:
+  ocr:
+    build:
+      context: .
+      dockerfile: Dockerfile.ocr
+    container_name: lecturelens-ocr
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
