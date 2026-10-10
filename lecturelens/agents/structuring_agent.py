@@ -680,12 +680,18 @@ class StructuringAgent:
         self.is_running = True
         interval = float(self.settings.structuring_interval_seconds)
         last_pass_time = time.monotonic()
+        heartbeat_interval = 2.0
+        last_heartbeat_time = 0.0
         while self.is_running:
+            now = time.monotonic()
+            if (now - last_heartbeat_time) >= heartbeat_interval:
+                self.control.write_heartbeat("live")
+                last_heartbeat_time = now
             if self.control.stop_requested():
                 logger.info("finalize requested, running final structuring pass")
                 await self.run_guarded_pass()
                 return
-            if (time.monotonic() - last_pass_time) >= interval:
+            if (now - last_pass_time) >= interval:
                 await self.run_guarded_pass()
                 last_pass_time = time.monotonic()
             await asyncio.sleep(1.0)

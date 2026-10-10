@@ -230,10 +230,18 @@ async def collect_snapshot(
             elapsed_seconds = 0.0
     entry_count = line_counter.refresh()
     snippet = last_transcript_snippet(session_dir / "timeline.jsonl")
+    notes_lines = 0
+    notes_path = session_dir / "notes.md"
+    if notes_path.exists():
+        try:
+            with open(notes_path, "rb") as file_handle:
+                notes_lines = file_handle.read().count(b"\n")
+        except Exception:
+            notes_lines = 0
 
     summary = Panel(
         f"Session: {session_id}   Elapsed: {format_elapsed(elapsed_seconds)}   "
-        f"Timeline entries: {entry_count}\nLatest: {snippet or '-'}",
+        f"Timeline entries: {entry_count}   Notes lines: {notes_lines}\nLatest: {snippet or '-'}",
         title="LectureLens"
     )
     return Group(summary, build_agents_table(rows), queue_table, build_router_table(router_rows))
