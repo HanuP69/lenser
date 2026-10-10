@@ -471,7 +471,12 @@ class AudioAgent:
         finally:
             self.is_running = False
             await self.transcription_queue.put(None)
-            await transcription_task
+            try:
+                await asyncio.wait_for(transcription_task, timeout=12.0)
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.warning("transcription drain timed out during shutdown")
+                transcription_task.cancel()
+                await asyncio.gather(transcription_task, return_exceptions=True)
             preload_task.cancel()
             await asyncio.gather(preload_task, return_exceptions=True)
             await run_in_thread_pool(source.stop)

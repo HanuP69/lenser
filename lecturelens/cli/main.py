@@ -270,14 +270,13 @@ def run_shutdown(monitor: AgentMonitor, session_dir: Path, planned_agents: list[
     for name in planned_agents:
         if name in CAPTURE_AGENT_NAMES or name == "gateway":
             capture_names.append(name)
-    console.print("[yellow]Stopping capture agents...[/yellow]")
     phases: list[tuple[list[str], str, float]] = [
-        (capture_names, STOP_FLAG_NAME, 20.0),
+        (capture_names, STOP_FLAG_NAME, 25.0),
         (["sync_agent"], SYNC_STOP_FLAG_NAME, 15.0),
         (["structuring_agent"], FINALIZE_FLAG_NAME, 600.0)
     ]
-    console.print("[yellow]Flushing timeline and running final structuring pass...[/yellow]")
-    monitor.run_shutdown_sequence(session_dir, phases)
+    with console.status("[bold cyan]Stopping agents, flushing timeline, and generating final notes with LLM...[/bold cyan]", spinner="dots"):
+        monitor.run_shutdown_sequence(session_dir, phases)
     session_meta.finish_run(session_dir)
     set_flag(session_dir, SESSION_FINISHED_FLAG_NAME)
     console.print("[green]Session stopped. Notes saved.[/green]")
