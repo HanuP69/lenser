@@ -166,7 +166,7 @@ def wrap_model_with_circuit_breaker(
     provider_name: str,
     rate_limiter: RedisRateLimiter,
     circuit_breaker: RedisCircuitBreaker,
-    timeout_seconds: float = 120.0
+    timeout_seconds: Optional[float] = None
 ) -> Any:
     async def invoke_guarded(messages: Any) -> Any:
         try:
@@ -182,7 +182,10 @@ def wrap_model_with_circuit_breaker(
             logger.warning("guard store unavailable for %s: %s", provider_name, guard_error)
 
         try:
-            result = await asyncio.wait_for(model.ainvoke(messages), timeout_seconds)
+            if timeout_seconds is not None and timeout_seconds > 0:
+                result = await asyncio.wait_for(model.ainvoke(messages), timeout_seconds)
+            else:
+                result = await model.ainvoke(messages)
         except asyncio.CancelledError:
             raise
         except Exception as invocation_error:
@@ -211,7 +214,7 @@ def build_router_for_task(
     router_config: dict[str, Any],
     ollama_url: str = "http://localhost:11434",
     llm_mode: str = "local",
-    timeout_seconds: float = 120.0
+    timeout_seconds: Optional[float] = None
 ) -> Any:
     providers_config = router_config.get("providers", {})
     task_routing = router_config.get("task_routing", {})
@@ -257,12 +260,14 @@ def build_router_for_task(
             cooldown_seconds=breaker_info.get("cooldown_seconds", 30)
         )
 
+        provider_timeout = current_provider_config.get("timeout_seconds", timeout_seconds)
+        timeout_val: Optional[float] = float(provider_timeout) if (provider_timeout is not None and float(provider_timeout) > 0) else None
         wrapped = wrap_model_with_circuit_breaker(
             model=base_model,
             provider_name=provider_name,
             rate_limiter=rate_limiter,
             circuit_breaker=circuit_breaker,
-            timeout_seconds=float(current_provider_config.get("timeout_seconds", timeout_seconds))
+            timeout_seconds=timeout_val
         )
         wrapped_models.append(wrapped)
 

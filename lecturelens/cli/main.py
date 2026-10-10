@@ -270,10 +270,10 @@ def run_shutdown(monitor: AgentMonitor, session_dir: Path, planned_agents: list[
     for name in planned_agents:
         if name in CAPTURE_AGENT_NAMES or name == "gateway":
             capture_names.append(name)
-    phases: list[tuple[list[str], str, float]] = [
-        (capture_names, STOP_FLAG_NAME, 25.0),
-        (["sync_agent"], SYNC_STOP_FLAG_NAME, 15.0),
-        (["structuring_agent"], FINALIZE_FLAG_NAME, 600.0)
+    phases: list[tuple[list[str], str, Optional[float]]] = [
+        (capture_names, STOP_FLAG_NAME, None),
+        (["sync_agent"], SYNC_STOP_FLAG_NAME, None),
+        (["structuring_agent"], FINALIZE_FLAG_NAME, None)
     ]
     with console.status("[bold cyan]Stopping agents, flushing timeline, and generating final notes with LLM...[/bold cyan]", spinner="dots"):
         monitor.run_shutdown_sequence(session_dir, phases)
@@ -412,7 +412,7 @@ def start(
 def stop(
     session: Optional[str] = typer.Option(None, "--session"),
     wait: bool = typer.Option(True, "--wait/--no-wait"),
-    timeout_seconds: float = typer.Option(900.0, "--timeout"),
+    timeout_seconds: Optional[float] = typer.Option(None, "--timeout"),
 ) -> None:
     settings = Settings()
     session_id = resolve_session(settings, session)
@@ -422,8 +422,12 @@ def stop(
     console.print(f"Shutdown requested for session {session_id}.")
     if not wait:
         return
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
+    deadline = (
+        time.monotonic() + timeout_seconds
+        if (timeout_seconds is not None and timeout_seconds > 0)
+        else None
+    )
+    while deadline is None or time.monotonic() < deadline:
         if flag_exists(session_dir, SESSION_FINISHED_FLAG_NAME):
             console.print("[green]Session stopped.[/green]")
             display_session_output_summary(session_dir, console)

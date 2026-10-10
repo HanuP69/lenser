@@ -150,9 +150,13 @@ class AgentMonitor:
                 restarted_agents.append(agent_name)
         return restarted_agents
 
-    def wait_for_exit(self, agent_names: list[str], timeout_seconds: float) -> bool:
-        deadline = time.monotonic() + timeout_seconds
-        while time.monotonic() < deadline:
+    def wait_for_exit(self, agent_names: list[str], timeout_seconds: Optional[float] = None) -> bool:
+        deadline = (
+            time.monotonic() + timeout_seconds
+            if (timeout_seconds is not None and timeout_seconds > 0)
+            else None
+        )
+        while deadline is None or time.monotonic() < deadline:
             all_exited = True
             for agent_name in agent_names:
                 process = self.processes.get(agent_name)
@@ -195,7 +199,7 @@ class AgentMonitor:
     def run_shutdown_sequence(
         self,
         session_dir: Path,
-        phases: list[tuple[list[str], str, float]]
+        phases: list[tuple[list[str], str, Optional[float]]]
     ) -> dict[str, bool]:
         self.shutting_down = True
         outcomes: dict[str, bool] = {}
@@ -212,10 +216,10 @@ class AgentMonitor:
                 process = self.processes[agent_name]
                 clean = process.poll() is not None
                 outcomes[agent_name] = clean
-                if not clean:
+                if not clean and (timeout_seconds is not None and timeout_seconds > 0):
                     logger.warning("agent %s ignored stop flag, terminating", agent_name)
                     self.terminate_agent(agent_name)
-            if not exited_cleanly:
+            if not exited_cleanly and (timeout_seconds is not None and timeout_seconds > 0):
                 logger.warning("phase %s timed out", flag_name)
         for agent_name in list(self.processes.keys()):
             self.close_log_handle(agent_name)

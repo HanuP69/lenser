@@ -222,14 +222,11 @@ class ScreenAgent:
         return ""
 
     async def run_vision_fallback(self, png_bytes: bytes) -> str:
-        if self.llm_router is None:
+        if self.llm_router is None or self.control.stop_requested():
             return ""
         message = build_image_message(SLIDE_VISION_PROMPT, png_bytes, "image/png")
         try:
-            response = await asyncio.wait_for(
-                self.llm_router.ainvoke([message]),
-                self.settings.llm_timeout_seconds + 30.0
-            )
+            response = await self.llm_router.ainvoke([message])
         except Exception as error:
             logger.error("slide vision fallback failed: %s", error)
             return ""
@@ -248,9 +245,9 @@ class ScreenAgent:
         extracted_text = ""
         if revisited_number > 0 and revisited_number in self.slide_texts:
             extracted_text = self.slide_texts[revisited_number]
-        else:
+        elif not self.control.stop_requested():
             extracted_text = await self.run_ocr(png_bytes)
-            if len(extracted_text.strip()) == 0:
+            if len(extracted_text.strip()) == 0 and not self.control.stop_requested():
                 extracted_text = await self.run_vision_fallback(png_bytes)
         self.remember_slide(slide_number, difference_hash, small_thumbnail, extracted_text)
 
@@ -294,9 +291,16 @@ class ScreenAgent:
                 await asyncio.sleep(min(10.0, interval * self.consecutive_capture_errors))
                 continue
 
+            if self.control.stop_requested():
+                break
+
             if self.gate.evaluate(frame.thumbnail, time.monotonic()):
+                if self.control.stop_requested():
+                    break
                 try:
                     png_bytes = await run_in_thread_pool(encode_frame_as_png, frame)
+                    if self.control.stop_requested():
+                        break
                     await self.accept_png(png_bytes, frame.thumbnail)
                 except Exception as error:
                     logger.error("slide processing failed: %s", error)

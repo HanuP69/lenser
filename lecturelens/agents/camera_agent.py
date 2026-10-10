@@ -230,14 +230,11 @@ class CameraAgent:
         return fraction >= self.settings.board_change_threshold
 
     async def read_vision_text(self, image_bytes: bytes) -> tuple[str, float, str]:
-        if self.llm_router is None:
+        if self.llm_router is None or self.control.stop_requested():
             return "", 0.0, "none"
         message = build_image_message(BOARD_VISION_PROMPT, image_bytes, "image/jpeg")
         try:
-            response = await asyncio.wait_for(
-                self.llm_router.ainvoke([message]),
-                self.settings.llm_timeout_seconds + 30.0
-            )
+            response = await self.llm_router.ainvoke([message])
         except Exception as error:
             logger.error("board vision call failed: %s", error)
             return "", 0.0, "none"
@@ -267,6 +264,9 @@ class CameraAgent:
         corrected_path = await run_in_thread_pool(
             save_board_image, corrected_bytes, str(self.board_dir), capture_index, "corrected"
         )
+
+        if self.control.stop_requested():
+            return None
 
         text, confidence, provider_name = await self.read_vision_text(corrected_bytes)
         self.last_published_thumbnail = thumbnail
@@ -309,6 +309,9 @@ class CameraAgent:
                     logger.error("camera capture failed (%d): %s", self.consecutive_capture_errors, error)
                 await asyncio.sleep(min(15.0, poll_interval * 2.0 * self.consecutive_capture_errors))
                 continue
+
+            if self.control.stop_requested():
+                break
 
             try:
                 await self.evaluate_frame(frame_bytes)
