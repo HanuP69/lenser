@@ -229,6 +229,13 @@ class TestCliCommands(unittest.TestCase):
         self.assertEqual(environment["LECTURELENS_COURSE_NAME"], "algorithms")
         self.assertEqual(environment["LECTURELENS_MONITOR_INDEX"], "2")
 
+    def test_environment_passes_unorouter_api_key(self) -> None:
+        settings = Settings()
+        with mock.patch.dict(os.environ, {"UNOROUTER_API_KEY": "test_uno_key"}):
+            environment = cli_main.build_agent_environment(settings, "lec1", "system", 1, "hybrid", None)
+            self.assertEqual(environment["UNOROUTER_API_KEY"], "test_uno_key")
+            self.assertEqual(environment["LECTURELENS_UNOROUTER_API_KEY"], "test_uno_key")
+
     def test_module_names(self) -> None:
         self.assertEqual(cli_main.module_for_agent("gateway"), "lecturelens.gateway.server")
         self.assertEqual(cli_main.module_for_agent("audio_agent"), "lecturelens.agents.audio_agent")

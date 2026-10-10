@@ -8,7 +8,12 @@ from lecturelens.core.validation import sanitize_file_stem
 
 
 class Settings(BaseSettings):
-    model_config = {"env_prefix": "LECTURELENS_", "env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {
+        "env_prefix": "LECTURELENS_",
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+        "extra": "ignore"
+    }
 
     redis_url: str = Field(default="redis://localhost:6379")
     ollama_url: str = Field(default="http://localhost:11434")
@@ -84,6 +89,13 @@ class Settings(BaseSettings):
 
     llm_mode: str = Field(default="local")
     llm_timeout_seconds: float = Field(default=120.0)
+
+    primary_provider: Optional[str] = Field(default=None)
+    ollama_model: Optional[str] = Field(default=None)
+    unorouter_model: Optional[str] = Field(default=None)
+    unorouter_api_key: Optional[str] = Field(default=None)
+    openrouter_api_key: Optional[str] = Field(default=None)
+    google_api_key: Optional[str] = Field(default=None)
 
     def get_session_output_dir(self, session_id: str) -> Path:
         session_dir = self.output_dir / session_id

@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+import urllib.error
 from unittest import mock
 
 from rich.console import Console
@@ -63,6 +64,32 @@ class TestInteractiveHelpers(unittest.TestCase):
             models = interactive.fetch_ollama_models("http://localhost:11434")
             self.assertEqual(models, [])
 
+    def test_check_unorouter_health_success(self) -> None:
+        fake_response = mock.MagicMock()
+        fake_response.status = 200
+        fake_response.__enter__.return_value = fake_response
+        with mock.patch("urllib.request.urlopen", return_value=fake_response):
+            success, message = interactive.check_unorouter_health("valid_key_123")
+            self.assertTrue(success)
+            self.assertIn("verified", message.lower())
+
+    def test_check_unorouter_health_unauthorized(self) -> None:
+        error = urllib.error.HTTPError(url="http://test", code=401, msg="Unauthorized", hdrs={}, fp=None)
+        with mock.patch("urllib.request.urlopen", side_effect=error):
+            success, message = interactive.check_unorouter_health("bad_key")
+            self.assertFalse(success)
+            self.assertIn("401", message)
+
+    def test_check_unorouter_health_empty(self) -> None:
+        success, message = interactive.check_unorouter_health("   ")
+        self.assertFalse(success)
+        self.assertIn("empty", message.lower())
+
+    def test_settings_accepts_unorouter_api_key_and_extra_env(self) -> None:
+        with mock.patch.dict(os.environ, {"LECTURELENS_UNOROUTER_API_KEY": "test_env_key", "LECTURELENS_EXTRA_IGNORE_ME": "123"}):
+            settings = Settings()
+            self.assertEqual(settings.unorouter_api_key, "test_env_key")
+
 
 class TestInteractiveFlows(unittest.TestCase):
     def setUp(self) -> None:
@@ -91,14 +118,23 @@ class TestInteractiveFlows(unittest.TestCase):
             with mock.patch.dict(os.environ, {}, clear=True):
                 with mock.patch.object(interactive, "load_env_api_key", return_value=None):
                     with mock.patch.object(interactive, "persist_api_key_to_env") as mock_persist:
-                        with mock.patch("rich.prompt.Prompt.ask", return_value="my_new_uno_key"):
-                            provider, model, llm_mode, primary = interactive.configure_unorouter_flow(self.console)
-                            self.assertEqual(provider, "unorouter")
-                            self.assertEqual(model, "gemma-4-26b:free")
-                            self.assertEqual(llm_mode, "hybrid")
-                            self.assertEqual(primary, "unorouter")
-                            self.assertEqual(os.environ.get("UNOROUTER_API_KEY"), "my_new_uno_key")
-                            mock_persist.assert_called_once_with("my_new_uno_key")
+                        with mock.patch.object(interactive, "check_unorouter_health", return_value=(True, "verified")):
+                            with mock.patch("rich.prompt.Prompt.ask", return_value="my_new_uno_key"):
+                                provider, model, llm_mode, primary = interactive.configure_unorouter_flow(self.console)
+                                self.assertEqual(provider, "unorouter")
+                                self.assertEqual(model, "gemma-4-26b:free")
+                                self.assertEqual(llm_mode, "hybrid")
+                                self.assertEqual(primary, "unorouter")
+                                self.assertEqual(os.environ.get("UNOROUTER_API_KEY"), "my_new_uno_key")
+                                mock_persist.assert_called_once_with("my_new_uno_key")
+
+    def test_configure_unorouter_flow_existing_key_valid(self) -> None:
+        with mock.patch.object(interactive, "load_env_api_key", return_value="existing_uno_key"):
+            with mock.patch.object(interactive, "check_unorouter_health", return_value=(True, "verified")):
+                with mock.patch("rich.prompt.Prompt.ask", return_value="y"):
+                    provider, model, llm_mode, primary = interactive.configure_unorouter_flow(self.console)
+                    self.assertEqual(provider, "unorouter")
+                    self.assertEqual(os.environ.get("UNOROUTER_API_KEY"), "existing_uno_key")
 
     def test_run_interactive_wizard_start_immediately(self) -> None:
         initial = {

@@ -60,21 +60,33 @@ def load_env_api_key(env_path: Path = Path(".env"), var_name: str = "UNOROUTER_A
     if direct_value is not None and len(direct_value.strip()) > 0:
         return direct_value.strip()
 
-    if not env_path.exists():
-        return None
+    lecturelens_value = os.environ.get(f"LECTURELENS_{var_name}")
+    if lecturelens_value is not None and len(lecturelens_value.strip()) > 0:
+        return lecturelens_value.strip()
 
-    try:
-        with open(env_path, "r", encoding="utf-8") as file_handle:
-            for line in file_handle:
-                line = line.strip()
-                if line.startswith(f"{var_name}="):
-                    parts = line.split("=", 1)
-                    if len(parts) == 2:
-                        cleaned = parts[1].strip().strip('"').strip("'")
-                        if len(cleaned) > 0:
-                            return cleaned
-    except Exception:
-        return None
+    target_prefixes = (f"{var_name}=", f"LECTURELENS_{var_name}=")
+    paths_to_check = [env_path]
+    if env_path == Path(".env"):
+        home_path = Path.home() / ".env"
+        if home_path not in paths_to_check:
+            paths_to_check.append(home_path)
+
+    for candidate in paths_to_check:
+        if not candidate.exists():
+            continue
+        try:
+            with open(candidate, "r", encoding="utf-8") as file_handle:
+                for line in file_handle:
+                    stripped = line.strip()
+                    for prefix in target_prefixes:
+                        if stripped.startswith(prefix):
+                            parts = stripped.split("=", 1)
+                            if len(parts) == 2:
+                                cleaned = parts[1].strip().strip('"').strip("'")
+                                if len(cleaned) > 0:
+                                    return cleaned
+        except Exception:
+            continue
     return None
 
 
@@ -101,6 +113,40 @@ def persist_api_key_to_env(key: str, env_path: Path = Path(".env"), var_name: st
             file_handle.writelines(lines)
     except Exception:
         pass
+
+
+def check_unorouter_health(
+    api_key: str,
+    base_url: str = "https://api.unorouter.com/v1",
+    timeout_seconds: float = 6.0
+) -> tuple[bool, str]:
+    cleaned_key = api_key.strip()
+    if len(cleaned_key) == 0:
+        return False, "API key cannot be empty"
+
+    endpoint_url = f"{base_url.rstrip('/')}/models"
+    request = urllib.request.Request(
+        endpoint_url,
+        headers={
+            "Authorization": f"Bearer {cleaned_key}",
+            "User-Agent": "LectureLens"
+        }
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            if response.status == 200:
+                return True, "API key verified successfully (HTTP 200 OK)"
+            return False, f"Unexpected HTTP status {response.status}"
+    except urllib.error.HTTPError as error:
+        if error.code == 401:
+            return False, "Authentication failed (HTTP 401 Unauthorized): Invalid API key"
+        if error.code == 403:
+            return False, "Access forbidden (HTTP 403 Forbidden): Key not permitted"
+        return False, f"HTTP error {error.code}: {error.reason}"
+    except urllib.error.URLError as error:
+        return False, f"Network connection failed: {error.reason}"
+    except Exception as error:
+        return False, f"Health check failed: {error}"
 
 
 def configure_ollama_flow(settings: Settings, console: Console) -> tuple[str, str, str, str]:
@@ -165,18 +211,42 @@ def configure_unorouter_flow(console: Console) -> tuple[str, str, str, str]:
     if existing_key is not None and len(existing_key) > 0:
         masked = mask_api_key(existing_key)
         console.print(f"Existing UnoRouter API key found: [green]{masked}[/green]")
-        reuse = Prompt.ask("Use this existing key?", choices=["y", "n"], default="y")
-        if reuse.lower() == "y":
-            api_key = existing_key
+        console.print("[dim]Verifying API key health with UnoRouter...[/dim]")
+        healthy, health_message = check_unorouter_health(existing_key)
+        if healthy:
+            console.print(f"[green]UnoRouter API health check: {health_message}[/green]")
+            reuse = Prompt.ask("Use this verified key?", choices=["y", "n"], default="y")
+            if reuse.lower() == "y":
+                api_key = existing_key
+        else:
+            console.print(f"[yellow]Health check warning: {health_message}[/yellow]")
+            reuse = Prompt.ask("Re-enter a new key instead?", choices=["y", "n"], default="y")
+            if reuse.lower() == "n":
+                api_key = existing_key
 
-    if len(api_key) == 0:
+    while len(api_key) == 0:
         console.print("[dim]Get your free API key at: https://unorouter.com[/dim]")
-        entered_key = Prompt.ask("Paste your UnoRouter API key", password=True)
-        api_key = entered_key.strip()
-        if len(api_key) > 0:
+        entered_key = Prompt.ask("Paste your UnoRouter API key", password=True).strip()
+        if len(entered_key) == 0:
+            console.print("[yellow]Key cannot be empty.[/yellow]")
+            continue
+        console.print("[dim]Verifying API key health with UnoRouter...[/dim]")
+        healthy, health_message = check_unorouter_health(entered_key)
+        if healthy:
+            console.print(f"[green]UnoRouter API health check: {health_message}[/green]")
+            api_key = entered_key
             persist_api_key_to_env(api_key)
+            break
+        else:
+            console.print(f"[red]Health check failed: {health_message}[/red]")
+            retry = Prompt.ask("Do you want to re-enter?", choices=["y", "n"], default="y")
+            if retry.lower() == "n":
+                api_key = entered_key
+                persist_api_key_to_env(api_key)
+                break
 
     os.environ["UNOROUTER_API_KEY"] = api_key
+    os.environ["LECTURELENS_UNOROUTER_API_KEY"] = api_key
     selected_model = "gemma-4-26b:free"
     console.print(f"[green]UnoRouter active with multimodal vision model: {selected_model}[/green]")
     return "unorouter", selected_model, "hybrid", "unorouter"

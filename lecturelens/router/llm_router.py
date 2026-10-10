@@ -118,6 +118,8 @@ def create_base_chat_model(
         env_var_name = provider_config.get("api_key_env", "OPENROUTER_API_KEY")
         api_key = os.environ.get(env_var_name, "")
         if len(api_key) == 0:
+            api_key = os.environ.get(f"LECTURELENS_{env_var_name}", "")
+        if len(api_key) == 0:
             logger.info("provider %s skipped: %s not set", provider_name, env_var_name)
             return None
         try:
@@ -137,6 +139,8 @@ def create_base_chat_model(
     if provider_type == "google_genai":
         env_var_name = provider_config.get("api_key_env", "GOOGLE_API_KEY")
         api_key = os.environ.get(env_var_name, "")
+        if len(api_key) == 0:
+            api_key = os.environ.get(f"LECTURELENS_{env_var_name}", "")
         if len(api_key) == 0:
             logger.info("provider %s skipped: %s not set", provider_name, env_var_name)
             return None

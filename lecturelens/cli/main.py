@@ -125,6 +125,10 @@ def build_agent_environment(
             environment["LECTURELENS_OLLAMA_MODEL"] = model_name
         elif primary_provider == "unorouter":
             environment["LECTURELENS_UNOROUTER_MODEL"] = model_name
+    unorouter_key = os.environ.get("UNOROUTER_API_KEY") or os.environ.get("LECTURELENS_UNOROUTER_API_KEY")
+    if unorouter_key:
+        environment["UNOROUTER_API_KEY"] = unorouter_key
+        environment["LECTURELENS_UNOROUTER_API_KEY"] = unorouter_key
     return environment
 
 
@@ -364,6 +368,26 @@ def start(
             f"[yellow]Ollama not reachable at {settings.ollama_url}. "
             "Capture continues; structuring will retry when it returns.[/yellow]"
         )
+
+    if primary_provider == "unorouter" or (llm_mode in ("hybrid", "cloud") and primary_provider != "gemma"):
+        from lecturelens.cli.interactive import check_unorouter_health, load_env_api_key
+        unorouter_key = os.environ.get("UNOROUTER_API_KEY") or os.environ.get("LECTURELENS_UNOROUTER_API_KEY")
+        if not unorouter_key:
+            unorouter_key = load_env_api_key()
+            if unorouter_key:
+                os.environ["UNOROUTER_API_KEY"] = unorouter_key
+                os.environ["LECTURELENS_UNOROUTER_API_KEY"] = unorouter_key
+        if unorouter_key:
+            healthy, health_msg = check_unorouter_health(unorouter_key)
+            if healthy:
+                console.print(f"[green]UnoRouter API health check: {health_msg}[/green]")
+            else:
+                if primary_provider == "unorouter" or llm_mode == "cloud":
+                    fail(f"UnoRouter health check failed: {health_msg}. Please check your API key.")
+                else:
+                    console.print(f"[yellow]UnoRouter health check warning: {health_msg}. Local Ollama will be used as fallback.[/yellow]")
+        elif primary_provider == "unorouter":
+            fail("UnoRouter is selected as primary provider, but UNOROUTER_API_KEY is not set.")
 
     settings.create_session_directories(session_id)
     disk_warning = format_low_disk_warning(get_free_disk_bytes(settings.output_dir))
