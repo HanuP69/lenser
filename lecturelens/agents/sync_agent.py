@@ -1,17 +1,47 @@
 import asyncio
 import json
+import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
+
 from lecturelens.config.settings import Settings
+from lecturelens.core.agent_runtime import (
+    AgentControl,
+    RuntimeContext,
+    SYNC_STOP_FLAG_NAME,
+    execute_agent_main,
+    run_standard_agent
+)
 from lecturelens.core.clock import SessionClock
+from lecturelens.core.concurrency import run_in_thread_pool
+from lecturelens.core.fileio import append_text_durably
+from lecturelens.core.logging_setup import get_logger
 from lecturelens.core.redis_bus import RedisBus
 from lecturelens.schemas.events import (
-    TranscriptChunk,
-    SlideCaptured,
     BoardCaptured,
-    TimelineEntry
+    SlideCaptured,
+    TimelineEntry,
+    TranscriptChunk
 )
+
+logger = get_logger("lecturelens.sync_agent")
+
+ANCHOR_SOURCE_TYPES: tuple[str, ...] = ("slide", "board")
+
+
+@dataclass
+class BufferedEntry:
+    entry: TimelineEntry
+    arrival_monotonic: float
+
+
+@dataclass
+class AnchorRecord:
+    timestamp_epoch: float
+    correlation_id: str
+    source_type: str
 
 
 class SyncAgent:
@@ -26,201 +56,276 @@ class SyncAgent:
         self.redis_bus: RedisBus = redis_bus
         self.session_clock: SessionClock = session_clock
         self.session_id: str = session_id
-        self.group_name: str = "group:kuudere"
-        self.consumer_name: str = f"consumer:kuudere:{uuid.uuid4().hex[:8]}"
-
-        self.transcript_stream: str = f"lecturelens:{session_id}:stream:transcript"
-        self.slide_stream: str = f"lecturelens:{session_id}:stream:slide"
-        self.board_stream: str = f"lecturelens:{session_id}:stream:board"
-
-        self.pending_buffer: list[TimelineEntry] = []
-        self.buffer_lock: asyncio.Lock = asyncio.Lock()
         self.is_running: bool = False
+        self.drain_requested: bool = False
 
-        session_dir = self.settings.get_session_output_dir(self.session_id)
-        session_dir.mkdir(parents=True, exist_ok=True)
-        self.timeline_file_path: Path = session_dir / "timeline.jsonl"
+        session_dir = settings.create_session_directories(session_id)
+        self.timeline_path: Path = session_dir / "timeline.jsonl"
+        self.control: AgentControl = AgentControl(session_dir, "sync_agent", SYNC_STOP_FLAG_NAME)
+        self.pending_buffer: list[BufferedEntry] = []
+        self.recent_anchors: list[AnchorRecord] = []
+        self.buffer_lock: asyncio.Lock = asyncio.Lock()
+        self.entries_written: int = 0
 
-    async def handle_transcript_message(self, message_data: dict[str, str]) -> None:
-        chunk = TranscriptChunk.from_redis_dict(message_data)
-        entry = TimelineEntry(
-            session_id=self.session_id,
-            timestamp_epoch=chunk.timestamp_epoch,
+    def build_stream_name(self, source_type: str) -> str:
+        return f"lecturelens:{self.session_id}:stream:{source_type}"
+
+    def transcript_to_entry(self, event: TranscriptChunk) -> TimelineEntry:
+        metadata = {
+            "confidence": event.confidence,
+            "language": event.language,
+            "audio_source": event.audio_source,
+            "start_seconds": event.start_seconds,
+            "end_seconds": event.end_seconds,
+            "raw_audio_path": event.raw_audio_path
+        }
+        return TimelineEntry(
+            session_id=event.session_id,
+            timestamp_epoch=event.timestamp_epoch,
             source_type="transcript",
-            content=chunk.text,
+            content=event.text,
             correlation_id=None,
-            importance_flags=chunk.importance_flags,
-            metadata={
-                "start_seconds": chunk.start_seconds,
-                "end_seconds": chunk.end_seconds,
-                "confidence": chunk.confidence,
-                "language": chunk.language,
-                "audio_source": chunk.audio_source,
-                "speaker_id": chunk.speaker_id,
-                "raw_audio_path": chunk.raw_audio_path
-            }
+            importance_flags=list(event.importance_flags),
+            metadata=metadata
         )
-        async with self.buffer_lock:
-            self.pending_buffer.append(entry)
 
-    async def handle_slide_message(self, message_data: dict[str, str]) -> None:
-        slide = SlideCaptured.from_redis_dict(message_data)
-        entry = TimelineEntry(
-            session_id=self.session_id,
-            timestamp_epoch=slide.timestamp_epoch,
+    def slide_to_entry(self, event: SlideCaptured) -> TimelineEntry:
+        metadata = {
+            "slide_number": event.slide_number,
+            "monitor_index": event.monitor_index,
+            "image_file_path": event.image_file_path,
+            "revisited_slide_number": event.revisited_slide_number
+        }
+        return TimelineEntry(
+            session_id=event.session_id,
+            timestamp_epoch=event.timestamp_epoch,
             source_type="slide",
-            content=slide.extracted_text,
+            content=event.extracted_text,
             correlation_id=None,
             importance_flags=[],
-            metadata={
-                "slide_number": slide.slide_number,
-                "monitor_index": slide.monitor_index,
-                "image_file_path": slide.image_file_path
-            }
+            metadata=metadata
         )
-        async with self.buffer_lock:
-            self.pending_buffer.append(entry)
 
-    async def handle_board_message(self, message_data: dict[str, str]) -> None:
-        board = BoardCaptured.from_redis_dict(message_data)
-        entry = TimelineEntry(
-            session_id=self.session_id,
-            timestamp_epoch=board.timestamp_epoch,
+    def board_to_entry(self, event: BoardCaptured) -> TimelineEntry:
+        metadata = {
+            "confidence": event.confidence,
+            "provider_used": event.provider_used,
+            "image_file_path": event.image_file_path
+        }
+        return TimelineEntry(
+            session_id=event.session_id,
+            timestamp_epoch=event.timestamp_epoch,
             source_type="board",
-            content=board.raw_ocr_text,
+            content=event.raw_ocr_text,
             correlation_id=None,
             importance_flags=[],
-            metadata={
-                "image_file_path": board.image_file_path,
-                "confidence": board.confidence,
-                "provider_used": board.provider_used
-            }
+            metadata=metadata
         )
+
+    def convert_message(self, source_type: str, message_data: dict[str, str]) -> TimelineEntry:
+        if source_type == "transcript":
+            return self.transcript_to_entry(TranscriptChunk.from_redis_dict(message_data))
+        if source_type == "slide":
+            return self.slide_to_entry(SlideCaptured.from_redis_dict(message_data))
+        if source_type == "board":
+            return self.board_to_entry(BoardCaptured.from_redis_dict(message_data))
+        raise ValueError(f"unknown source type {source_type}")
+
+    async def add_entry(self, entry: TimelineEntry) -> None:
         async with self.buffer_lock:
-            self.pending_buffer.append(entry)
+            self.pending_buffer.append(BufferedEntry(entry, time.monotonic()))
 
-    def correlate_and_extract_ready_entries(self, current_time: float) -> list[TimelineEntry]:
-        ready_entries: list[TimelineEntry] = []
-        remaining_entries: list[TimelineEntry] = []
+    async def consume_stream(self, source_type: str) -> None:
+        stream_name = self.build_stream_name(source_type)
 
-        self.pending_buffer.sort(key=lambda entry: entry.timestamp_epoch)
+        async def handle_message(message_data: dict[str, str]) -> None:
+            entry = self.convert_message(source_type, message_data)
+            await self.add_entry(entry)
 
-        for entry in self.pending_buffer:
-            age_seconds = current_time - entry.timestamp_epoch
-            if age_seconds >= self.settings.sync_merge_window_seconds:
-                ready_entries.append(entry)
-            else:
-                remaining_entries.append(entry)
+        await self.redis_bus.consume(
+            stream_name=stream_name,
+            group_name="group:kuudere",
+            consumer_name=f"consumer:kuudere:{source_type}",
+            handler=handle_message,
+            batch_size=self.settings.redis_consumer_batch_size,
+            block_ms=self.settings.redis_consumer_block_ms,
+            should_stop=lambda: self.drain_requested
+        )
 
-        self.pending_buffer = remaining_entries
+    def find_nearest_anchor(self, timestamp_epoch: float, window_seconds: float) -> Optional[AnchorRecord]:
+        best_record: Optional[AnchorRecord] = None
+        best_distance = window_seconds + 1.0
+        for record in self.recent_anchors:
+            distance = abs(record.timestamp_epoch - timestamp_epoch)
+            if distance <= window_seconds and distance < best_distance:
+                best_distance = distance
+                best_record = record
+        return best_record
 
-        for i in range(len(ready_entries)):
-            current = ready_entries[i]
-            if current.correlation_id is not None:
+    def find_cross_type_anchor(
+        self,
+        timestamp_epoch: float,
+        source_type: str,
+        window_seconds: float
+    ) -> Optional[AnchorRecord]:
+        best_record: Optional[AnchorRecord] = None
+        best_distance = window_seconds + 1.0
+        for record in self.recent_anchors:
+            if record.source_type == source_type:
                 continue
-            for j in range(i + 1, len(ready_entries)):
-                other = ready_entries[j]
-                time_difference = abs(current.timestamp_epoch - other.timestamp_epoch)
-                if time_difference <= self.settings.correlation_window_seconds:
-                    if current.source_type != other.source_type:
-                        if current.correlation_id is None:
-                            shared_id = str(uuid.uuid4())
-                            current.correlation_id = shared_id
-                        other.correlation_id = current.correlation_id
+            distance = abs(record.timestamp_epoch - timestamp_epoch)
+            if distance <= window_seconds and distance < best_distance:
+                best_distance = distance
+                best_record = record
+        return best_record
 
-        return ready_entries
+    def prune_anchor_history(self, newest_timestamp: float, window_seconds: float) -> None:
+        horizon = max(60.0, window_seconds * 6.0)
+        kept: list[AnchorRecord] = []
+        for record in self.recent_anchors:
+            if newest_timestamp - record.timestamp_epoch <= horizon:
+                kept.append(record)
+        self.recent_anchors = kept
+
+    def assign_correlation_ids(self, ordered_entries: list[TimelineEntry]) -> None:
+        window_seconds = self.settings.correlation_window_seconds
+        known_ids: set[str] = set()
+        for record in self.recent_anchors:
+            known_ids.add(record.correlation_id)
+
+        for entry in ordered_entries:
+            if entry.source_type not in ANCHOR_SOURCE_TYPES:
+                continue
+            if entry.correlation_id is None:
+                neighbor = self.find_cross_type_anchor(
+                    entry.timestamp_epoch, entry.source_type, window_seconds
+                )
+                if neighbor is not None:
+                    entry.correlation_id = neighbor.correlation_id
+                else:
+                    entry.correlation_id = str(uuid.uuid4())
+            already_recorded = False
+            for record in self.recent_anchors:
+                if (
+                    record.correlation_id == entry.correlation_id
+                    and record.source_type == entry.source_type
+                    and record.timestamp_epoch == entry.timestamp_epoch
+                ):
+                    already_recorded = True
+                    break
+            if not already_recorded:
+                self.recent_anchors.append(
+                    AnchorRecord(entry.timestamp_epoch, entry.correlation_id, entry.source_type)
+                )
+
+        for entry in ordered_entries:
+            if entry.source_type in ANCHOR_SOURCE_TYPES:
+                continue
+            if entry.correlation_id is not None:
+                continue
+            anchor = self.find_nearest_anchor(entry.timestamp_epoch, window_seconds)
+            if anchor is not None:
+                entry.correlation_id = anchor.correlation_id
+
+        if len(ordered_entries) > 0:
+            self.prune_anchor_history(ordered_entries[-1].timestamp_epoch, window_seconds)
+
+    def select_ready_entries(self, now_monotonic: float, force: bool) -> list[BufferedEntry]:
+        ready: list[BufferedEntry] = []
+        merge_window = self.settings.sync_merge_window_seconds
+        for buffered in self.pending_buffer:
+            if force or (now_monotonic - buffered.arrival_monotonic) >= merge_window:
+                ready.append(buffered)
+        ready.sort(key=lambda item: item.entry.timestamp_epoch)
+        return ready
+
+    def remove_flushed_entries(self, flushed: list[BufferedEntry]) -> None:
+        flushed_identities: set[int] = set()
+        for buffered in flushed:
+            flushed_identities.add(id(buffered))
+        remaining: list[BufferedEntry] = []
+        for buffered in self.pending_buffer:
+            if id(buffered) not in flushed_identities:
+                remaining.append(buffered)
+        self.pending_buffer = remaining
+
+    def render_lines(self, entries: list[TimelineEntry]) -> str:
+        lines: list[str] = []
+        for entry in entries:
+            lines.append(json.dumps(entry.model_dump(), ensure_ascii=False))
+        return "\n".join(lines) + "\n"
+
+    async def flush_ready_entries(self, force: bool = False) -> int:
+        async with self.buffer_lock:
+            ready = self.select_ready_entries(time.monotonic(), force)
+            if len(ready) == 0:
+                return 0
+            ordered_entries: list[TimelineEntry] = []
+            for buffered in ready:
+                ordered_entries.append(buffered.entry)
+            self.assign_correlation_ids(ordered_entries)
+            text_block = self.render_lines(ordered_entries)
+            try:
+                await run_in_thread_pool(append_text_durably, self.timeline_path, text_block)
+            except OSError as error:
+                logger.error("timeline write failed, entries kept in buffer: %s", error)
+                return 0
+            self.remove_flushed_entries(ready)
+            self.entries_written += len(ordered_entries)
+            self.control.set_stat("timeline_entries_written", self.entries_written)
+            self.control.set_stat("buffered_entries", len(self.pending_buffer))
+            return len(ordered_entries)
 
     async def flush_loop(self) -> None:
-        while self.is_running:
+        while True:
+            try:
+                await self.flush_ready_entries(force=False)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.error("flush loop error: %s", error)
             await asyncio.sleep(1.0)
-            current_time = self.session_clock.get_timestamp()
 
-            async with self.buffer_lock:
-                ready = self.correlate_and_extract_ready_entries(current_time)
-
-            if len(ready) == 0:
-                continue
-
-            with open(self.timeline_file_path, "a", encoding="utf-8") as file_handle:
-                for entry in ready:
-                    line = json.dumps(entry.to_jsonl_dict(), ensure_ascii=False)
-                    file_handle.write(line + "\n")
+    async def watch_stop_flag(self) -> None:
+        while not self.control.stop_requested():
+            await asyncio.sleep(0.5)
+        self.drain_requested = True
 
     async def run(self) -> None:
         self.is_running = True
+        consumer_tasks: list[asyncio.Task] = []
+        for source_type in ("transcript", "slide", "board"):
+            consumer_tasks.append(asyncio.create_task(self.consume_stream(source_type)))
         flush_task = asyncio.create_task(self.flush_loop())
-
-        transcript_task = asyncio.create_task(
-            self.redis_bus.consume(
-                stream_name=self.transcript_stream,
-                group_name=self.group_name,
-                consumer_name=self.consumer_name,
-                handler=self.handle_transcript_message,
-                batch_size=self.settings.redis_consumer_batch_size,
-                block_ms=self.settings.redis_consumer_block_ms
-            )
-        )
-
-        slide_task = asyncio.create_task(
-            self.redis_bus.consume(
-                stream_name=self.slide_stream,
-                group_name=self.group_name,
-                consumer_name=self.consumer_name,
-                handler=self.handle_slide_message,
-                batch_size=self.settings.redis_consumer_batch_size,
-                block_ms=self.settings.redis_consumer_block_ms
-            )
-        )
-
-        board_task = asyncio.create_task(
-            self.redis_bus.consume(
-                stream_name=self.board_stream,
-                group_name=self.group_name,
-                consumer_name=self.consumer_name,
-                handler=self.handle_board_message,
-                batch_size=self.settings.redis_consumer_batch_size,
-                block_ms=self.settings.redis_consumer_block_ms
-            )
-        )
-
+        stop_watch_task = asyncio.create_task(self.watch_stop_flag())
         try:
-            await asyncio.gather(flush_task, transcript_task, slide_task, board_task)
-        except asyncio.CancelledError:
+            await asyncio.gather(*consumer_tasks)
+        finally:
             self.is_running = False
+            flush_task.cancel()
+            stop_watch_task.cancel()
+            await asyncio.gather(flush_task, stop_watch_task, return_exceptions=True)
+            for task in consumer_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*consumer_tasks, return_exceptions=True)
+            await self.flush_ready_entries(force=True)
 
     def stop(self) -> None:
-        self.is_running = False
+        self.drain_requested = True
 
 
 async def main() -> None:
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--session", default=None)
-    args, _ = parser.parse_known_args()
+    def build_agent(context: RuntimeContext) -> SyncAgent:
+        return SyncAgent(
+            settings=context.settings,
+            redis_bus=context.redis_bus,
+            session_clock=context.session_clock,
+            session_id=context.session_id
+        )
 
-    settings = Settings()
-    if args.session is not None and len(args.session) > 0:
-        settings.session_name = args.session
-
-    session_id = settings.session_name or "default_session"
-    clock_file = settings.get_session_output_dir(session_id) / "clock.json"
-    if clock_file.exists():
-        session_clock = SessionClock.load_from_file(clock_file)
-    else:
-        session_clock = SessionClock()
-
-    redis_bus = RedisBus(settings.redis_url)
-    agent = SyncAgent(
-        settings=settings,
-        redis_bus=redis_bus,
-        session_clock=session_clock,
-        session_id=session_id
-    )
-    try:
-        await agent.run()
-    finally:
-        await redis_bus.close()
+    await run_standard_agent(build_agent)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    execute_agent_main(main)

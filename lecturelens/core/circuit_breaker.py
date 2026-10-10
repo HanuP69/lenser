@@ -1,5 +1,6 @@
 import time
 from typing import Any
+
 import redis.asyncio as redis
 
 
@@ -24,10 +25,8 @@ class RedisRateLimiter:
 
     async def is_allowed(self) -> bool:
         key_name = self.generate_window_key()
+        await self.redis_client.set(key_name, 0, ex=self.window_seconds + 1, nx=True)
         current_count = await self.redis_client.incr(key_name)
-        if current_count == 1:
-            await self.redis_client.expire(key_name, self.window_seconds)
-
         if current_count <= self.max_requests_per_window:
             return True
         return False
@@ -38,6 +37,13 @@ class RedisRateLimiter:
         if value is None:
             return 0
         return int(value)
+
+    async def get_remaining(self) -> int:
+        current_count = await self.get_current_count()
+        remaining = self.max_requests_per_window - current_count
+        if remaining < 0:
+            return 0
+        return remaining
 
 
 class RedisCircuitBreaker:
@@ -65,6 +71,12 @@ class RedisCircuitBreaker:
         if exists is not None:
             return True
         return False
+
+    async def get_failure_count(self) -> int:
+        value = await self.redis_client.get(self.get_failure_key())
+        if value is None:
+            return 0
+        return int(value)
 
     async def record_success(self) -> None:
         failure_key = self.get_failure_key()

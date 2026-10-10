@@ -1,7 +1,11 @@
 providers:
   gemma:
     type: ollama
+    cloud: false
     model: "gemma4:e4b"
+    num_ctx: 8192
+    temperature: 0.2
+    timeout_seconds: 180
     rate_limit:
       max_rpm: 120
       window_seconds: 60
@@ -9,11 +13,27 @@ providers:
       failure_threshold: 3
       cooldown_seconds: 30
 
+  unorouter:
+    type: openai_compatible
+    cloud: true
+    base_url: "https://api.unorouter.com/v1"
+    model: "gemma-4-26b:free"
+    api_key_env: "UNOROUTER_API_KEY"
+    timeout_seconds: 120
+    rate_limit:
+      max_rpm: 20
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 3
+      cooldown_seconds: 60
+
   openrouter:
     type: openai_compatible
+    cloud: true
     base_url: "https://openrouter.ai/api/v1"
-    model: "google/gemini-2.0-flash-exp:free"
+    model: "openrouter/free"
     api_key_env: "OPENROUTER_API_KEY"
+    timeout_seconds: 90
     rate_limit:
       max_rpm: 20
       window_seconds: 60
@@ -23,8 +43,10 @@ providers:
 
   gemini:
     type: google_genai
-    model: "gemini-2.0-flash"
+    cloud: true
+    model: "gemini-3.5-flash"
     api_key_env: "GOOGLE_API_KEY"
+    timeout_seconds: 90
     rate_limit:
       max_rpm: 15
       window_seconds: 60
@@ -34,14 +56,17 @@ providers:
 
 task_routing:
   board_ocr:
+    - unorouter
     - gemma
     - openrouter
     - gemini
   structuring:
+    - unorouter
     - gemma
     - openrouter
     - gemini
   qa:
+    - unorouter
     - gemma
     - openrouter
     - gemini

@@ -37,3 +37,27 @@ class TestImportance(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestImportanceFalsePositives(unittest.TestCase):
+    def test_example_is_not_exam(self) -> None:
+        flags = detect_importance_flags("For example, consider sorting.")
+        self.assertNotIn("exam_relevant", flags)
+        self.assertIn("example", flags)
+
+    def test_latest_is_not_test(self) -> None:
+        self.assertEqual(detect_importance_flags("The latest version is out."), [])
+
+    def test_finally_is_not_final(self) -> None:
+        self.assertEqual(detect_importance_flags("Finally, we are done."), [])
+
+    def test_unimportant_is_not_important(self) -> None:
+        self.assertEqual(detect_importance_flags("That detail is unimportant."), [])
+
+    def test_real_exam_mentions(self) -> None:
+        self.assertIn("exam_relevant", detect_importance_flags("This will be on the exam."))
+        self.assertIn("exam_relevant", detect_importance_flags("There is a quiz on Friday."))
+        self.assertIn("exam_relevant", detect_importance_flags("Midterms are next week."))
+
+    def test_curly_apostrophe_confusion(self) -> None:
+        self.assertIn("confusion", detect_importance_flags("I don\u2019t understand this step."))

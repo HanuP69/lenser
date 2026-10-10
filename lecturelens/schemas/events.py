@@ -1,3 +1,4 @@
+import json
 from typing import Optional
 
 from pydantic import BaseModel, Field
@@ -44,8 +45,8 @@ class TranscriptChunk(BaseModel):
         parsed["end_seconds"] = float(data["end_seconds"])
         parsed["text"] = data["text"]
         parsed["confidence"] = float(data["confidence"])
-        parsed["language"] = data["language"]
-        parsed["audio_source"] = data["audio_source"]
+        parsed["language"] = data.get("language", "") or "en"
+        parsed["audio_source"] = data.get("audio_source", "") or "mic"
 
         speaker_id_value = data.get("speaker_id", "")
         if speaker_id_value == "":
@@ -75,6 +76,7 @@ class SlideCaptured(BaseModel):
     monitor_index: int = Field(default=0)
     image_file_path: str
     extracted_text: str
+    revisited_slide_number: int = Field(default=0)
 
     def to_redis_dict(self) -> dict[str, str]:
         data = self.model_dump()
@@ -96,6 +98,7 @@ class SlideCaptured(BaseModel):
         parsed["monitor_index"] = int(data.get("monitor_index", "0"))
         parsed["image_file_path"] = data["image_file_path"]
         parsed["extracted_text"] = data["extracted_text"]
+        parsed["revisited_slide_number"] = int(data.get("revisited_slide_number", "0") or "0")
         return cls(**parsed)
 
 
@@ -147,7 +150,6 @@ class TimelineEntry(BaseModel):
         return cls(**data)
 
     def to_redis_dict(self) -> dict[str, str]:
-        import json
         result = {}
         result["session_id"] = self.session_id
         result["timestamp_epoch"] = str(self.timestamp_epoch)
@@ -165,7 +167,6 @@ class TimelineEntry(BaseModel):
 
     @classmethod
     def from_redis_dict(cls, data: dict[str, str]) -> "TimelineEntry":
-        import json
         parsed = {}
         parsed["session_id"] = data["session_id"]
         parsed["timestamp_epoch"] = float(data["timestamp_epoch"])

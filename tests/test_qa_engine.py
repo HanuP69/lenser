@@ -1,48 +1,58 @@
+import hashlib
 import json
 import tempfile
 import unittest
 from pathlib import Path
+
+from langchain_core.messages import AIMessage
+
 from lecturelens.knowledge.qa_engine import QAEngine
 
 
 class DummyLLMRouter:
-    async def ainvoke(self, messages: list) -> str:
-        return "QuickSort has an average time complexity of O(n log n)."
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    async def ainvoke(self, messages: list) -> AIMessage:
+        self.prompts.append(str(messages[0].content))
+        return AIMessage(content="QuickSort has an average time complexity of O(n log n). [1]")
+
+
+def fake_vector(text: str) -> list[float]:
+    digest = hashlib.md5(text.encode("utf-8")).digest()
+    vector: list[float] = []
+    for byte in digest:
+        vector.append(float(byte) / 255.0)
+    return vector
 
 
 class TestQAEngine(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.session_dir = Path(self.temp_dir.name)
+        self.embedded_texts: list[str] = []
 
-        timeline_path = self.session_dir / "timeline.jsonl"
-        with open(timeline_path, "w", encoding="utf-8") as file_handle:
-            entry_1 = {
-                "session_id": "test_qa",
-                "timestamp_epoch": 100.0,
-                "source_type": "transcript",
-                "content": "QuickSort is a divide and conquer algorithm with average complexity O(n log n)."
-            }
-            file_handle.write(json.dumps(entry_1) + "\n")
-
-        notes_path = self.session_dir / "notes.md"
-        with open(notes_path, "w", encoding="utf-8") as file_handle:
-            file_handle.write("# Sorting Algorithms\n\nQuickSort partitions around a pivot element.\n")
-
-        self.router = DummyLLMRouter()
-        self.qa_engine = QAEngine(
-            session_dir=self.session_dir,
-            ollama_url="http://localhost:11434",
-            llm_router=self.router
+        entry = {
+            "session_id": "test_qa",
+            "timestamp_epoch": 100.0,
+            "source_type": "transcript",
+            "content": "QuickSort is a divide and conquer algorithm with average complexity O(n log n)."
+        }
+        (self.session_dir / "timeline.jsonl").write_text(json.dumps(entry) + "\n", encoding="utf-8")
+        (self.session_dir / "notes.md").write_text(
+            "# Sorting Algorithms\n\nQuickSort partitions around a pivot element.\n", encoding="utf-8"
         )
+        self.router = DummyLLMRouter()
+        self.engine = QAEngine(self.session_dir, "http://localhost:11434", self.router)
 
-        async def mock_embedding(text: str) -> list[float]:
-            import hashlib
-            hasher = hashlib.md5(text.encode("utf-8")).digest()
-            vector = [float(b) / 255.0 for b in hasher]
-            return vector
+        async def mock_embeddings(texts: list[str]) -> list[list[float]]:
+            self.embedded_texts.extend(texts)
+            vectors: list[list[float]] = []
+            for text in texts:
+                vectors.append(fake_vector(text))
+            return vectors
 
-        self.qa_engine.generate_embedding = mock_embedding
+        self.engine.generate_embeddings = mock_embeddings
 
     def tearDown(self) -> None:
         try:
@@ -50,12 +60,53 @@ class TestQAEngine(unittest.IsolatedAsyncioTestCase):
         except Exception:
             pass
 
-    async def test_build_index_and_ask(self) -> None:
-        count = await self.qa_engine.build_index()
+    async def test_build_index_and_ask_returns_sources(self) -> None:
+        count = await self.engine.build_index()
         self.assertGreaterEqual(count, 2)
-
-        answer = await self.qa_engine.ask("What is the complexity of QuickSort?")
+        answer = await self.engine.ask("What is the complexity of QuickSort?")
         self.assertIn("QuickSort", answer)
+        self.assertIn("Sources:", answer)
+        self.assertIn("notes.md", answer)
+
+    async def test_ask_with_sources_lists_timeline_offsets(self) -> None:
+        answer, references = await self.engine.ask_with_sources("QuickSort complexity")
+        timeline_references = 0
+        for reference in references:
+            if reference.startswith("timeline @"):
+                timeline_references += 1
+        self.assertGreaterEqual(timeline_references, 1)
+        self.assertIn("EXCERPTS", self.router.prompts[0])
+
+    async def test_second_index_does_not_reembed_unchanged_content(self) -> None:
+        await self.engine.build_index()
+        first_count = len(self.embedded_texts)
+        await self.engine.build_index()
+        self.assertEqual(len(self.embedded_texts), first_count)
+
+    async def test_new_timeline_lines_are_embedded_incrementally(self) -> None:
+        await self.engine.build_index()
+        first_count = len(self.embedded_texts)
+        extra = {"timestamp_epoch": 130.0, "source_type": "transcript", "content": "Mergesort is stable."}
+        with open(self.session_dir / "timeline.jsonl", "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(extra) + "\n")
+        await self.engine.build_index()
+        self.assertEqual(len(self.embedded_texts), first_count + 1)
+
+    async def test_changed_notes_replace_stale_chunks(self) -> None:
+        await self.engine.build_index()
+        count_before = self.engine.collection.count()
+        (self.session_dir / "notes.md").write_text("# Heaps\n\nA heap is a tree.\n", encoding="utf-8")
+        await self.engine.build_index()
+        self.assertEqual(self.engine.collection.count(), count_before)
+        stored = self.engine.collection.get(include=[])["ids"]
+        self.assertEqual(len(stored), len(set(stored)))
+
+    async def test_empty_session_gives_clear_message(self) -> None:
+        empty_dir = Path(self.temp_dir.name) / "empty"
+        empty_dir.mkdir()
+        engine = QAEngine(empty_dir, "http://localhost:11434", self.router)
+        answer = await engine.ask("anything")
+        self.assertIn("No indexed lecture content", answer)
 
 
 if __name__ == "__main__":

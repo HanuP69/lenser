@@ -1,54 +1,56 @@
-import random
+import html
+import zlib
 from pathlib import Path
 from typing import Any
+
 import genanki
 
-
-ANKI_MODEL_ID = 1607392319
-ANKI_DECK_ID_BASE = 2059400110
+MODEL_ID = 1607392319
 
 
-def get_default_flashcard_model() -> genanki.Model:
-    model = genanki.Model(
-        ANKI_MODEL_ID,
-        "LectureLens Basic Flashcard",
-        fields=[
-            {"name": "Question"},
-            {"name": "Answer"}
-        ],
-        templates=[
-            {
-                "name": "Card 1",
-                "qfmt": "<div style='font-family: Arial; font-size: 20px; text-align: center; color: #2D3748;'>{{Question}}</div>",
-                "afmt": "<div style='font-family: Arial; font-size: 20px; text-align: center; color: #2D3748;'>{{FrontSide}}<hr id='answer'><div style='color: #2B6CB0; font-weight: bold;'>{{Answer}}</div></div>"
-            }
-        ],
-        css=".card { font-family: arial; font-size: 20px; text-align: center; color: black; background-color: white; }"
-    )
-    return model
+def compute_stable_deck_id(deck_name: str) -> int:
+    checksum = zlib.crc32(deck_name.encode("utf-8"))
+    return (1 << 30) + (checksum % (1 << 30))
 
 
 def create_anki_deck(
     deck_name: str,
-    flashcards: list[dict[str, str]],
+    flashcards: list[dict[str, Any]],
     output_file_path: Path
-) -> None:
-    deck_id = ANKI_DECK_ID_BASE + (hash(deck_name) % 1000000)
-    deck = genanki.Deck(deck_id, deck_name)
-    model = get_default_flashcard_model()
+) -> int:
+    model = genanki.Model(
+        MODEL_ID,
+        "LectureLens Basic",
+        fields=[{"name": "Question"}, {"name": "Answer"}],
+        templates=[
+            {
+                "name": "Card 1",
+                "qfmt": "{{Question}}",
+                "afmt": "{{FrontSide}}<hr id=\"answer\">{{Answer}}"
+            }
+        ]
+    )
+    deck = genanki.Deck(compute_stable_deck_id(deck_name), deck_name)
 
-    for card in flashcards:
-        question = card.get("question", "").strip()
-        answer = card.get("answer", "").strip()
+    added_count = 0
+    seen_questions: set[str] = set()
+    for flashcard in flashcards:
+        question = str(flashcard.get("question", "")).strip()
+        answer = str(flashcard.get("answer", "")).strip()
         if len(question) == 0 or len(answer) == 0:
             continue
-
+        if question in seen_questions:
+            continue
+        seen_questions.add(question)
         note = genanki.Note(
             model=model,
-            fields=[question, answer]
+            fields=[html.escape(question), html.escape(answer)],
+            guid=genanki.guid_for(question)
         )
         deck.add_note(note)
+        added_count += 1
 
-    package = genanki.Package(deck)
-    output_file_path.parent.mkdir(parents=True, exist_ok=True)
-    package.write_to_file(str(output_file_path))
+    output_path = Path(output_file_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    genanki.Package(deck).write_to_file(str(output_path))
+    return added_count

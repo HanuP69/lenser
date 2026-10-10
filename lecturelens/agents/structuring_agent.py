@@ -1,15 +1,35 @@
 import asyncio
 import json
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
-from typing_extensions import TypedDict
+
 from langchain_core.messages import HumanMessage
-from langgraph.graph import StateGraph, START, END
+from langgraph.graph import END, START, StateGraph
+from typing_extensions import TypedDict
+
 from lecturelens.config.settings import Settings
-from lecturelens.core.redis_bus import RedisBus
+from lecturelens.core.agent_runtime import (
+    AgentControl,
+    FINALIZE_FLAG_NAME,
+    RuntimeContext,
+    execute_agent_main,
+    run_standard_agent
+)
+from lecturelens.core.fileio import atomic_write_text
+from lecturelens.core.logging_setup import get_logger
 from lecturelens.exports.anki_exporter import create_anki_deck
 from lecturelens.knowledge.concept_graph import ConceptGraph
-from lecturelens.router.llm_router import build_router_for_task, load_router_config
+from lecturelens.router.messages import response_to_text
+
+logger = get_logger("lecturelens.structuring_agent")
+
+REVISIT_TEXT_LIMIT = 200
+FLAG_EXCERPT_LIMIT = 160
+MAX_FLAG_EXCERPTS = 3
+OVERLAP_WINDOW_SECONDS = 20.0
+MAX_OVERLAP_ITEMS = 15
 
 
 class StructuringState(TypedDict):
@@ -21,94 +41,199 @@ class StructuringState(TypedDict):
     action_items: list[str]
     flashcards: list[dict[str, str]]
     importance_flags: list[str]
+    overlap_entries: list[dict[str, Any]]
+
+
+def extract_overlap_entries(
+    entries: list[dict[str, Any]],
+    window_seconds: float = OVERLAP_WINDOW_SECONDS
+) -> list[dict[str, Any]]:
+    if len(entries) == 0:
+        return []
+    max_timestamp = 0.0
+    for entry in entries:
+        ts = float(entry.get("timestamp_epoch", 0.0))
+        if ts > max_timestamp:
+            max_timestamp = ts
+
+    cutoff = max_timestamp - window_seconds
+    overlap: list[dict[str, Any]] = []
+    for entry in entries:
+        ts = float(entry.get("timestamp_epoch", 0.0))
+        if ts >= cutoff:
+            overlap.append(entry)
+    if len(overlap) > MAX_OVERLAP_ITEMS:
+        overlap = overlap[-MAX_OVERLAP_ITEMS:]
+    return overlap
+
+
+@dataclass
+class SliceBatch:
+    entries: list[dict[str, Any]]
+    end_offset: int
+
+
+def extract_json_payload(raw_output: str) -> Any:
+    clean_json = raw_output.strip()
+    if "```json" in clean_json:
+        clean_json = clean_json.split("```json")[1].split("```")[0].strip()
+    elif "```" in clean_json:
+        clean_json = clean_json.split("```")[1].split("```")[0].strip()
+    try:
+        return json.loads(clean_json)
+    except ValueError:
+        return None
+
+
+def truncate_text(text: str, limit: int) -> str:
+    flattened = " ".join(text.split())
+    if len(flattened) <= limit:
+        return flattened
+    return flattened[:limit].rstrip() + "..."
+
+
+def format_entry_line(item: dict[str, Any]) -> str:
+    source = str(item.get("source_type", "unknown")).upper()
+    text = str(item.get("content", "")).strip()
+    metadata = item.get("metadata", {}) or {}
+    if len(text) == 0:
+        return ""
+    revisited_number = int(metadata.get("revisited_slide_number", 0) or 0)
+    if source == "SLIDE" and revisited_number > 0:
+        text = f"(returned to earlier slide {revisited_number}) " + truncate_text(text, REVISIT_TEXT_LIMIT)
+    flags = item.get("importance_flags", []) or []
+    flag_text = ""
+    if len(flags) > 0:
+        flag_text = "[" + ",".join(flags) + "]"
+    return f"[{source}]{flag_text} {text}"
+
+
+def split_entries_into_batches(
+    records: list[tuple[Optional[dict[str, Any]], int]],
+    max_characters: int,
+    final_offset: int
+) -> list[SliceBatch]:
+    batches: list[SliceBatch] = []
+    current_entries: list[dict[str, Any]] = []
+    current_characters = 0
+    current_end_offset = 0
+    for entry, end_offset in records:
+        if entry is None:
+            current_end_offset = end_offset
+            continue
+        entry_characters = len(str(entry.get("content", ""))) + 40
+        if len(current_entries) > 0 and (current_characters + entry_characters) > max_characters:
+            batches.append(SliceBatch(entries=current_entries, end_offset=current_end_offset))
+            current_entries = []
+            current_characters = 0
+        current_entries.append(entry)
+        current_characters += entry_characters
+        current_end_offset = end_offset
+    if len(current_entries) > 0:
+        batches.append(SliceBatch(entries=current_entries, end_offset=final_offset))
+    elif len(batches) > 0:
+        batches[-1].end_offset = final_offset
+    return batches
 
 
 def create_structuring_graph(llm_router: Any) -> Any:
+    async def call_llm(prompt: str) -> str:
+        message = HumanMessage(content=prompt)
+        response = await llm_router.ainvoke([message])
+        return response_to_text(response)
+
     async def group_correlated_events_node(state: StructuringState) -> dict[str, Any]:
         slice_items = state.get("timeline_slice", [])
         groups_map: dict[str, list[dict[str, Any]]] = {}
-        ungrouped_items: list[dict[str, Any]] = []
+        group_order: list[str] = []
+        aggregated_groups: list[dict[str, Any]] = []
 
         for item in slice_items:
             correlation_id = item.get("correlation_id")
             if correlation_id is not None and len(correlation_id) > 0:
                 if correlation_id not in groups_map:
                     groups_map[correlation_id] = []
+                    group_order.append(correlation_id)
+                    aggregated_groups.append({"correlation_id": correlation_id, "items": groups_map[correlation_id]})
                 groups_map[correlation_id].append(item)
             else:
-                ungrouped_items.append(item)
-
-        aggregated_groups: list[dict[str, Any]] = []
-        for corr_id, group_elements in groups_map.items():
-            aggregated_groups.append({
-                "correlation_id": corr_id,
-                "items": group_elements
-            })
-
-        for single_item in ungrouped_items:
-            aggregated_groups.append({
-                "correlation_id": None,
-                "items": [single_item]
-            })
+                aggregated_groups.append({"correlation_id": None, "items": [item]})
 
         all_flags: list[str] = []
         for item in slice_items:
-            flags = item.get("importance_flags", [])
-            for flag in flags:
+            for flag in item.get("importance_flags", []) or []:
                 if flag not in all_flags:
                     all_flags.append(flag)
 
-        return {
-            "correlated_groups": aggregated_groups,
-            "importance_flags": all_flags
-        }
+        return {"correlated_groups": aggregated_groups, "importance_flags": all_flags}
 
     async def summarize_slice_node(state: StructuringState) -> dict[str, Any]:
         running_context = state.get("running_context", "")
         groups = state.get("correlated_groups", [])
+        overlap_items = state.get("overlap_entries", [])
+
+        overlap_lines: list[str] = []
+        for item in overlap_items:
+            line = format_entry_line(item)
+            if len(line) > 0:
+                overlap_lines.append(line)
+        overlap_text = "\n".join(overlap_lines)
 
         content_lines: list[str] = []
         for group in groups:
-            items = group.get("items", [])
             group_texts: list[str] = []
-            for item in items:
-                source = item.get("source_type", "unknown").upper()
-                text = item.get("content", "").strip()
-                if len(text) > 0:
-                    group_texts.append(f"[{source}] {text}")
+            for item in group.get("items", []):
+                line = format_entry_line(item)
+                if len(line) > 0:
+                    group_texts.append(line)
             if len(group_texts) > 0:
-                combined_group_text = " | ".join(group_texts)
-                content_lines.append(combined_group_text)
+                content_lines.append(" | ".join(group_texts))
 
         new_timeline_text = "\n".join(content_lines)
         if len(new_timeline_text.strip()) == 0:
             return {"summary": ""}
 
+        overlap_block = ""
+        if len(overlap_text.strip()) > 0:
+            overlap_block = f"""
+PREVIOUS OVERLAP BUFFER (tail of previous slice, already recorded):
+{overlap_text}
+(Note: Use this overlap only to complete cut-off thoughts and maintain continuity. Do not duplicate notes for content in this overlap.)
+"""
+
         prompt = f"""
 You are an expert academic note taker.
 PREVIOUS LECTURE CONTEXT:
 {running_context}
-
-NEW LECTURE TIMELINE SLICE (transcript, slide OCR, board captures):
+{overlap_block}
+NEW LECTURE TIMELINE SLICE (transcript, slide OCR, board captures; lines tagged with importance flags):
 {new_timeline_text}
 
 Generate clear, structured, cohesive markdown notes for this slice.
 Incorporate definitions, key formulas, and explanations.
+Write content from lines flagged exam_relevant in bold.
 Maintain continuous narrative flow from the previous lecture context.
 Do not invent facts not present in the content.
 """
-        message = HumanMessage(content=prompt)
-        response = await llm_router.ainvoke([message])
-        summary_content = getattr(response, "content", str(response))
-        return {"summary": str(summary_content).strip()}
+        summary_text = await call_llm(prompt)
+        return {"summary": summary_text}
 
     async def extract_definitions_node(state: StructuringState) -> dict[str, Any]:
         summary_text = state.get("summary", "")
         if len(summary_text) == 0:
             return {"definitions": []}
 
+        definition_lines: list[str] = []
+        for item in state.get("timeline_slice", []):
+            if "definition" in (item.get("importance_flags", []) or []):
+                definition_lines.append(truncate_text(str(item.get("content", "")), 300))
+        priority_text = "\n".join(definition_lines)
+
         prompt = f"""
 From the following lecture note summary, extract all key technical terms and their definitions.
+Prioritize terms from these spoken lines flagged as definitions:
+{priority_text}
+
 SUMMARY:
 {summary_text}
 
@@ -117,29 +242,16 @@ Respond strictly in valid JSON format as a list of objects with 'term' and 'defi
   {{"term": "term name", "definition": "detailed definition"}}
 ]
 """
-        message = HumanMessage(content=prompt)
-        response = await llm_router.ainvoke([message])
-        raw_output = getattr(response, "content", str(response)).strip()
-
-        clean_json = raw_output
-        if "```json" in clean_json:
-            clean_json = clean_json.split("```json")[1].split("```")[0].strip()
-        elif "```" in clean_json:
-            clean_json = clean_json.split("```")[1].split("```")[0].strip()
-
+        raw_output = await call_llm(prompt)
+        parsed = extract_json_payload(raw_output)
         definitions_list: list[dict[str, str]] = []
-        try:
-            parsed = json.loads(clean_json)
-            if isinstance(parsed, list):
-                for item in parsed:
-                    if isinstance(item, dict) and "term" in item and "definition" in item:
-                        definitions_list.append({
-                            "term": str(item["term"]),
-                            "definition": str(item["definition"])
-                        })
-        except Exception:
-            definitions_list = []
-
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, dict) and "term" in item and "definition" in item:
+                    definitions_list.append({
+                        "term": str(item["term"]),
+                        "definition": str(item["definition"])
+                    })
         return {"definitions": definitions_list}
 
     async def extract_action_items_node(state: StructuringState) -> dict[str, Any]:
@@ -156,41 +268,38 @@ Respond strictly in valid JSON format as a list of strings:
 ["action item 1", "action item 2"]
 If none, return [].
 """
-        message = HumanMessage(content=prompt)
-        response = await llm_router.ainvoke([message])
-        raw_output = getattr(response, "content", str(response)).strip()
-
-        clean_json = raw_output
-        if "```json" in clean_json:
-            clean_json = clean_json.split("```json")[1].split("```")[0].strip()
-        elif "```" in clean_json:
-            clean_json = clean_json.split("```")[1].split("```")[0].strip()
-
+        raw_output = await call_llm(prompt)
+        parsed = extract_json_payload(raw_output)
         action_items: list[str] = []
-        try:
-            parsed = json.loads(clean_json)
-            if isinstance(parsed, list):
-                for item in parsed:
-                    action_items.append(str(item))
-        except Exception:
-            action_items = []
-
+        if isinstance(parsed, list):
+            for item in parsed:
+                action_items.append(str(item))
         return {"action_items": action_items}
 
     async def generate_flashcards_node(state: StructuringState) -> dict[str, Any]:
         definitions = state.get("definitions", [])
         summary_text = state.get("summary", "")
+        flags = state.get("importance_flags", [])
         flashcards: list[dict[str, str]] = []
 
-        for d in definitions:
+        for definition_item in definitions:
             flashcards.append({
-                "question": f"What is the definition of {d['term']}?",
-                "answer": d["definition"]
+                "question": f"What is the definition of {definition_item['term']}?",
+                "answer": definition_item["definition"]
             })
 
-        if len(summary_text) > 0 and len(definitions) == 0:
+        needs_generated_cards = len(definitions) == 0 or "exam_relevant" in flags
+        if len(summary_text) > 0 and needs_generated_cards:
+            exam_lines: list[str] = []
+            for item in state.get("timeline_slice", []):
+                if "exam_relevant" in (item.get("importance_flags", []) or []):
+                    exam_lines.append(truncate_text(str(item.get("content", "")), 300))
+            exam_text = "\n".join(exam_lines)
             prompt = f"""
 Generate 2-3 high-yield study flashcards based on this lecture summary.
+Focus on points the lecturer flagged as exam relevant:
+{exam_text}
+
 SUMMARY:
 {summary_text}
 
@@ -199,28 +308,15 @@ Respond strictly in valid JSON format as a list of objects with 'question' and '
   {{"question": "...", "answer": "..."}}
 ]
 """
-            message = HumanMessage(content=prompt)
-            response = await llm_router.ainvoke([message])
-            raw_output = getattr(response, "content", str(response)).strip()
-
-            clean_json = raw_output
-            if "```json" in clean_json:
-                clean_json = clean_json.split("```json")[1].split("```")[0].strip()
-            elif "```" in clean_json:
-                clean_json = clean_json.split("```")[1].split("```")[0].strip()
-
-            try:
-                parsed = json.loads(clean_json)
-                if isinstance(parsed, list):
-                    for item in parsed:
-                        if isinstance(item, dict) and "question" in item and "answer" in item:
-                            flashcards.append({
-                                "question": str(item["question"]),
-                                "answer": str(item["answer"])
-                            })
-            except Exception:
-                pass
-
+            raw_output = await call_llm(prompt)
+            parsed = extract_json_payload(raw_output)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, dict) and "question" in item and "answer" in item:
+                        flashcards.append({
+                            "question": str(item["question"]),
+                            "answer": str(item["answer"])
+                        })
         return {"flashcards": flashcards}
 
     async def update_running_context_node(state: StructuringState) -> dict[str, Any]:
@@ -230,38 +326,34 @@ Respond strictly in valid JSON format as a list of objects with 'question' and '
             return {"running_context": previous_context}
 
         prompt = f"""
-Compress the following cumulative lecture summary so that it maintains all critical concepts, theories, and progression in under 400 words.
-PREVIOUS CONTEXT:
+Compress the following lecture notes into a dense running context of at most 300 words.
+Keep key topics, definitions, and the current thread of the lecture.
+
+EARLIER CONTEXT:
 {previous_context}
 
-LATEST NOTES ADDITION:
+NEW NOTES:
 {summary_text}
-
-Output only the concise, cumulative context summary:
 """
-        message = HumanMessage(content=prompt)
-        response = await llm_router.ainvoke([message])
-        updated_context = getattr(response, "content", str(response))
-        return {"running_context": str(updated_context).strip()}
+        compressed = await call_llm(prompt)
+        return {"running_context": compressed}
 
-    workflow = StateGraph(StructuringState)
-    workflow.add_node("group_correlated_events", group_correlated_events_node)
-    workflow.add_node("summarize_slice", summarize_slice_node)
-    workflow.add_node("extract_definitions", extract_definitions_node)
-    workflow.add_node("extract_action_items", extract_action_items_node)
-    workflow.add_node("generate_flashcards", generate_flashcards_node)
-    workflow.add_node("update_running_context", update_running_context_node)
+    graph_builder = StateGraph(StructuringState)
+    graph_builder.add_node("group_correlated_events", group_correlated_events_node)
+    graph_builder.add_node("summarize_slice", summarize_slice_node)
+    graph_builder.add_node("extract_definitions", extract_definitions_node)
+    graph_builder.add_node("extract_action_items", extract_action_items_node)
+    graph_builder.add_node("generate_flashcards", generate_flashcards_node)
+    graph_builder.add_node("update_running_context", update_running_context_node)
 
-    workflow.add_edge(START, "group_correlated_events")
-    workflow.add_edge("group_correlated_events", "summarize_slice")
-    workflow.add_edge("summarize_slice", "extract_definitions")
-    workflow.add_edge("extract_definitions", "extract_action_items")
-    workflow.add_edge("extract_action_items", "generate_flashcards")
-    workflow.add_edge("generate_flashcards", "update_running_context")
-    workflow.add_edge("update_running_context", END)
-
-    compiled_graph = workflow.compile()
-    return compiled_graph
+    graph_builder.add_edge(START, "group_correlated_events")
+    graph_builder.add_edge("group_correlated_events", "summarize_slice")
+    graph_builder.add_edge("summarize_slice", "extract_definitions")
+    graph_builder.add_edge("extract_definitions", "extract_action_items")
+    graph_builder.add_edge("extract_action_items", "generate_flashcards")
+    graph_builder.add_edge("generate_flashcards", "update_running_context")
+    graph_builder.add_edge("update_running_context", END)
+    return graph_builder.compile()
 
 
 class StructuringAgent:
@@ -269,171 +361,346 @@ class StructuringAgent:
         self,
         settings: Settings,
         session_id: str,
-        llm_router: Any
+        llm_router: Any,
+        redis_bus: Any = None
     ) -> None:
         self.settings: Settings = settings
         self.session_id: str = session_id
         self.llm_router: Any = llm_router
-        self.compiled_graph: Any = create_structuring_graph(llm_router)
-
-        session_dir = self.settings.get_session_output_dir(self.session_id)
-        session_dir.mkdir(parents=True, exist_ok=True)
-
-        self.timeline_file_path: Path = session_dir / "timeline.jsonl"
-        self.notes_file_path: Path = session_dir / "notes.md"
-        self.context_file_path: Path = session_dir / "context.json"
-        self.flashcards_file_path: Path = session_dir / "flashcards.apkg"
-        self.concepts_db_path: Path = session_dir / "concepts.db"
-
-        self.concept_graph: ConceptGraph = ConceptGraph(self.concepts_db_path)
-        self.processed_line_offset: int = 0
-        self.accumulated_flashcards: list[dict[str, str]] = []
+        self.redis_bus: Any = redis_bus
         self.is_running: bool = False
 
-    def load_running_context(self) -> str:
-        if self.context_file_path.exists():
+        session_dir = settings.create_session_directories(session_id)
+        self.session_dir: Path = session_dir
+        self.timeline_path: Path = session_dir / "timeline.jsonl"
+        self.notes_path: Path = session_dir / "notes.md"
+        self.context_path: Path = session_dir / "context.json"
+        self.flashcards_path: Path = session_dir / "flashcards.jsonl"
+        self.anki_path: Path = session_dir / "flashcards.apkg"
+        self.control: AgentControl = AgentControl(session_dir, "structuring_agent", FINALIZE_FLAG_NAME)
+
+        self.concept_graph: ConceptGraph = ConceptGraph(session_dir / "concepts.db")
+        self.course_graph: ConceptGraph = ConceptGraph(
+            settings.get_course_database_path(settings.course_name)
+        )
+        self.graph: Any = create_structuring_graph(llm_router)
+        self.consecutive_failures: int = 0
+        initial_state_data = self.load_state()
+        self.current_overlap: list[dict[str, Any]] = list(initial_state_data.get("overlap_entries", []))
+
+    def load_state(self) -> dict[str, Any]:
+        if not self.context_path.exists():
+            return {"running_context": "", "processed_byte_offset": 0, "overlap_entries": []}
+        try:
+            with open(self.context_path, "r", encoding="utf-8") as file_handle:
+                data = json.load(file_handle)
+        except (ValueError, OSError):
+            return {"running_context": "", "processed_byte_offset": 0, "overlap_entries": []}
+        return {
+            "running_context": str(data.get("running_context", "")),
+            "processed_byte_offset": int(data.get("processed_byte_offset", 0)),
+            "overlap_entries": list(data.get("overlap_entries", []))
+        }
+
+    def save_state(
+        self,
+        running_context: str,
+        processed_byte_offset: int,
+        overlap_entries: Optional[list[dict[str, Any]]] = None
+    ) -> None:
+        payload = {
+            "running_context": running_context[: self.settings.context_max_characters],
+            "processed_byte_offset": processed_byte_offset,
+            "overlap_entries": overlap_entries or []
+        }
+        atomic_write_text(self.context_path, json.dumps(payload, ensure_ascii=False))
+
+    def read_pending_records(self, start_offset: int) -> tuple[list[tuple[Optional[dict[str, Any]], int]], int]:
+        if not self.timeline_path.exists():
+            return [], start_offset
+        with open(self.timeline_path, "rb") as file_handle:
+            file_handle.seek(start_offset)
+            raw_bytes = file_handle.read()
+        last_newline = raw_bytes.rfind(b"\n")
+        if last_newline < 0:
+            return [], start_offset
+        complete_bytes = raw_bytes[: last_newline + 1]
+        records: list[tuple[Optional[dict[str, Any]], int]] = []
+        cursor = start_offset
+        for raw_line in complete_bytes[:-1].split(b"\n"):
+            if len(raw_line) == 0:
+                cursor += 1
+                continue
+            cursor_after = cursor + len(raw_line) + 1
+            parsed: Optional[dict[str, Any]] = None
             try:
-                with open(self.context_file_path, "r", encoding="utf-8") as file_handle:
-                    data = json.load(file_handle)
-                    return data.get("running_context", "")
-            except Exception:
-                return ""
-        return ""
+                candidate = json.loads(raw_line.decode("utf-8"))
+                if isinstance(candidate, dict):
+                    parsed = candidate
+            except (ValueError, UnicodeDecodeError):
+                logger.warning("skipping corrupt timeline line at byte %d", cursor)
+            records.append((parsed, cursor_after))
+            cursor = cursor_after
+        return records, start_offset + len(complete_bytes)
 
-    def save_running_context(self, context_text: str) -> None:
-        with open(self.context_file_path, "w", encoding="utf-8") as file_handle:
-            json.dump({"running_context": context_text}, file_handle)
-
-    def read_new_timeline_slice(self) -> list[dict[str, Any]]:
-        if not self.timeline_file_path.exists():
+    def read_pending_batches(self) -> list[SliceBatch]:
+        state = self.load_state()
+        start_offset = state["processed_byte_offset"]
+        records, final_offset = self.read_pending_records(start_offset)
+        if final_offset == start_offset:
             return []
+        batches = split_entries_into_batches(
+            records, self.settings.max_slice_characters, final_offset
+        )
+        if len(batches) == 0:
+            self.save_state(state["running_context"], final_offset, self.current_overlap)
+        for batch in batches:
+            batch.entries.sort(key=lambda entry: float(entry.get("timestamp_epoch", 0.0)))
+        return batches
 
-        new_entries: list[dict[str, Any]] = []
-        current_line_index = 0
+    def collect_flag_excerpts(self, entries: list[dict[str, Any]], flag_name: str) -> list[str]:
+        excerpts: list[str] = []
+        for entry in entries:
+            if flag_name not in (entry.get("importance_flags", []) or []):
+                continue
+            if entry.get("source_type") != "transcript":
+                continue
+            excerpts.append(truncate_text(str(entry.get("content", "")), FLAG_EXCERPT_LIMIT))
+            if len(excerpts) >= MAX_FLAG_EXCERPTS:
+                break
+        return excerpts
 
-        with open(self.timeline_file_path, "r", encoding="utf-8") as file_handle:
+    def build_notes_section(
+        self,
+        batch: SliceBatch,
+        result_state: dict[str, Any],
+        previous_mentions: list[str]
+    ) -> str:
+        summary = str(result_state.get("summary", "")).strip()
+        if len(summary) == 0:
+            return ""
+        first_timestamp = float(batch.entries[0].get("timestamp_epoch", 0.0))
+        heading_time = time.strftime("%H:%M:%S", time.localtime(first_timestamp))
+        section_lines: list[str] = [f"### {heading_time}", ""]
+
+        exam_excerpts = self.collect_flag_excerpts(batch.entries, "exam_relevant")
+        if len(exam_excerpts) > 0:
+            section_lines.append("> **Important Exam Topic**")
+            for excerpt in exam_excerpts:
+                section_lines.append(f"> - {excerpt}")
+            section_lines.append("")
+
+        confusion_excerpts = self.collect_flag_excerpts(batch.entries, "confusion")
+        for excerpt in confusion_excerpts:
+            section_lines.append(f"> ⚠️ **Review**: {excerpt}")
+        if len(confusion_excerpts) > 0:
+            section_lines.append("")
+
+        section_lines.append(summary)
+        section_lines.append("")
+
+        for mention in previous_mentions:
+            section_lines.append(f"> Previously covered in {mention}")
+        if len(previous_mentions) > 0:
+            section_lines.append("")
+
+        action_items = result_state.get("action_items", []) or []
+        if len(action_items) > 0:
+            section_lines.append("**Action Items**")
+            for action_item in action_items:
+                section_lines.append(f"- {action_item}")
+            section_lines.append("")
+        return "\n".join(section_lines) + "\n"
+
+    def find_previous_mentions(self, definitions: list[dict[str, str]]) -> list[str]:
+        mentions: list[str] = []
+        for definition_item in definitions:
+            term = definition_item["term"]
+            earlier = self.course_graph.find_concept_in_other_sessions(term, self.session_id)
+            if len(earlier) == 0:
+                continue
+            sessions: list[str] = []
+            for record in earlier:
+                if record["session_id"] not in sessions:
+                    sessions.append(record["session_id"])
+            mentions.append(f"{', '.join(sessions)}: {term}")
+        return mentions
+
+    def record_concepts(self, definitions: list[dict[str, str]], timestamp_epoch: float) -> None:
+        term_names: list[str] = []
+        for definition_item in definitions:
+            term_names.append(definition_item["term"])
+        for definition_item in definitions:
+            related: list[str] = []
+            for other_term in term_names:
+                if other_term != definition_item["term"]:
+                    related.append(other_term)
+            self.concept_graph.add_or_update_concept(
+                concept_name=definition_item["term"],
+                session_id=self.session_id,
+                timestamp_epoch=timestamp_epoch,
+                definition=definition_item["definition"],
+                related_concepts=related,
+                course_name=self.settings.course_name
+            )
+            self.course_graph.add_or_update_concept(
+                concept_name=definition_item["term"],
+                session_id=self.session_id,
+                timestamp_epoch=timestamp_epoch,
+                definition=definition_item["definition"],
+                related_concepts=related,
+                course_name=self.settings.course_name
+            )
+
+    def load_flashcards(self) -> list[dict[str, str]]:
+        cards: list[dict[str, str]] = []
+        if not self.flashcards_path.exists():
+            return cards
+        with open(self.flashcards_path, "r", encoding="utf-8") as file_handle:
             for line in file_handle:
-                if current_line_index >= self.processed_line_offset:
-                    line_clean = line.strip()
-                    if len(line_clean) > 0:
-                        try:
-                            item = json.loads(line_clean)
-                            new_entries.append(item)
-                        except Exception:
-                            pass
-                current_line_index += 1
+                stripped = line.strip()
+                if len(stripped) == 0:
+                    continue
+                try:
+                    cards.append(json.loads(stripped))
+                except ValueError:
+                    continue
+        return cards
 
-        self.processed_line_offset = current_line_index
-        return new_entries
-
-    async def process_batch(self) -> None:
-        timeline_slice = self.read_new_timeline_slice()
-        if len(timeline_slice) == 0:
+    def append_flashcards(self, new_cards: list[dict[str, str]]) -> None:
+        existing_questions: set[str] = set()
+        for card in self.load_flashcards():
+            existing_questions.add(str(card.get("question", "")))
+        lines: list[str] = []
+        for card in new_cards:
+            question = str(card.get("question", ""))
+            if question in existing_questions:
+                continue
+            existing_questions.add(question)
+            lines.append(json.dumps(card, ensure_ascii=False))
+        if len(lines) == 0:
             return
+        with open(self.flashcards_path, "a", encoding="utf-8", newline="\n") as file_handle:
+            file_handle.write("\n".join(lines) + "\n")
 
-        running_context = self.load_running_context()
+    def regenerate_anki_deck(self) -> None:
+        cards = self.load_flashcards()
+        if len(cards) == 0:
+            return
+        create_anki_deck(
+            deck_name=f"LectureLens {self.session_id}",
+            flashcards=cards,
+            output_file_path=self.anki_path
+        )
+
+    async def process_single_batch(self, batch: SliceBatch, running_context: str) -> str:
         initial_state: StructuringState = {
-            "timeline_slice": timeline_slice,
+            "timeline_slice": batch.entries,
             "running_context": running_context,
             "correlated_groups": [],
             "summary": "",
             "definitions": [],
             "action_items": [],
             "flashcards": [],
-            "importance_flags": []
+            "importance_flags": [],
+            "overlap_entries": self.current_overlap
         }
+        result_state = await self.graph.ainvoke(initial_state)
 
-        result_state = await self.compiled_graph.ainvoke(initial_state)
+        definitions = result_state.get("definitions", []) or []
+        previous_mentions = self.find_previous_mentions(definitions)
+        section_text = self.build_notes_section(batch, result_state, previous_mentions)
+        if len(section_text) > 0:
+            with open(self.notes_path, "a", encoding="utf-8", newline="\n") as file_handle:
+                file_handle.write(section_text)
 
-        summary = result_state.get("summary", "").strip()
-        new_context = result_state.get("running_context", "")
-        definitions = result_state.get("definitions", [])
-        action_items = result_state.get("action_items", [])
-        flashcards = result_state.get("flashcards", [])
-        flags = result_state.get("importance_flags", [])
+        self.append_flashcards(result_state.get("flashcards", []) or [])
+        first_timestamp = float(batch.entries[0].get("timestamp_epoch", 0.0))
+        self.record_concepts(definitions, first_timestamp)
+        self.regenerate_anki_deck()
 
-        if len(summary) > 0:
-            with open(self.notes_file_path, "a", encoding="utf-8") as notes_file:
-                if "exam_relevant" in flags:
-                    notes_file.write("\n> **Important Exam Topic**\n\n")
-                if "confusion" in flags:
-                    notes_file.write("\n> ⚠️ *Review point: Concept identified as needing reinforcement.*\n\n")
+        next_overlap = extract_overlap_entries(batch.entries, OVERLAP_WINDOW_SECONDS)
+        self.current_overlap = next_overlap
 
-                notes_file.write(summary + "\n\n")
+        new_context = str(result_state.get("running_context", running_context))
+        self.save_state(new_context, batch.end_offset, next_overlap)
+        return new_context
 
-                if len(action_items) > 0:
-                    notes_file.write("### Action Items & Deadlines\n")
-                    for action in action_items:
-                        notes_file.write(f"- [ ] {action}\n")
-                    notes_file.write("\n")
+    async def process_all_pending(self) -> int:
+        processed_batches = 0
+        for _ in range(1000):
+            batches = self.read_pending_batches()
+            if len(batches) == 0:
+                break
+            state = self.load_state()
+            running_context = state["running_context"]
+            for batch in batches:
+                running_context = await self.process_single_batch(batch, running_context)
+                processed_batches += 1
+                self.control.set_stat("batches_processed", processed_batches)
+        return processed_batches
 
-        if len(new_context) > 0:
-            self.save_running_context(new_context)
+    async def process_batch(self) -> int:
+        return await self.process_all_pending()
 
-        for definition in definitions:
-            term = definition.get("term", "")
-            meaning = definition.get("definition", "")
-            self.concept_graph.add_or_update_concept(
-                concept_name=term,
-                session_id=self.session_id,
-                timestamp_epoch=0.0,
-                definition=meaning,
-                related_concepts=[]
-            )
+    def reset_outputs(self) -> None:
+        for path in (self.notes_path, self.context_path, self.flashcards_path, self.anki_path):
+            if path.exists():
+                path.unlink()
+        self.current_overlap = []
+        self.concept_graph.delete_session(self.session_id)
+        self.course_graph.delete_session(self.session_id)
 
-        if len(flashcards) > 0:
-            for card in flashcards:
-                self.accumulated_flashcards.append(card)
-            create_anki_deck(
-                deck_name=f"LectureLens_{self.session_id}",
-                flashcards=self.accumulated_flashcards,
-                output_file_path=self.flashcards_file_path
-            )
+    async def run_guarded_pass(self) -> None:
+        try:
+            await self.process_all_pending()
+            self.consecutive_failures = 0
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self.consecutive_failures += 1
+            self.control.set_stat("consecutive_failures", self.consecutive_failures)
+            logger.error("structuring pass failed (%d), will retry: %s", self.consecutive_failures, error)
 
     async def run(self) -> None:
         self.is_running = True
+        interval = float(self.settings.structuring_interval_seconds)
+        last_pass_time = time.monotonic()
         while self.is_running:
-            await asyncio.sleep(self.settings.structuring_interval_seconds)
-            try:
-                await self.process_batch()
-            except Exception:
-                pass
+            if self.control.stop_requested():
+                logger.info("finalize requested, running final structuring pass")
+                await self.run_guarded_pass()
+                return
+            if (time.monotonic() - last_pass_time) >= interval:
+                await self.run_guarded_pass()
+                last_pass_time = time.monotonic()
+            await asyncio.sleep(1.0)
 
     def stop(self) -> None:
         self.is_running = False
 
 
 async def main() -> None:
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--session", default=None)
-    args, _ = parser.parse_known_args()
+    def build_agent(context: RuntimeContext) -> StructuringAgent:
+        from lecturelens.router.llm_router import build_router_for_task, load_router_config
+        router_config = load_router_config(context.settings.router_config_path)
+        router = build_router_for_task(
+            "structuring",
+            context.redis_bus.client,
+            router_config,
+            context.settings.ollama_url,
+            context.settings.llm_mode,
+            context.settings.llm_timeout_seconds
+        )
+        return StructuringAgent(
+            settings=context.settings,
+            session_id=context.session_id,
+            llm_router=router,
+            redis_bus=context.redis_bus
+        )
 
-    settings = Settings()
-    if args.session is not None and len(args.session) > 0:
-        settings.session_name = args.session
-
-    session_id = settings.session_name or "default_session"
-    redis_bus = RedisBus(settings.redis_url)
-
-    router_config = load_router_config(settings.router_config_path)
-    llm_router = build_router_for_task(
-        task_type="structuring",
-        redis_client=redis_bus.client,
-        router_config=router_config,
-        ollama_url=settings.ollama_url
-    )
-
-    agent = StructuringAgent(
-        settings=settings,
-        session_id=session_id,
-        llm_router=llm_router
-    )
-    try:
-        await agent.run()
-    finally:
-        await redis_bus.close()
+    await run_standard_agent(build_agent)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    execute_agent_main(main)

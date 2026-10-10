@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lecturelens"
-version = "0.1.0"
+version = "0.2.0"
 description = "Real-time multimodal multi-agent lecture note-taking system"
 requires-python = ">=3.10"
 dependencies = [
@@ -14,6 +14,10 @@ dependencies = [
     "redis>=5.0",
     "typer>=0.12",
     "rich>=13.0",
+    "httpx>=0.25",
+    "typing-extensions>=4.5",
+    "numpy>=1.24",
+    "websockets>=12.0",
 ]
 
 [project.optional-dependencies]
@@ -34,7 +38,7 @@ full = [
     "genanki>=0.13",
     "chromadb>=0.5",
     "websockets>=12.0",
-    "python-zeroconf>=0.130",
+    "reportlab>=4.0",
 ]
 client = [
     "sounddevice>=0.4",
@@ -44,6 +48,13 @@ client = [
     "Pillow>=10.0",
     "opencv-python>=4.8",
     "websockets>=12.0",
+]
+
+pdf = [
+    "reportlab>=4.0",
+]
+dev = [
+    "pytest>=7.0",
 ]
 
 [project.scripts]

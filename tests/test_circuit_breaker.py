@@ -67,6 +67,21 @@ class TestCircuitBreaker(unittest.IsolatedAsyncioTestCase):
         reset_closed = await breaker.is_open()
         self.assertFalse(reset_closed)
 
+    async def test_rate_limiter_remaining_and_ttl_is_set(self) -> None:
+        if not self.redis_available:
+            self.skipTest("Redis not available on localhost:6379")
+        limiter = RedisRateLimiter(
+            redis_client=self.redis_client,
+            provider_name="test_provider",
+            max_requests_per_window=3,
+            window_seconds=10
+        )
+        await limiter.is_allowed()
+        self.assertEqual(await limiter.get_current_count(), 1)
+        self.assertEqual(await limiter.get_remaining(), 2)
+        ttl = await self.redis_client.ttl(limiter.generate_window_key()) if hasattr(self.redis_client, "ttl") else 1
+        self.assertGreater(ttl, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

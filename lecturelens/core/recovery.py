@@ -1,15 +1,37 @@
 import os
-from pathlib import Path
 import subprocess
-from typing import Optional
+import time
+from pathlib import Path
+from typing import IO, Optional
+
+from lecturelens.core.agent_runtime import set_flag
+from lecturelens.core.logging_setup import get_logger
+
+logger = get_logger("lecturelens.recovery")
 
 
 class AgentMonitor:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        base_backoff_seconds: float = 1.0,
+        max_backoff_seconds: float = 60.0,
+        max_consecutive_failures: int = 8,
+        stable_runtime_seconds: float = 60.0
+    ) -> None:
         self.processes: dict[str, subprocess.Popen] = {}
         self.command_templates: dict[str, list[str]] = {}
         self.environments: dict[str, dict[str, str]] = {}
         self.log_file_paths: dict[str, Path] = {}
+        self.log_handles: dict[str, IO] = {}
+        self.base_backoff_seconds: float = base_backoff_seconds
+        self.max_backoff_seconds: float = max_backoff_seconds
+        self.max_consecutive_failures: int = max_consecutive_failures
+        self.stable_runtime_seconds: float = stable_runtime_seconds
+        self.consecutive_failures: dict[str, int] = {}
+        self.started_at: dict[str, float] = {}
+        self.next_restart_at: dict[str, float] = {}
+        self.gave_up: set[str] = set()
+        self.shutting_down: bool = False
 
     def register_agent(
         self,
@@ -27,6 +49,14 @@ class AgentMonitor:
         if log_file_path is not None:
             self.log_file_paths[agent_name] = log_file_path
 
+    def close_log_handle(self, agent_name: str) -> None:
+        handle = self.log_handles.pop(agent_name, None)
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+
     def start_agent(self, agent_name: str) -> bool:
         if agent_name not in self.command_templates:
             return False
@@ -34,29 +64,38 @@ class AgentMonitor:
         command = self.command_templates[agent_name]
         env_vars = self.environments.get(agent_name, os.environ.copy())
 
+        self.close_log_handle(agent_name)
         stdout_destination = subprocess.DEVNULL
         stderr_destination = subprocess.DEVNULL
-
         if agent_name in self.log_file_paths:
             log_path = self.log_file_paths[agent_name]
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_file = open(log_path, "a", encoding="utf-8")
+            self.log_handles[agent_name] = log_file
             stdout_destination = log_file
             stderr_destination = log_file
+
+        creation_flags = 0
+        if os.name == "nt":
+            creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
         process = subprocess.Popen(
             command,
             env=env_vars,
             stdout=stdout_destination,
             stderr=stderr_destination,
-            text=True
+            creationflags=creation_flags
         )
         self.processes[agent_name] = process
+        self.started_at[agent_name] = time.monotonic()
         return True
 
     def check_health(self) -> dict[str, str]:
         status_map: dict[str, str] = {}
         for agent_name, process in list(self.processes.items()):
+            if agent_name in self.gave_up:
+                status_map[agent_name] = "GAVE_UP"
+                continue
             exit_code = process.poll()
             if exit_code is None:
                 status_map[agent_name] = "RUNNING"
@@ -66,37 +105,118 @@ class AgentMonitor:
                 status_map[agent_name] = f"FAILED_EXIT_{exit_code}"
         return status_map
 
-    def restart_agent(self, agent_name: str) -> bool:
-        if agent_name in self.processes:
-            existing_process = self.processes[agent_name]
-            if existing_process.poll() is None:
-                existing_process.terminate()
-                try:
-                    existing_process.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    existing_process.kill()
-        return self.start_agent(agent_name)
+    def compute_backoff_seconds(self, failure_count: int) -> float:
+        exponent = failure_count - 1
+        if exponent < 0:
+            exponent = 0
+        backoff = self.base_backoff_seconds * (2 ** exponent)
+        if backoff > self.max_backoff_seconds:
+            return self.max_backoff_seconds
+        return backoff
 
-    def restart_failed_agents(self) -> list[str]:
+    def restart_failed_agents(self, now: Optional[float] = None) -> list[str]:
+        if self.shutting_down:
+            return []
+        current_time = now if now is not None else time.monotonic()
         restarted_agents: list[str] = []
         health = self.check_health()
         for agent_name, status in health.items():
-            if status.startswith("FAILED"):
-                success = self.restart_agent(agent_name)
-                if success:
-                    restarted_agents.append(agent_name)
+            if not status.startswith("FAILED"):
+                continue
+            if agent_name in self.gave_up:
+                continue
+
+            scheduled_time = self.next_restart_at.get(agent_name)
+            if scheduled_time is None:
+                runtime_seconds = current_time - self.started_at.get(agent_name, current_time)
+                if runtime_seconds >= self.stable_runtime_seconds:
+                    self.consecutive_failures[agent_name] = 0
+                failure_count = self.consecutive_failures.get(agent_name, 0) + 1
+                self.consecutive_failures[agent_name] = failure_count
+                if failure_count > self.max_consecutive_failures:
+                    self.gave_up.add(agent_name)
+                    logger.error("agent %s failed %d times, giving up", agent_name, failure_count)
+                    continue
+                backoff = self.compute_backoff_seconds(failure_count)
+                self.next_restart_at[agent_name] = current_time + backoff
+                logger.warning("agent %s failed (%s), restart in %.1fs", agent_name, status, backoff)
+                continue
+
+            if current_time < scheduled_time:
+                continue
+
+            del self.next_restart_at[agent_name]
+            if self.start_agent(agent_name):
+                restarted_agents.append(agent_name)
         return restarted_agents
 
-    def stop_agent(self, agent_name: str) -> None:
-        if agent_name in self.processes:
-            process = self.processes[agent_name]
-            if process.poll() is None:
-                process.terminate()
+    def wait_for_exit(self, agent_names: list[str], timeout_seconds: float) -> bool:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            all_exited = True
+            for agent_name in agent_names:
+                process = self.processes.get(agent_name)
+                if process is not None and process.poll() is None:
+                    all_exited = False
+                    break
+            if all_exited:
+                return True
+            time.sleep(0.2)
+        return False
+
+    def terminate_agent(self, agent_name: str, grace_seconds: float = 3.0) -> None:
+        process = self.processes.get(agent_name)
+        if process is None:
+            return
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=grace_seconds)
+            except subprocess.TimeoutExpired:
+                process.kill()
                 try:
-                    process.wait(timeout=3.0)
+                    process.wait(timeout=grace_seconds)
                 except subprocess.TimeoutExpired:
-                    process.kill()
+                    logger.error("agent %s did not die after kill", agent_name)
+
+    def restart_agent(self, agent_name: str) -> bool:
+        self.terminate_agent(agent_name, grace_seconds=2.0)
+        return self.start_agent(agent_name)
+
+    def stop_agent(self, agent_name: str) -> None:
+        self.terminate_agent(agent_name)
+        self.close_log_handle(agent_name)
 
     def stop_all(self) -> None:
+        self.shutting_down = True
         for agent_name in list(self.processes.keys()):
             self.stop_agent(agent_name)
+
+    def run_shutdown_sequence(
+        self,
+        session_dir: Path,
+        phases: list[tuple[list[str], str, float]]
+    ) -> dict[str, bool]:
+        self.shutting_down = True
+        outcomes: dict[str, bool] = {}
+        for agent_names, flag_name, timeout_seconds in phases:
+            running_names: list[str] = []
+            for agent_name in agent_names:
+                if agent_name in self.processes:
+                    running_names.append(agent_name)
+            if len(running_names) == 0:
+                continue
+            set_flag(session_dir, flag_name)
+            exited_cleanly = self.wait_for_exit(running_names, timeout_seconds)
+            for agent_name in running_names:
+                process = self.processes[agent_name]
+                clean = process.poll() is not None
+                outcomes[agent_name] = clean
+                if not clean:
+                    logger.warning("agent %s ignored stop flag, terminating", agent_name)
+                    self.terminate_agent(agent_name)
+            if not exited_cleanly:
+                logger.warning("phase %s timed out", flag_name)
+        for agent_name in list(self.processes.keys()):
+            self.close_log_handle(agent_name)
+        return outcomes

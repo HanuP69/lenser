@@ -83,6 +83,22 @@ class TestSchemas(unittest.TestCase):
         self.assertEqual(from_redis.correlation_id, "corr-123")
         self.assertEqual(from_redis.metadata["custom_key"], 42)
 
+    def test_slide_revisit_field_round_trip(self) -> None:
+        slide = SlideCaptured(
+            session_id="s",
+            timestamp_epoch=1.0,
+            slide_number=4,
+            monitor_index=1,
+            image_file_path="x.png",
+            extracted_text="text",
+            revisited_slide_number=2
+        )
+        restored = SlideCaptured.from_redis_dict(slide.to_redis_dict())
+        self.assertEqual(restored.revisited_slide_number, 2)
+        legacy = slide.to_redis_dict()
+        del legacy["revisited_slide_number"]
+        self.assertEqual(SlideCaptured.from_redis_dict(legacy).revisited_slide_number, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
