@@ -133,7 +133,7 @@ def create_base_chat_model(
             base_url=base_url,
             api_key=api_key,
             model=model_name,
-            max_retries=0
+            max_retries=2
         )
 
     if provider_type == "google_genai":

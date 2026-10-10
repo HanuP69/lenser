@@ -62,6 +62,29 @@ class TestMarkdownFormatter(unittest.TestCase):
         self.assertIn("- $A$: Squared coefficient", cleaned)
         self.assertIn("\n\n$$\nx^2 + bx + c = 0\n$$\n\n", cleaned)
 
+    def test_strip_scratchpad_and_thoughts(self) -> None:
+        raw = (
+            "01:51:40\n"
+            "Expert academic note taker. O. Henry's 'Hearts and Hands'.\n"
+            "Sub-topic 1: The Persona\n"
+            "Heading 1: The Persona\n"
+            "Drafting Section 1: Detail text here.\n"
+            "Refining Section 1: Better academic words.\n"
+            "Markdown headings? Yes.\n"
+            "No Roman numerals? Yes.\n"
+            "Ignore the DP slide? Yes.\n"
+            "## The Reinforcement of the False Persona\n\n"
+            "Actual content of the lecture notes starts here."
+        )
+        cleaned = format_clean_markdown(raw)
+        self.assertNotIn("Drafting Section 1", cleaned)
+        self.assertNotIn("Refining Section 1", cleaned)
+        self.assertNotIn("Markdown headings? Yes", cleaned)
+        self.assertNotIn("Ignore the DP slide", cleaned)
+        self.assertNotIn("Sub-topic 1", cleaned)
+        self.assertTrue(cleaned.startswith("## The Reinforcement of the False Persona"))
+        self.assertIn("Actual content of the lecture notes starts here.", cleaned)
+
 
 if __name__ == "__main__":
     unittest.main()

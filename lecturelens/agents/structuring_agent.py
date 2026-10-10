@@ -210,21 +210,19 @@ PREVIOUS LECTURE CONTEXT:
 NEW LECTURE TIMELINE SLICE (transcript, slide OCR, board captures; lines tagged with importance flags):
 {new_timeline_text}
 
-FORMATTING AND CONTENT GUIDELINES:
-1. HEADINGS: Use standard Markdown headings (## for major concepts, ### for subsections). Never use Roman numerals (I., II., III.) as headings.
-2. CONTINUITY: Continue the narrative seamlessly from earlier notes. Do NOT output repeated titles like "Topic (Cont.)" or "Topic (Continued)".
-3. NO EMOJIS: Do NOT output any emojis, icons, or decorative symbols (such as 📌, 📖, ⚠️, 💡).
-4. MATHEMATICS:
-   - Inline math: Use single dollar signs `$formula$`. Never put spaces immediately inside the dollar signs (write `$A = 2$`, not `$ A = 2 $`).
-   - Display/standalone math: Always put `$$` on its own separate line preceded and followed by blank lines:
-     $$
-     \\text{{formula}}
-     $$
-     NEVER write `$$...$$` inline on the same line as regular text.
-   - Parameter lists: Group multiple parameter values into bulleted lists (`- $A = 2$`) or clear sentences.
-5. EXAM RELEVANCE: Emphasize points from lines flagged exam_relevant in bold or as dedicated note callouts.
-6. LANGUAGE: If the lecture speech or transcript is in Hindi or Hinglish, write the academic notes in clear, textbook-quality English with standard terminology and mathematical formulas.
-7. Do not invent facts not present in the content.
+FORMATTING GUIDELINES:
+1. HEADINGS: Use Markdown headings (## for concepts, ### for subsections). Never use Roman numerals (I., II., III.).
+2. CONTINUITY: Seamless narrative from earlier notes. Never repeat titles with (Cont.) or (Continued).
+3. NO EMOJIS: Never output emojis or icons.
+4. MATH: Single dollar inline ($formula$). Display math on its own lines:
+   $$
+   \\text{{formula}}
+   $$
+   Never write $$...$$ inline with text. Group parameters into bullet lists.
+5. EXAM RELEVANCE: Emphasize points flagged exam_relevant in bold.
+6. LANGUAGE: If transcript is in Hindi/Hinglish, write academic notes in clear English.
+7. ACCURACY: Do not invent facts not present in the content.
+8. OUTPUT ONLY final markdown notes. Do NOT output scratchpads, drafting notes, or checklists. Start with the first heading.
 """
         summary_text = await call_llm(prompt)
         cleaned_summary = format_clean_markdown(summary_text).strip()

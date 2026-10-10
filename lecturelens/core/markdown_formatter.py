@@ -121,8 +121,58 @@ def normalize_lists_and_definitions(text: str) -> str:
     return "\n".join(final_lines)
 
 
+def strip_scratchpad_and_thoughts(text: str) -> str:
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<thought>.*?</thought>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+
+    lines = cleaned.split("\n")
+    first_heading_index = -1
+    for idx, line in enumerate(lines):
+        if line.strip().startswith("#"):
+            first_heading_index = idx
+            break
+
+    scratchpad_markers = (
+        "drafting section",
+        "refining section",
+        "sub-topic",
+        "heading 1:",
+        "heading 2:",
+        "heading 3:",
+        "markdown headings?",
+        "no roman numerals?",
+        "no emojis?",
+        "academic english?",
+        "ignore the",
+        "expert academic note taker",
+        "irrelevant content:"
+    )
+
+    if first_heading_index > 0:
+        preamble = "\n".join(lines[:first_heading_index]).lower()
+        if any(marker in preamble for marker in scratchpad_markers):
+            lines = lines[first_heading_index:]
+
+    checklist_pattern = re.compile(r"^[\w\s\-().]+\?\s*(?:yes|no|checked|true|false)\.?$", re.IGNORECASE)
+    drafting_line_pattern = re.compile(r"^(?:Drafting|Refining|Sub-topic|Heading)\s+\d+:", re.IGNORECASE)
+
+    filtered_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if checklist_pattern.match(stripped):
+            continue
+        if drafting_line_pattern.match(stripped):
+            continue
+        if stripped.lower().startswith("expert academic note taker."):
+            continue
+        filtered_lines.append(line)
+
+    return "\n".join(filtered_lines)
+
+
 def format_clean_markdown(text: str) -> str:
-    cleaned = clean_mojibake_and_emojis(text)
+    cleaned = strip_scratchpad_and_thoughts(text)
+    cleaned = clean_mojibake_and_emojis(cleaned)
     cleaned = normalize_math_blocks(cleaned)
     cleaned = normalize_headings(cleaned)
     cleaned = normalize_lists_and_definitions(cleaned)

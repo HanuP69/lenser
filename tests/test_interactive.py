@@ -123,7 +123,7 @@ class TestInteractiveFlows(unittest.TestCase):
                                 provider, model, llm_mode, primary = interactive.configure_unorouter_flow(self.console)
                                 self.assertEqual(provider, "unorouter")
                                 self.assertEqual(model, "gemma-4-26b:free")
-                                self.assertEqual(llm_mode, "hybrid")
+                                self.assertEqual(llm_mode, "cloud")
                                 self.assertEqual(primary, "unorouter")
                                 self.assertEqual(os.environ.get("UNOROUTER_API_KEY"), "my_new_uno_key")
                                 mock_persist.assert_called_once_with("my_new_uno_key")

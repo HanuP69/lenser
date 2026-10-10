@@ -203,7 +203,7 @@ def configure_ollama_flow(settings: Settings, console: Console) -> tuple[str, st
     return "gemma", selected, "local", "gemma"
 
 
-def configure_unorouter_flow(console: Console) -> tuple[str, str, str, str]:
+def configure_unorouter_flow(console: Console, mode: str = "cloud") -> tuple[str, str, str, str]:
     console.print("\n[bold cyan]Configuring UnoRouter (Multimodal Gateway)...[/bold cyan]")
     existing_key = load_env_api_key()
     api_key: str = ""
@@ -248,8 +248,8 @@ def configure_unorouter_flow(console: Console) -> tuple[str, str, str, str]:
     os.environ["UNOROUTER_API_KEY"] = api_key
     os.environ["LECTURELENS_UNOROUTER_API_KEY"] = api_key
     selected_model = "gemma-4-26b:free"
-    console.print(f"[green]UnoRouter active with multimodal vision model: {selected_model}[/green]")
-    return "unorouter", selected_model, "hybrid", "unorouter"
+    console.print(f"[green]UnoRouter active with multimodal vision model: {selected_model} (mode: {mode})[/green]")
+    return "unorouter", selected_model, mode, "unorouter"
 
 
 def select_llm_provider(settings: Settings, console: Console) -> tuple[str, str, str, str]:
@@ -257,14 +257,17 @@ def select_llm_provider(settings: Settings, console: Console) -> tuple[str, str,
         Panel(
             "[bold white]Step 1: Choose LLM Provider[/bold white]\n\n"
             "  [1] [bold green]Local Ollama[/bold green] (Offline, RTX GPU/CPU, Gemma 4)\n"
-            "  [2] [bold cyan]UnoRouter[/bold cyan] (Cloud Gateway, Multimodal Vision gemma-4-26b:free, 262k context)",
+            "  [2] [bold cyan]UnoRouter (Cloud)[/bold cyan] (Pure Cloud, Multimodal Vision gemma-4-26b:free, 262k context)\n"
+            "  [3] [bold yellow]Hybrid Mode[/bold yellow] (UnoRouter Cloud with Local Ollama fallback)",
             title="LectureLens AI Backend",
             border_style="blue"
         )
     )
-    choice = Prompt.ask("Select provider", choices=["1", "2"], default="1")
+    choice = Prompt.ask("Select provider", choices=["1", "2", "3"], default="2")
     if choice == "2":
-        return configure_unorouter_flow(console)
+        return configure_unorouter_flow(console, mode="cloud")
+    if choice == "3":
+        return configure_unorouter_flow(console, mode="hybrid")
     return configure_ollama_flow(settings, console)
 
 
