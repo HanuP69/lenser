@@ -99,6 +99,44 @@ class TestHelpers(unittest.TestCase):
             self.assertEqual(helpers.find_latest_session(output), "new")
             self.assertIsNone(helpers.find_latest_session(output / "missing"))
 
+    def test_format_file_size(self) -> None:
+        self.assertEqual(helpers.format_file_size(500), "500 B")
+        self.assertEqual(helpers.format_file_size(2048), "2.0 KB")
+        self.assertEqual(helpers.format_file_size(5 * 1024 * 1024), "5.0 MB")
+
+    def test_count_file_lines_and_images(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            file_path = Path(temp_dir) / "test.txt"
+            file_path.write_text("line1\nline2\nline3\n", encoding="utf-8")
+            self.assertEqual(helpers.count_file_lines(file_path), 3)
+            self.assertEqual(helpers.count_file_lines(Path(temp_dir) / "missing.txt"), 0)
+
+            img_dir = Path(temp_dir) / "raw" / "screen"
+            img_dir.mkdir(parents=True)
+            (img_dir / "frame_001.jpg").write_bytes(b"dummy_image_bytes")
+            count, size = helpers.count_images_in_directory(img_dir)
+            self.assertEqual(count, 1)
+            self.assertGreater(size, 0)
+
+    def test_build_session_output_table_and_display(self) -> None:
+        from rich.console import Console
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_dir = Path(temp_dir) / "test_sess"
+            session_dir.mkdir(parents=True)
+            (session_dir / "notes.md").write_text("# Notes\n- item 1\n", encoding="utf-8")
+            (session_dir / "timeline.jsonl").write_text('{"event": 1}\n{"event": 2}\n', encoding="utf-8")
+            (session_dir / "session_meta.json").write_text('{"runs": []}', encoding="utf-8")
+
+            table = helpers.build_session_output_table(session_dir)
+            self.assertIsNotNone(table)
+
+            console = Console(record=True)
+            helpers.display_session_output_summary(session_dir, console)
+            output = console.export_text()
+            self.assertIn("notes.md", output)
+            self.assertIn("timeline.jsonl", output)
+            self.assertIn("test_sess", output)
+
 
 class TestRuntimeControl(unittest.TestCase):
     def setUp(self) -> None:

@@ -16,6 +16,7 @@ from rich.table import Table
 from lecturelens.cli.helpers import (
     LineCounter,
     build_agent_rows,
+    display_session_output_summary,
     find_latest_session,
     format_elapsed,
     format_low_disk_warning,
@@ -280,6 +281,7 @@ def run_shutdown(monitor: AgentMonitor, session_dir: Path, planned_agents: list[
     session_meta.finish_run(session_dir)
     set_flag(session_dir, SESSION_FINISHED_FLAG_NAME)
     console.print("[green]Session stopped. Notes saved.[/green]")
+    display_session_output_summary(session_dir, console)
 
 
 @app.command()
@@ -425,6 +427,7 @@ def stop(
     while time.monotonic() < deadline:
         if flag_exists(session_dir, SESSION_FINISHED_FLAG_NAME):
             console.print("[green]Session stopped.[/green]")
+            display_session_output_summary(session_dir, console)
             return
         time.sleep(1.0)
     fail("Timed out waiting for the session to finish.")
