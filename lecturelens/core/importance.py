@@ -19,6 +19,12 @@ EXAM_RELEVANT_PATTERNS: tuple[str, ...] = (
     r"will be graded",
     r"note this down",
     r"write this down",
+    r"महत्वपूर्ण",
+    r"परीक्षा",
+    r"dhyan (?:do|rakhna)",
+    r"exam me",
+    r"yaad rakhna",
+    r"note kar (?:lo|lena)",
 )
 
 DEFINITION_PATTERNS: tuple[str, ...] = (
@@ -32,6 +38,10 @@ DEFINITION_PATTERNS: tuple[str, ...] = (
     r"denoted by",
     r"the term",
     r"formally",
+    r"परिभाषा",
+    r"ka matlab",
+    r"bolte hain",
+    r"kehte hain",
 )
 
 EXAMPLE_PATTERNS: tuple[str, ...] = (
@@ -45,6 +55,10 @@ EXAMPLE_PATTERNS: tuple[str, ...] = (
     r"imagine",
     r"to demonstrate",
     r"as an example",
+    r"उदाहरण",
+    r"jaise ki",
+    r"maan lo",
+    r"maan lijiye",
 )
 
 CONFUSION_PATTERNS: tuple[str, ...] = (
@@ -59,6 +73,9 @@ CONFUSION_PATTERNS: tuple[str, ...] = (
     r"could you explain",
     r"not clear",
     r"i'm lost",
+    r"samajh nahi (?:aaya|aa raha)",
+    r"phir se batao",
+    r"doubt hai",
 )
 
 

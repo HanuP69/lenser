@@ -223,7 +223,8 @@ FORMATTING AND CONTENT GUIDELINES:
      NEVER write `$$...$$` inline on the same line as regular text.
    - Parameter lists: Group multiple parameter values into bulleted lists (`- $A = 2$`) or clear sentences.
 5. EXAM RELEVANCE: Emphasize points from lines flagged exam_relevant in bold or as dedicated note callouts.
-6. Do not invent facts not present in the content.
+6. LANGUAGE: If the lecture speech or transcript is in Hindi or Hinglish, write the academic notes in clear, textbook-quality English with standard terminology and mathematical formulas.
+7. Do not invent facts not present in the content.
 """
         summary_text = await call_llm(prompt)
         cleaned_summary = format_clean_markdown(summary_text).strip()

@@ -34,6 +34,19 @@ class TestImportance(unittest.TestCase):
         flags = detect_importance_flags(text)
         self.assertEqual(len(flags), 0)
 
+    def test_hindi_and_hinglish_detection(self) -> None:
+        text_exam = "Ye concept bahut important hai aur exam me aayega dhyan do."
+        self.assertIn("exam_relevant", detect_importance_flags(text_exam))
+
+        text_def = "Is concept ka matlab aur paribhasha samjho."
+        self.assertIn("definition", detect_importance_flags(text_def))
+
+        text_ex = "Jaise ki maan lo hamare paas ek array hai."
+        self.assertIn("example", detect_importance_flags(text_ex))
+
+        text_conf = "Mujhe samajh nahi aaya doubt hai."
+        self.assertIn("confusion", detect_importance_flags(text_conf))
+
 
 if __name__ == "__main__":
     unittest.main()
