@@ -19,6 +19,7 @@ from lecturelens.core.agent_runtime import (
 )
 from lecturelens.core.fileio import atomic_write_text
 from lecturelens.core.logging_setup import get_logger
+from lecturelens.core.markdown_formatter import format_clean_markdown
 from lecturelens.exports.anki_exporter import create_anki_deck
 from lecturelens.knowledge.concept_graph import ConceptGraph
 from lecturelens.router.messages import response_to_text
@@ -202,21 +203,31 @@ PREVIOUS OVERLAP BUFFER (tail of previous slice, already recorded):
 """
 
         prompt = f"""
-You are an expert academic note taker.
+You are an expert academic note taker creating textbook-quality markdown lecture notes.
 PREVIOUS LECTURE CONTEXT:
 {running_context}
 {overlap_block}
 NEW LECTURE TIMELINE SLICE (transcript, slide OCR, board captures; lines tagged with importance flags):
 {new_timeline_text}
 
-Generate clear, structured, cohesive markdown notes for this slice.
-Incorporate definitions, key formulas, and explanations.
-Write content from lines flagged exam_relevant in bold.
-Maintain continuous narrative flow from the previous lecture context.
-Do not invent facts not present in the content.
+FORMATTING AND CONTENT GUIDELINES:
+1. HEADINGS: Use standard Markdown headings (## for major concepts, ### for subsections). Never use Roman numerals (I., II., III.) as headings.
+2. CONTINUITY: Continue the narrative seamlessly from earlier notes. Do NOT output repeated titles like "Topic (Cont.)" or "Topic (Continued)".
+3. NO EMOJIS: Do NOT output any emojis, icons, or decorative symbols (such as 📌, 📖, ⚠️, 💡).
+4. MATHEMATICS:
+   - Inline math: Use single dollar signs `$formula$`. Never put spaces immediately inside the dollar signs (write `$A = 2$`, not `$ A = 2 $`).
+   - Display/standalone math: Always put `$$` on its own separate line preceded and followed by blank lines:
+     $$
+     \\text{{formula}}
+     $$
+     NEVER write `$$...$$` inline on the same line as regular text.
+   - Parameter lists: Group multiple parameter values into bulleted lists (`- $A = 2$`) or clear sentences.
+5. EXAM RELEVANCE: Emphasize points from lines flagged exam_relevant in bold or as dedicated note callouts.
+6. Do not invent facts not present in the content.
 """
         summary_text = await call_llm(prompt)
-        return {"summary": summary_text}
+        cleaned_summary = format_clean_markdown(summary_text).strip()
+        return {"summary": cleaned_summary}
 
     async def extract_definitions_node(state: StructuringState) -> dict[str, Any]:
         summary_text = state.get("summary", "")
@@ -479,9 +490,11 @@ class StructuringAgent:
         summary = str(result_state.get("summary", "")).strip()
         if len(summary) == 0:
             return ""
+        cleaned_summary = format_clean_markdown(summary).strip()
         first_timestamp = float(batch.entries[0].get("timestamp_epoch", 0.0))
         heading_time = time.strftime("%H:%M:%S", time.localtime(first_timestamp))
-        section_lines: list[str] = [f"### {heading_time}", ""]
+        divider = "\n---\n\n" if (self.notes_path.exists() and self.notes_path.stat().st_size > 0) else ""
+        section_lines: list[str] = [f"{divider}### {heading_time}", ""]
 
         exam_excerpts = self.collect_flag_excerpts(batch.entries, "exam_relevant")
         if len(exam_excerpts) > 0:
@@ -496,7 +509,7 @@ class StructuringAgent:
         if len(confusion_excerpts) > 0:
             section_lines.append("")
 
-        section_lines.append(summary)
+        section_lines.append(cleaned_summary)
         section_lines.append("")
 
         for mention in previous_mentions:
