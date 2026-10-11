@@ -260,7 +260,7 @@ class TestStructuringContent(StructuringTestBase):
         ])
         await self.make_agent().process_all_pending()
         notes = self.notes_text()
-        self.assertIn("⚠️ **Review**: Wait what, I don't understand the pivot.", notes)
+        self.assertIn("**Review**: Wait what, I don't understand the pivot.", notes)
         self.assertNotIn("Review**: The pivot splits", notes)
 
     async def test_flag_markers_do_not_apply_to_whole_batch(self) -> None:

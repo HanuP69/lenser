@@ -9,8 +9,8 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
 BOLD_PATTERN = re.compile(r"\*\*(.+?)\*\*")
 EMOJI_REPLACEMENTS: dict[str, str] = {
-    "⚠️": "[!]",
-    "⚠": "[!]",
+    "\u26a0\ufe0f": "[!]",
+    "\u26a0": "[!]",
 }
 
 

@@ -11,11 +11,11 @@ from lecturelens.core.markdown_formatter import (
 
 class TestMarkdownFormatter(unittest.TestCase):
     def test_clean_mojibake_and_emojis(self) -> None:
-        raw = "ðŸ“ Quadratic Equations and Polynomials 📌 📖"
+        raw = "ðŸ“ Quadratic Equations and Polynomials \U0001f4cc \U0001f4d6"
         cleaned = clean_mojibake_and_emojis(raw)
         self.assertNotIn("ðŸ“", cleaned)
-        self.assertNotIn("📌", cleaned)
-        self.assertNotIn("📖", cleaned)
+        self.assertNotIn("\U0001f4cc", cleaned)
+        self.assertNotIn("\U0001f4d6", cleaned)
         self.assertIn("Quadratic Equations", cleaned)
 
     def test_normalize_math_blocks(self) -> None:

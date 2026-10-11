@@ -211,7 +211,7 @@ NEW LECTURE TIMELINE SLICE (transcript, slide OCR, board captures; lines tagged 
 {new_timeline_text}
 
 FORMATTING GUIDELINES:
-1. HEADINGS: Use Markdown headings (## for concepts, ### for subsections). Never use Roman numerals (I., II., III.).
+1. HEADINGS: Use clear Markdown headings (## for concepts, ### for subsections) to organize notes logically.
 2. CONTINUITY: Seamless narrative from earlier notes. Never repeat titles with (Cont.) or (Continued).
 3. NO EMOJIS: Never output emojis or icons.
 4. MATH: Single dollar inline ($formula$). Display math on its own lines:
@@ -220,7 +220,7 @@ FORMATTING GUIDELINES:
    $$
    Never write $$...$$ inline with text. Group parameters into bullet lists.
 5. EXAM RELEVANCE: Emphasize points flagged exam_relevant in bold.
-6. LANGUAGE: If transcript is in Hindi/Hinglish, write academic notes in clear English.
+6. LANGUAGE & TERMINOLOGY: Let the language of the lecture guide your writing. If the lecture is conducted in Hindi, Hinglish, Spanish, French, or another language, produce structured notes naturally in that language with technical accuracy, preserving relevant academic terminology.
 7. ACCURACY: Do not invent facts not present in the content.
 8. OUTPUT ONLY final markdown notes. Do NOT output scratchpads, drafting notes, or checklists. Start with the first heading.
 """
@@ -534,7 +534,7 @@ class StructuringAgent:
 
         confusion_excerpts = self.collect_flag_excerpts(batch.entries, "confusion")
         for excerpt in confusion_excerpts:
-            section_lines.append(f"> ⚠️ **Review**: {excerpt}")
+            section_lines.append(f"> **Review**: {excerpt}")
         if len(confusion_excerpts) > 0:
             section_lines.append("")
 
