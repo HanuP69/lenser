@@ -249,6 +249,7 @@ class TestAudioAgent(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             bus = FakeBus()
             agent = make_agent(temp_dir, ScriptedSource([]), bus)
+            agent.settings.whisper_lock_language = True
             pending = PendingTranscription(b"", "p.wav", 0.0, 1.0)
             captured_languages: list[Optional[str]] = []
 

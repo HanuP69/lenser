@@ -27,6 +27,28 @@ class TestPdfExporter(unittest.TestCase):
             self.assertTrue(data.startswith(b"%PDF"))
             self.assertGreater(len(data), 1000)
 
+    def test_pdf_with_tables_code_and_math(self) -> None:
+        markdown_text = (
+            "# Complex Lecture\n\n"
+            "| Algorithm | Time | Space |\n"
+            "|---|---|---|\n"
+            "| Binary Search | $O(\\log n)$ | $O(1)$ |\n"
+            "| Merge Sort | $O(n \\log n)$ | $O(n)$ |\n\n"
+            "$$\n"
+            "T(n) = 2T(n/2) + O(n)\n"
+            "$$\n\n"
+            "```python\n"
+            "def binary_search(arr, target):\n"
+            "    return -1\n"
+            "```\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "tables_notes.pdf"
+            create_pdf_from_markdown(markdown_text, output, "Algorithms")
+            data = output.read_bytes()
+            self.assertTrue(data.startswith(b"%PDF"))
+            self.assertGreater(len(data), 1000)
+
 
 if __name__ == "__main__":
     unittest.main()

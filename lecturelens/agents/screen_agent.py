@@ -221,16 +221,19 @@ class ScreenAgent:
                 logger.error("docker OCR failed: %s", error)
         return ""
 
-    async def run_vision_fallback(self, png_bytes: bytes) -> str:
+    async def run_vision_fallback(self, png_bytes: bytes, max_retries: int = 2) -> str:
         if self.llm_router is None or self.control.stop_requested():
             return ""
         message = build_image_message(SLIDE_VISION_PROMPT, png_bytes, "image/png")
-        try:
-            response = await self.llm_router.ainvoke([message])
-        except Exception as error:
-            logger.error("slide vision fallback failed: %s", error)
-            return ""
-        return response_to_text(response)
+        for attempt in range(max_retries):
+            try:
+                response = await self.llm_router.ainvoke([message])
+                return response_to_text(response)
+            except Exception as error:
+                logger.error("slide vision fallback failed (attempt %d/%d): %s", attempt + 1, max_retries, error)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+        return ""
 
     async def accept_png(self, png_bytes: bytes, thumbnail: np.ndarray) -> SlideCaptured:
         self.slide_counter += 1
@@ -249,7 +252,8 @@ class ScreenAgent:
             extracted_text = await self.run_ocr(png_bytes)
             if len(extracted_text.strip()) == 0 and not self.control.stop_requested():
                 extracted_text = await self.run_vision_fallback(png_bytes)
-        self.remember_slide(slide_number, difference_hash, small_thumbnail, extracted_text)
+        if len(extracted_text.strip()) > 0:
+            self.remember_slide(slide_number, difference_hash, small_thumbnail, extracted_text)
 
         slide_event = SlideCaptured(
             session_id=self.session_id,

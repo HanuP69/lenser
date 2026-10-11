@@ -75,30 +75,55 @@ class SliceBatch:
     end_offset: int
 
 
-def extract_json_payload(raw_output: str) -> Any:
+def extract_json_payload(raw_output: str, expect_list: bool = True) -> Any:
     clean_json = raw_output.strip()
     if "```json" in clean_json:
         clean_json = clean_json.split("```json")[1].split("```")[0].strip()
     elif "```" in clean_json:
         clean_json = clean_json.split("```")[1].split("```")[0].strip()
-    try:
-        return json.loads(clean_json)
-    except (ValueError, TypeError):
-        pass
 
-    arr_match = re.search(r"\[[\s\S]*\]", raw_output)
-    if arr_match:
+    clean_no_trailing = re.sub(r",\s*([\]}])", r"\1", clean_json)
+    for text in (clean_json, clean_no_trailing):
         try:
-            return json.loads(arr_match.group(0))
+            val = json.loads(text)
+            if expect_list and isinstance(val, dict):
+                for k in ("flashcards", "definitions", "action_items", "items", "cards"):
+                    if k in val and isinstance(val[k], list):
+                        return val[k]
+                if any(k in val for k in ("question", "term", "action_item")):
+                    return [val]
+            return val
         except (ValueError, TypeError):
             pass
 
-    obj_match = re.search(r"\{[\s\S]*\}", raw_output)
-    if obj_match:
-        try:
-            return json.loads(obj_match.group(0))
-        except (ValueError, TypeError):
-            pass
+    repaired = re.sub(r",\s*([\]}])", r"\1", raw_output)
+    decoder = json.JSONDecoder()
+    candidates: list[Any] = []
+    for source in (raw_output, repaired):
+        for i in range(len(source)):
+            if source[i] in ("[", "{"):
+                try:
+                    obj, _ = decoder.raw_decode(source[i:])
+                    if obj not in candidates:
+                        candidates.append(obj)
+                except Exception:
+                    pass
+
+    if expect_list:
+        for c in candidates:
+            if isinstance(c, list) and len(c) > 0 and isinstance(c[0], (dict, str)):
+                return c
+        for c in candidates:
+            if isinstance(c, dict):
+                for k in ("flashcards", "definitions", "action_items", "items", "cards"):
+                    if k in c and isinstance(c[k], list):
+                        return c[k]
+                if any(k in c for k in ("question", "term", "action_item")):
+                    return [c]
+
+    for c in candidates:
+        if isinstance(c, (list, dict)):
+            return c
 
     if len(raw_output.strip()) > 0:
         logger.warning("failed to parse JSON payload from LLM response: %s", raw_output[:300])
@@ -457,11 +482,6 @@ class StructuringAgent:
         except (ValueError, OSError):
             return {"running_context": "", "processed_byte_offset": 0, "overlap_entries": [], "notes_byte_offset": 0}
         notes_byte_offset = int(data.get("notes_byte_offset", 0))
-        if self.notes_path.exists() and notes_byte_offset > 0:
-            current_notes_size = self.notes_path.stat().st_size
-            if current_notes_size > notes_byte_offset:
-                with open(self.notes_path, "r+b") as fh:
-                    fh.truncate(notes_byte_offset)
         return {
             "running_context": str(data.get("running_context", "")),
             "processed_byte_offset": int(data.get("processed_byte_offset", 0)),
@@ -682,8 +702,15 @@ class StructuringAgent:
         previous_mentions = self.find_previous_mentions(definitions)
         section_text = self.build_notes_section(batch, result_state, previous_mentions)
         if len(section_text) > 0:
-            with open(self.notes_path, "a", encoding="utf-8", newline="\n") as file_handle:
-                file_handle.write(section_text)
+            first_timestamp = float(batch.entries[0].get("timestamp_epoch", 0.0))
+            heading_time = time.strftime("%H:%M:%S", time.localtime(first_timestamp))
+            section_marker = f"### {heading_time}"
+            existing_notes = self.notes_path.read_text(encoding="utf-8") if self.notes_path.exists() else ""
+            if section_marker in existing_notes:
+                logger.info("section %s already present in notes, skipping append to prevent duplicate", section_marker)
+            else:
+                with open(self.notes_path, "a", encoding="utf-8", newline="\n") as file_handle:
+                    file_handle.write(section_text)
 
         self.append_flashcards(result_state.get("flashcards", []) or [])
         first_timestamp = float(batch.entries[0].get("timestamp_epoch", 0.0))

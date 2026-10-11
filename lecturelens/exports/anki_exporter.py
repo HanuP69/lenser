@@ -14,10 +14,27 @@ def compute_stable_deck_id(deck_name: str) -> int:
     return (1 << 30) + (checksum % (1 << 30))
 
 
+def is_valid_math_expression(content: str) -> bool:
+    stripped = content.strip()
+    if len(stripped) == 0:
+        return False
+    if re.match(r"^\d+(?:[.,]\d+)?$", stripped):
+        return False
+    has_math_syntax = any(char in stripped for char in ("\\", "=", "+", "-", "*", "/", "^", "_", "{", "}", "<", ">"))
+    is_variable = bool(re.match(r"^[A-Za-z](?:\[[0-9A-Za-z]+\]|\([0-9A-Za-z]+\))?$", stripped))
+    return has_math_syntax or is_variable
+
+
 def convert_markdown_math_to_anki(text: str) -> str:
     display_converted = re.sub(r"\$\$(.+?)\$\$", r"\\[\1\\]", text, flags=re.DOTALL)
-    inline_converted = re.sub(r"\$([^$\n]+?)\$", r"\\(\1\\)", display_converted)
-    return inline_converted
+
+    def replace_inline(match: re.Match) -> str:
+        inner = match.group(1)
+        if is_valid_math_expression(inner):
+            return f"\\({inner}\\)"
+        return match.group(0)
+
+    return re.sub(r"\$(?!\s)([^$\n]+?)(?<!\s)\$", replace_inline, display_converted)
 
 
 def format_card_field_html(text: str) -> str:

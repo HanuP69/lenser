@@ -229,19 +229,22 @@ class CameraAgent:
         fraction = compute_changed_fraction(self.last_published_thumbnail, thumbnail, 25)
         return fraction >= self.settings.board_change_threshold
 
-    async def read_vision_text(self, image_bytes: bytes) -> tuple[str, float, str]:
+    async def read_vision_text(self, image_bytes: bytes, max_retries: int = 2) -> tuple[str, float, str]:
         if self.llm_router is None or self.control.stop_requested():
             return "", 0.0, "none"
         message = build_image_message(BOARD_VISION_PROMPT, image_bytes, "image/jpeg")
-        try:
-            response = await self.llm_router.ainvoke([message])
-        except Exception as error:
-            logger.error("board vision call failed: %s", error)
-            return "", 0.0, "none"
-        raw_text = response_to_text(response)
-        cleaned_text, confidence = parse_confidence_footer(raw_text)
-        provider_name = extract_provider_name(response, "unknown")
-        return cleaned_text, confidence, provider_name
+        for attempt in range(max_retries):
+            try:
+                response = await self.llm_router.ainvoke([message])
+                raw_text = response_to_text(response)
+                cleaned_text, confidence = parse_confidence_footer(raw_text)
+                provider_name = extract_provider_name(response, "unknown")
+                return cleaned_text, confidence, provider_name
+            except Exception as error:
+                logger.error("board vision call failed (attempt %d/%d): %s", attempt + 1, max_retries, error)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+        return "", 0.0, "none"
 
     async def process_still_frame(self, frame_bytes: bytes) -> Optional[BoardCaptured]:
         thumbnail = await run_in_thread_pool(build_board_thumbnail, frame_bytes)
@@ -269,7 +272,8 @@ class CameraAgent:
             return None
 
         text, confidence, provider_name = await self.read_vision_text(corrected_bytes)
-        self.last_published_thumbnail = thumbnail
+        if len(text.strip()) > 0:
+            self.last_published_thumbnail = thumbnail
         self.last_publish_time = time.monotonic()
 
         board_event = BoardCaptured(

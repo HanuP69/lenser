@@ -35,6 +35,9 @@ ANCHOR_SOURCE_TYPES: tuple[str, ...] = ("slide", "board")
 class BufferedEntry:
     entry: TimelineEntry
     arrival_monotonic: float
+    stream_name: Optional[str] = None
+    group_name: Optional[str] = None
+    message_id: Optional[str] = None
 
 
 @dataclass
@@ -131,16 +134,29 @@ class SyncAgent:
             return self.board_to_entry(BoardCaptured.from_redis_dict(message_data))
         raise ValueError(f"unknown source type {source_type}")
 
-    async def add_entry(self, entry: TimelineEntry) -> None:
+    async def add_entry(
+        self,
+        entry: TimelineEntry,
+        stream_name: Optional[str] = None,
+        group_name: Optional[str] = None,
+        message_id: Optional[str] = None
+    ) -> None:
         async with self.buffer_lock:
-            self.pending_buffer.append(BufferedEntry(entry, time.monotonic()))
+            self.pending_buffer.append(
+                BufferedEntry(entry, time.monotonic(), stream_name, group_name, message_id)
+            )
 
     async def consume_stream(self, source_type: str) -> None:
         stream_name = self.build_stream_name(source_type)
 
-        async def handle_message(message_data: dict[str, str]) -> None:
+        async def handle_message(message_data: dict[str, str], message_id: str) -> None:
             entry = self.convert_message(source_type, message_data)
-            await self.add_entry(entry)
+            await self.add_entry(
+                entry,
+                stream_name=stream_name,
+                group_name="group:kuudere",
+                message_id=message_id
+            )
 
         await self.redis_bus.consume(
             stream_name=stream_name,
@@ -149,7 +165,8 @@ class SyncAgent:
             handler=handle_message,
             batch_size=self.settings.redis_consumer_batch_size,
             block_ms=self.settings.redis_consumer_block_ms,
-            should_stop=lambda: self.drain_requested
+            should_stop=lambda: self.drain_requested,
+            auto_ack=False
         )
 
     def find_nearest_anchor(self, timestamp_epoch: float, window_seconds: float) -> Optional[AnchorRecord]:
@@ -270,6 +287,14 @@ class SyncAgent:
             except OSError as error:
                 logger.error("timeline write failed, entries kept in buffer: %s", error)
                 return 0
+            for buffered in ready:
+                if buffered.stream_name and buffered.group_name and buffered.message_id:
+                    try:
+                        await self.redis_bus.client.xack(
+                            buffered.stream_name, buffered.group_name, buffered.message_id
+                        )
+                    except Exception as ack_err:
+                        logger.warning("failed to ack message %s: %s", buffered.message_id, ack_err)
             self.remove_flushed_entries(ready)
             self.entries_written += len(ordered_entries)
             self.control.set_stat("timeline_entries_written", self.entries_written)

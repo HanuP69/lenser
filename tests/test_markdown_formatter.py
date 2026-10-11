@@ -33,7 +33,7 @@ class TestMarkdownFormatter(unittest.TestCase):
     def test_normalize_headings_roman_and_continuation(self) -> None:
         raw = "I. Review of Coefficients\nTopic (Cont.)\n### Next Section (Continued)"
         normalized = normalize_headings(raw)
-        self.assertIn("## Review of Coefficients", normalized)
+        self.assertIn("#### Review of Coefficients", normalized)
         self.assertNotIn("(Cont.)", normalized)
         self.assertNotIn("(Continued)", normalized)
 
@@ -57,7 +57,7 @@ class TestMarkdownFormatter(unittest.TestCase):
         cleaned = format_clean_markdown(sample)
         self.assertNotIn("ðŸ“", cleaned)
         self.assertNotIn("(Cont.)", cleaned)
-        self.assertIn("## Overview", cleaned)
+        self.assertIn("#### Overview", cleaned)
         self.assertIn("- $A = 2$", cleaned)
         self.assertIn("- $A$: Squared coefficient", cleaned)
         self.assertIn("\n\n$$\nx^2 + bx + c = 0\n$$\n\n", cleaned)
@@ -103,6 +103,32 @@ class TestMarkdownFormatter(unittest.TestCase):
         cleaned = clean_mojibake_and_emojis(raw)
         self.assertIn("\U0001D465", cleaned)
         self.assertIn("\u2300", cleaned)
+
+    def test_tables_not_converted_to_headings(self) -> None:
+        raw = "| Name | Value |\n|---|---|\n| Theta | 42 |"
+        formatted = format_clean_markdown(raw)
+        self.assertNotIn("## | Name | Value |", formatted)
+        self.assertNotIn("#### | Name | Value |", formatted)
+        self.assertIn("| Name | Value |", formatted)
+
+    def test_numbered_items_not_converted_to_headings(self) -> None:
+        raw = "4. Binary Search\n10. Dynamic Programming"
+        formatted = format_clean_markdown(raw)
+        self.assertNotIn("#### 4. Binary Search", formatted)
+        self.assertNotIn("#### 10. Dynamic Programming", formatted)
+        self.assertIn("4. Binary Search", formatted)
+
+    def test_nested_list_indentation_preserved(self) -> None:
+        raw = "- Level 1\n  - Level 2\n    - Level 3"
+        formatted = format_clean_markdown(raw)
+        self.assertIn("  - Level 2", formatted)
+        self.assertIn("    - Level 3", formatted)
+
+    def test_double_dollars_inside_code_fences_preserved(self) -> None:
+        raw = "```python\nx = '$$test$$'\n```"
+        formatted = format_clean_markdown(raw)
+        self.assertIn("$$test$$", formatted)
+        self.assertNotIn("\n\n$$\ntest\n$$\n\n", formatted)
 
 
 if __name__ == "__main__":

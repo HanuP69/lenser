@@ -173,12 +173,18 @@ class RedisBus:
         stream_name: str,
         group_name: str,
         messages: list[tuple[str, dict[str, str]]],
-        handler: Callable[[dict[str, str]], Awaitable[Any]]
+        handler: Callable[..., Awaitable[Any]],
+        auto_ack: bool = True
     ) -> None:
         for message_id, message_data in messages:
             failure_key = f"{stream_name}|{message_id}"
             try:
-                await handler(message_data)
+                import inspect
+                sig = inspect.signature(handler)
+                if len(sig.parameters) >= 2:
+                    await handler(message_data, message_id)
+                else:
+                    await handler(message_data)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -197,7 +203,8 @@ class RedisBus:
                     )
                     del self.failure_counts[failure_key]
                 continue
-            await self.client.xack(stream_name, group_name, message_id)
+            if auto_ack:
+                await self.client.xack(stream_name, group_name, message_id)
             if failure_key in self.failure_counts:
                 del self.failure_counts[failure_key]
 
@@ -206,10 +213,11 @@ class RedisBus:
         stream_name: str,
         group_name: str,
         consumer_name: str,
-        handler: Callable[[dict[str, str]], Awaitable[Any]],
+        handler: Callable[..., Awaitable[Any]],
         batch_size: int = 10,
         block_ms: int = 2000,
-        should_stop: Optional[Callable[[], bool]] = None
+        should_stop: Optional[Callable[[], bool]] = None,
+        auto_ack: bool = True
     ) -> None:
         backoff_seconds = 0.5
         backlog_drained = False
@@ -228,7 +236,7 @@ class RedisBus:
                     if len(messages) == 0:
                         backlog_drained = True
                         continue
-                    await self.dispatch_messages(stream_name, group_name, messages, handler)
+                    await self.dispatch_messages(stream_name, group_name, messages, handler, auto_ack)
                     continue
 
                 current_time = time.monotonic()
@@ -238,7 +246,7 @@ class RedisBus:
                         stream_name, group_name, consumer_name, batch_size
                     )
                     if len(reclaimed) > 0:
-                        await self.dispatch_messages(stream_name, group_name, reclaimed, handler)
+                        await self.dispatch_messages(stream_name, group_name, reclaimed, handler, auto_ack)
 
                 messages = await self.read_group_messages(
                     stream_name, group_name, consumer_name, ">", batch_size, block_ms
@@ -248,7 +256,7 @@ class RedisBus:
                     if should_stop is not None and should_stop():
                         return
                     continue
-                await self.dispatch_messages(stream_name, group_name, messages, handler)
+                await self.dispatch_messages(stream_name, group_name, messages, handler, auto_ack)
             except asyncio.CancelledError:
                 raise
             except Exception as error:

@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     whisper_model_size: str = Field(default="base")
     whisper_device: str = Field(default="cpu")
     whisper_language: Optional[str] = Field(default=None)
-    whisper_lock_language: bool = Field(default=True)
+    whisper_lock_language: bool = Field(default=False)
     whisper_beam_size: int = Field(default=3)
     whisper_min_avg_logprob: float = Field(default=-1.0)
     whisper_max_no_speech_prob: float = Field(default=0.6)

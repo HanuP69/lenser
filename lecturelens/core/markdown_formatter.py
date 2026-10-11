@@ -39,11 +39,17 @@ def clean_mojibake_and_emojis(text: str) -> str:
 
 
 def normalize_math_blocks(text: str) -> str:
-    def format_math_match(match: re.Match) -> str:
-        equation_content = match.group(1).strip()
-        return f"\n\n$$\n{equation_content}\n$$\n\n"
-
-    return DISPLAY_MATH_PATTERN.sub(format_math_match, text)
+    parts = re.split(r"(```[\s\S]*?```|`[^`\n]+`)", text)
+    result: list[str] = []
+    for i, part in enumerate(parts):
+        if i % 2 == 1:
+            result.append(part)
+        else:
+            result.append(DISPLAY_MATH_PATTERN.sub(
+                lambda match: f"\n\n$$\n{match.group(1).strip()}\n$$\n\n",
+                part
+            ))
+    return "".join(result)
 
 
 def normalize_headings(text: str) -> str:
@@ -72,10 +78,18 @@ def normalize_headings(text: str) -> str:
             processed_lines.append(stripped)
             continue
 
+        if stripped.startswith("|") or stripped.endswith("|"):
+            processed_lines.append(line.rstrip())
+            continue
+
+        if re.match(r"^\d+\.", stripped):
+            processed_lines.append(line.rstrip())
+            continue
+
         roman_match = ROMAN_NUMERAL_HEADING_PATTERN.match(stripped)
         if roman_match:
             heading_title = roman_match.group(1).strip()
-            processed_lines.append(f"## {heading_title}")
+            processed_lines.append(f"#### {heading_title}")
             continue
 
         words = stripped.split()
@@ -84,14 +98,15 @@ def normalize_headings(text: str) -> str:
             len(words) <= 7
             and not is_equation_or_code
             and not stripped.endswith((".", ":", ",", ";", "?", "!"))
-            and not stripped.startswith(("-", "*", ">", "$", "1.", "2.", "3.", "#"))
+            and not stripped.startswith(("-", "*", ">", "$", "#", "|"))
+            and not re.match(r"^\d+\.", stripped)
             and any(w[0].isupper() for w in words if len(w) > 0 and w[0].isalpha())
             and len(stripped) <= 60
         ):
-            processed_lines.append(f"## {stripped}")
+            processed_lines.append(f"#### {stripped}")
             continue
 
-        processed_lines.append(stripped)
+        processed_lines.append(line.rstrip())
 
     return "\n".join(processed_lines)
 

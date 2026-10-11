@@ -101,6 +101,18 @@ class TestAnkiExporter(unittest.TestCase):
         self.assertIn(r"\(e^{i\pi} + 1\)", fields)
         self.assertIn(r"\[0\]", fields)
 
+    def test_currency_is_not_converted_to_math(self) -> None:
+        flashcards = [
+            {"question": "The item costs $5 and later $10.", "answer": "Total is $15."}
+        ]
+        count = create_anki_deck("Currency deck", flashcards, self.output_path)
+        self.assertEqual(count, 1)
+        fields = read_note_fields(self.output_path, self.work_dir)
+        self.assertIn("$5", fields)
+        self.assertIn("$10", fields)
+        self.assertNotIn(r"\(5", fields)
+        self.assertNotIn(r"\)", fields)
+
 
 if __name__ == "__main__":
     unittest.main()

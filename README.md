@@ -10,7 +10,7 @@
 2. [Data Flow & Lifecycle of a Session](#data-flow--lifecycle-of-a-session)
 3. [Meet the Agents (Personalities & Roles)](#meet-the-agents-personalities--roles)
 4. [Empirical Benchmarks & Reproducible Metrics](#empirical-benchmarks--reproducible-metrics)
-5. [Automated Test Suite (260 Tests)](#automated-test-suite-260-tests)
+5. [Automated Test Suite (268 Tests)](#automated-test-suite-268-tests)
 6. [CLI Command Reference](#cli-command-reference)
 7. [Session Artifacts & Output Structure](#session-artifacts--output-structure)
 8. [Configuration & Environment Variables](#configuration--environment-variables)
@@ -121,9 +121,9 @@ When a user launches a lecture recording session (`lecturelens start`), the syst
       |
       v
 7. 3-Phase Graceful Shutdown (On Ctrl+C or `lecturelens stop`)
-      Phase 1 (5s timeout) : Sets stop.flag -> Capture agents halt audio/video recording.
-      Phase 2 (10s timeout): Sets sync_stop.flag -> Sync agent flushes remaining stream events to timeline.
-      Phase 3 (30s timeout): Sets finalize.flag -> Structuring agent executes final end-of-lecture synthesis.
+      Phase 1 (30s timeout): Sets stop.flag -> Capture agents halt audio/video recording.
+      Phase 2 (30s timeout): Sets sync_stop.flag -> Sync agent flushes remaining stream events to timeline.
+      Phase 3 (120s timeout): Sets finalize.flag -> Structuring agent executes final end-of-lecture synthesis.
       Notes, concept graphs, and flashcards finalized safely.
 ```
 
@@ -227,13 +227,13 @@ python benchmark_reproducible.py
 
 ---
 
-## Automated Test Suite (260 Tests)
+## Automated Test Suite (268 Tests)
 
-LectureLens maintains an automated test suite of **260 unit and integration tests** verifying concurrency, resilience, audio processing, computer vision, and LLM state machines:
+LectureLens maintains an automated test suite of **268 unit and integration tests** verifying concurrency, resilience, audio processing, computer vision, and LLM state machines:
 
 ```
 ----------------------------------------------------------------------
-Ran 260 tests in 38.067s
+Ran 268 tests in 38.067s
 
 OK
 ```
@@ -248,22 +248,22 @@ OK
 | `test_gateway.py` | **18 tests** | WebSocket gateway server, API key validation, base64 payload decoding, connection multiplexing, remote streaming. |
 | `test_audio_agent.py` | **17 tests** | RMS VAD energy gating, speech segmentation, audio mixing, faster-whisper chunking, language locking. |
 | `test_camera_agent.py` | **17 tests** | 4-point perspective warp, motion thresholding, blur variance, stillness gating, whiteboard detection. |
+| `test_importance.py` | **17 tests** | Verbal cue classification across English, Hindi, and Hinglish ("definition", "exam_relevant", "dhyaan do", bare test false-positive avoidance). |
 | `test_sync_agent.py` | **16 tests** | Redis Streams consumption, sliding merge window, cross-modal correlation IDs, chronological timeline serialization. |
 | `test_interactive.py` | **16 tests** | Interactive terminal wizard, live UnoRouter API health check, Ollama local model detection, model filtering. |
-| `test_importance.py` | **15 tests** | Verbal cue classification across English, Hindi, and Hinglish ("definition", "exam_relevant", "dhyaan do", bare test false-positive avoidance). |
 | `test_screen_agent.py` | **14 tests** | MSS screenshot grabbing, perceptual dHash hashing, Hamming distance slide cache, OCR fallback to vision LLM. |
+| `test_markdown_formatter.py`| **14 tests** | Code block indentation preservation, equation heading protection, unicode math preservation, display math block normalization. |
 | `test_llm_router.py` | **13 tests** | Multimodal task routing, OpenAI-compatible provider, Google GenAI, Ollama, circuit breaker rate-limiting, retries. |
 | `test_clock_and_files.py` | **11 tests** | SessionClock persistence, elapsed duration calculation, accumulated_seconds tracking, atomic file writes. |
-| `test_markdown_formatter.py`| **10 tests** | Code block indentation preservation, equation heading protection, unicode math preservation, display math block normalization. |
 | `test_redis_bus.py` | **9 tests** | Redis Streams resilient publishing, offline memory outbox buffer, dead-letter stream, consumer group acknowledgements. |
 | `test_recovery.py` | **8 tests** | AgentMonitor process lifecycle, exponential backoff restarts (1s, 2s, 4s, 8s), multi-phase graceful shutdown with timeouts. |
 | `test_concept_graph.py` | **7 tests** | SQLite relational concept store, definition indexing, cross-lecture concept linking, sanitized database isolation. |
+| `test_anki_exporter.py` | **6 tests** | Anki `.apkg` deck packaging, Basic note model with MathJax `\(` and `\[` rendering, deck-qualified GUID deduplication, currency preservation. |
 | `test_qa_engine.py` | **6 tests** | Vector indexing, semantic search, RAG-grounded question answering with source transcript citations. |
 | `test_schemas.py` | **5 tests** | Pydantic event schemas: `TranscriptChunk`, `SlideCaptured`, `BoardCaptured`, `TimelineEntry`. |
-| `test_anki_exporter.py` | **5 tests** | Anki `.apkg` deck packaging, Basic note model with MathJax `\(` and `\[` rendering, deck-qualified GUID deduplication. |
 | `test_concurrency.py` | **4 tests** | Thread pool and process pool executor allocation, worker limits, safe shutdown. |
 | `test_circuit_breaker.py` | **3 tests** | Redis fixed-window rate limiter, failure count tracking and TTL cooldown. |
-| `test_pdf_exporter.py` | **2 tests** | ReportLab flowable PDF compilation, heading formatting, typography, callout blocks. |
+| `test_pdf_exporter.py` | **3 tests** | ReportLab flowable PDF compilation, table styles, math formatting, typography, callout blocks. |
 | `test_pipeline_integration.py`| **1 test** | Full integration test from multimodal stream ingestion to finalized notes. |
 
 To run the complete test suite:
@@ -301,7 +301,7 @@ lecturelens resume --session "os_lecture_01"
 ```
 
 ### 3. `lecturelens stop`
-Triggers the multi-phase graceful shutdown: capture agents stop (5s timeout), remaining timeline entries are flushed (10s timeout), and a final LLM structuring pass synthesizes notes (30s timeout):
+Triggers the multi-phase graceful shutdown: capture agents stop (30s timeout), remaining timeline entries are flushed (30s timeout), and a final LLM structuring pass synthesizes notes (120s timeout):
 ```bash
 lecturelens stop --session "os_lecture_01"
 ```

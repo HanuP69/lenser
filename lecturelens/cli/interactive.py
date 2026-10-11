@@ -183,6 +183,14 @@ def configure_ollama_flow(settings: Settings, console: Console) -> tuple[str, st
         if choice == "custom":
             custom_model = Prompt.ask("Enter Ollama model name to use", default=models[0])
             return "gemma", custom_model, "local", "gemma"
+        if choice == "pull-default":
+            console.print("[cyan]Running 'ollama pull gemma4:e4b'...[/cyan]")
+            try:
+                import subprocess
+                subprocess.run(["ollama", "pull", "gemma4:e4b"], check=False)
+            except Exception as pull_err:
+                console.print(f"[yellow]Could not execute ollama pull: {pull_err}[/yellow]")
+            return "gemma", "gemma4:e4b", "local", "gemma"
         return "gemma", "gemma4:e4b", "local", "gemma"
 
     if len(compatible) == 1:
@@ -263,7 +271,7 @@ def select_llm_provider(settings: Settings, console: Console) -> tuple[str, str,
             border_style="blue"
         )
     )
-    choice = Prompt.ask("Select provider", choices=["1", "2", "3"], default="2")
+    choice = Prompt.ask("Select provider", choices=["1", "2", "3"], default="1")
     if choice == "2":
         return configure_unorouter_flow(console, mode="cloud")
     if choice == "3":

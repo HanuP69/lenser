@@ -174,6 +174,8 @@ class SpeechSegmenter:
     ) -> None:
         self.sample_rate: int = sample_rate
         self.energy_threshold: float = energy_threshold
+        self.noise_floor: float = energy_threshold * 0.5
+        self.adaptive: bool = True
         self.min_chunk_seconds: float = min_chunk_seconds
         self.max_chunk_seconds: float = max_chunk_seconds
         self.silence_gap_seconds: float = silence_gap_seconds
@@ -215,7 +217,13 @@ class SpeechSegmenter:
 
         block_start_sample = self.consumed_samples
         self.consumed_samples += block.size
-        speech_present = is_speech_detected(block, self.energy_threshold)
+        rms = compute_rms_energy(block)
+        effective_threshold = self.energy_threshold
+        if self.adaptive:
+            effective_threshold = max(self.energy_threshold, self.noise_floor * 2.2)
+        speech_present = rms >= effective_threshold
+        if not speech_present:
+            self.noise_floor = 0.95 * self.noise_floor + 0.05 * rms
 
         if len(self.active_blocks) == 0:
             if not speech_present:
@@ -380,6 +388,12 @@ class MixedBlockSource:
 
     def read_block(self, timeout_seconds: float) -> Optional[np.ndarray]:
         first_block = self.first_source.read_block(timeout_seconds)
+        if hasattr(self.second_source, "block_queue"):
+            while self.second_source.block_queue.qsize() > 3:
+                try:
+                    self.second_source.block_queue.get_nowait()
+                except Exception:
+                    break
         second_block = self.second_source.read_block(0.02)
         if first_block is None and second_block is None:
             return None

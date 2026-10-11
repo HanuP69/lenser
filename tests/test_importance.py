@@ -81,3 +81,11 @@ class TestImportanceFalsePositives(unittest.TestCase):
     def test_dhyaan_variants_detected(self) -> None:
         self.assertIn("exam_relevant", detect_importance_flags("Is point par dhyaan do."))
         self.assertIn("exam_relevant", detect_importance_flags("Is point par dhyan do."))
+
+    def test_unit_test_passes_not_flagged(self) -> None:
+        self.assertEqual(detect_importance_flags("All unit test passes in our suite."), [])
+
+    def test_upcoming_and_surprise_test_flagged(self) -> None:
+        self.assertIn("exam_relevant", detect_importance_flags("The test will cover graph algorithms."))
+        self.assertIn("exam_relevant", detect_importance_flags("There is a test next Monday."))
+        self.assertIn("exam_relevant", detect_importance_flags("Get ready for a surprise test."))

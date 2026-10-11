@@ -117,14 +117,27 @@ for _ in range(50):
     naive_times.append(time.perf_counter() - t0)
 avg_naive_ms = (sum(naive_times) / len(naive_times)) * 1000.0
 
-gate = SlideChangeGate(change_threshold=0.004, pixel_delta=25, min_interval_seconds=0.0)
-gate_times = []
+thumb_base = build_gray_thumbnail(slide_img, 640)
+alt_slide_img = Image.fromarray(img_arr2)
+thumb_changed = build_gray_thumbnail(alt_slide_img, 640)
+
+gate_settled = SlideChangeGate(change_threshold=0.004, pixel_delta=25, min_interval_seconds=0.0)
+gate_settled.evaluate(thumb_base, 0.0)
+settled_times = []
 for _ in range(50):
     t0 = time.perf_counter()
-    thumb1 = build_gray_thumbnail(slide_img, 640)
-    _ = gate.evaluate(thumb1, time.monotonic())
-    gate_times.append(time.perf_counter() - t0)
-avg_gate_ms = (sum(gate_times) / len(gate_times)) * 1000.0
+    _ = gate_settled.evaluate(thumb_base, time.monotonic())
+    settled_times.append(time.perf_counter() - t0)
+avg_settled_ms = (sum(settled_times) / len(settled_times)) * 1000.0
+
+gate_changing = SlideChangeGate(change_threshold=0.004, pixel_delta=25, min_interval_seconds=0.0)
+changing_times = []
+for i in range(50):
+    current_thumb = thumb_changed if (i % 2 == 1) else thumb_base
+    t0 = time.perf_counter()
+    _ = gate_changing.evaluate(current_thumb, time.monotonic())
+    changing_times.append(time.perf_counter() - t0)
+avg_changing_ms = (sum(changing_times) / len(changing_times)) * 1000.0
 
 revisit_hash_times = []
 thumb_pre = build_gray_thumbnail(slide_img, 640)
@@ -134,10 +147,12 @@ for _ in range(200):
     revisit_hash_times.append(time.perf_counter() - t0)
 avg_revisit_hash_us = (sum(revisit_hash_times) / len(revisit_hash_times)) * 1_000_000.0
 
-print(f"    Method 1: Naive 1080p RGB Matrix Difference: {avg_naive_ms:.2f} ms")
-print(f"    Method 2: Production SlideChangeGate (640px): {avg_gate_ms:.2f} ms")
-print(f"    Revisit Cache dHash Kernel:                  {avg_revisit_hash_us:.1f} us")
-print(f"    Gating Speedup vs Full Frame Diff:           {avg_naive_ms / avg_gate_ms:.1f}x faster")
+print(f"    Method 1: Naive 1080p RGB Matrix Difference:    {avg_naive_ms:.2f} ms")
+print(f"    Method 2a: SlideChangeGate Settled (640px):     {avg_settled_ms:.2f} ms")
+print(f"    Method 2b: SlideChangeGate Changed (640px):     {avg_changing_ms:.2f} ms")
+print(f"    Revisit Cache dHash Kernel:                     {avg_revisit_hash_us:.1f} us")
+print(f"    Gating Speedup vs Full Frame Diff (Settled):    {avg_naive_ms / avg_settled_ms:.1f}x faster")
+print(f"    Gating Speedup vs Full Frame Diff (Changed):    {avg_naive_ms / avg_changing_ms:.1f}x faster")
 
 found_session = False
 output_dir = Path("./output")
@@ -146,14 +161,38 @@ if output_dir.exists():
         slides_dir = session_dir / "raw" / "slides"
         if slides_dir.exists():
             n_slides = len(list(slides_dir.glob("*.png")))
-            session_sec = 600
+            session_sec = 0
+            meta_file = session_dir / "session_meta.json"
             clock_file = session_dir / "clock.json"
-            if clock_file.exists():
+            timeline_file = session_dir / "timeline.jsonl"
+            if meta_file.exists():
                 try:
-                    c_data = json.loads(clock_file.read_text(encoding="utf-8"))
-                    session_sec = max(60, int(c_data.get("accumulated_seconds", 600)))
+                    m_data = json.loads(meta_file.read_text(encoding="utf-8"))
+                    dur = sum(float(r.get("duration_seconds", 0.0)) for r in m_data.get("runs", []))
+                    if dur > 0:
+                        session_sec = int(dur)
                 except Exception:
                     pass
+            if session_sec == 0 and clock_file.exists():
+                try:
+                    c_data = json.loads(clock_file.read_text(encoding="utf-8"))
+                    dur = float(c_data.get("accumulated_seconds", 0.0))
+                    if dur > 0:
+                        session_sec = int(dur)
+                except Exception:
+                    pass
+            if session_sec == 0 and timeline_file.exists():
+                try:
+                    lines = timeline_file.read_text(encoding="utf-8").strip().splitlines()
+                    if len(lines) >= 2:
+                        first_t = float(json.loads(lines[0]).get("timestamp_epoch", 0.0))
+                        last_t = float(json.loads(lines[-1]).get("timestamp_epoch", 0.0))
+                        if last_t > first_t:
+                            session_sec = int(last_t - first_t)
+                except Exception:
+                    pass
+            if session_sec == 0:
+                session_sec = 600
             total_potential_frames = session_sec
             reduction = ((total_potential_frames - n_slides) / total_potential_frames) * 100.0
             print(f"\n[3] SESSION COMPUTE REDUCTION (Real Lecture: {session_dir.name})")

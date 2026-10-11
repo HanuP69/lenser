@@ -284,12 +284,19 @@ def run_shutdown(monitor: AgentMonitor, session_dir: Path, planned_agents: list[
         if name in CAPTURE_AGENT_NAMES or name == "gateway":
             capture_names.append(name)
     phases: list[tuple[list[str], str, Optional[float]]] = [
-        (capture_names, STOP_FLAG_NAME, 5.0),
-        (["sync_agent"], SYNC_STOP_FLAG_NAME, 10.0),
-        (["structuring_agent"], FINALIZE_FLAG_NAME, 30.0)
+        (capture_names, STOP_FLAG_NAME, 30.0),
+        (["sync_agent"], SYNC_STOP_FLAG_NAME, 30.0),
+        (["structuring_agent"], FINALIZE_FLAG_NAME, 120.0)
     ]
     with console.status("[bold cyan]Stopping agents, flushing timeline, and generating final notes with LLM...[/bold cyan]", spinner="dots"):
         monitor.run_shutdown_sequence(session_dir, phases)
+    clock_path = session_dir / "clock.json"
+    if clock_path.exists():
+        try:
+            clock = SessionClock.load_from_file(clock_path)
+            clock.save_to_file(clock_path)
+        except Exception:
+            pass
     session_meta.finish_run(session_dir)
     set_flag(session_dir, SESSION_FINISHED_FLAG_NAME)
     notes_file = session_dir / "notes.md"
@@ -573,13 +580,18 @@ def reprocess(
     if meta.get("course_name"):
         settings.course_name = meta["course_name"]
 
+    course_db_path = settings.get_course_database_path(settings.course_name)
     backup_files: dict[str, tuple[Path, Path]] = {}
-    for filename in ("notes.md", "context.json", "flashcards.jsonl", f"{session}.apkg", "flashcards.apkg"):
+    for filename in ("notes.md", "context.json", "flashcards.jsonl", f"{session}.apkg", "flashcards.apkg", "concepts.db"):
         p = session_dir / filename
         if p.exists():
             backup_p = session_dir / f"{filename}.bak"
             shutil.copy2(p, backup_p)
             backup_files[filename] = (p, backup_p)
+    if course_db_path.exists():
+        course_backup_p = course_db_path.with_suffix(".db.bak")
+        shutil.copy2(course_db_path, course_backup_p)
+        backup_files["course_db"] = (course_db_path, course_backup_p)
 
     async def run() -> int:
         from lecturelens.agents.structuring_agent import StructuringAgent
@@ -605,7 +617,8 @@ def reprocess(
     except Exception as error:
         for _, (p, backup_p) in backup_files.items():
             if backup_p.exists():
-                shutil.move(backup_p, p)
+                shutil.copy2(backup_p, p)
+                backup_p.unlink()
         fail(f"Reprocess failed: {error}")
     console.print(f"[green]Reprocessed {batches} batch(es).[/green]")
 
