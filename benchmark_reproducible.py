@@ -12,6 +12,7 @@ import numpy as np
 
 from lecturelens.agents.audio_agent import transcribe_audio_chunk
 from lecturelens.core.image_utils import (
+    SlideChangeGate,
     compute_difference_hash,
     hamming_distance
 )
@@ -25,15 +26,17 @@ print("=" * 60)
 def resolve_audio_sample() -> tuple[bytes, float]:
     candidate_patterns = [
         "output/**/raw/audio/*.wav",
-        "C:/Users/enup1/output/**/raw/audio/*.wav"
     ]
     for pattern in candidate_patterns:
         matches = glob.glob(pattern, recursive=True)
         if len(matches) > 0:
             target_path = Path(matches[0])
-            with wave.open(str(target_path), "rb") as wf:
-                duration = wf.getnframes() / float(wf.getframerate())
-            return target_path.read_bytes(), duration
+            try:
+                with wave.open(str(target_path), "rb") as wf:
+                    duration = wf.getnframes() / float(wf.getframerate())
+                return target_path.read_bytes(), duration
+            except Exception:
+                pass
 
     sample_rate = 16000
     duration = 5.0
@@ -51,12 +54,14 @@ def resolve_audio_sample() -> tuple[bytes, float]:
 def resolve_slide_sample() -> Image.Image:
     candidate_patterns = [
         "output/**/raw/slides/*.png",
-        "C:/Users/enup1/output/**/raw/slides/*.png"
     ]
     for pattern in candidate_patterns:
         matches = glob.glob(pattern, recursive=True)
         if len(matches) > 0:
-            return Image.open(matches[0])
+            try:
+                return Image.open(matches[0])
+            except Exception:
+                pass
 
     img = Image.new("RGB", (1920, 1080), color=(255, 255, 255))
     draw = ImageDraw.Draw(img)
@@ -112,68 +117,69 @@ for _ in range(50):
     naive_times.append(time.perf_counter() - t0)
 avg_naive_ms = (sum(naive_times) / len(naive_times)) * 1000.0
 
-gating_times = []
+gate = SlideChangeGate(change_threshold=0.004, pixel_delta=25, min_interval_seconds=0.0)
+gate_times = []
 for _ in range(50):
     t0 = time.perf_counter()
     thumb1 = build_gray_thumbnail(slide_img, 640)
-    hash1 = compute_difference_hash(thumb1)
-    thumb2 = build_gray_thumbnail(Image.fromarray(img_arr2), 640)
-    hash2 = compute_difference_hash(thumb2)
-    _ = hamming_distance(hash1, hash2)
-    gating_times.append(time.perf_counter() - t0)
-avg_gate_ms = (sum(gating_times) / len(gating_times)) * 1000.0
+    _ = gate.evaluate(thumb1, time.monotonic())
+    gate_times.append(time.perf_counter() - t0)
+avg_gate_ms = (sum(gate_times) / len(gate_times)) * 1000.0
 
-hash_only_times = []
+revisit_hash_times = []
 thumb_pre = build_gray_thumbnail(slide_img, 640)
 for _ in range(200):
     t0 = time.perf_counter()
     _ = compute_difference_hash(thumb_pre)
-    hash_only_times.append(time.perf_counter() - t0)
-avg_hash_only_us = (sum(hash_only_times) / len(hash_only_times)) * 1_000_000.0
+    revisit_hash_times.append(time.perf_counter() - t0)
+avg_revisit_hash_us = (sum(revisit_hash_times) / len(revisit_hash_times)) * 1_000_000.0
 
 print(f"    Method 1: Naive 1080p RGB Matrix Difference: {avg_naive_ms:.2f} ms")
-print(f"    Method 2: LectureLens Thumbnail + dHash:      {avg_gate_ms:.2f} ms")
-print(f"    dHash Hash Kernel Only:                      {avg_hash_only_us:.1f} us (microseconds)")
+print(f"    Method 2: Production SlideChangeGate (640px): {avg_gate_ms:.2f} ms")
+print(f"    Revisit Cache dHash Kernel:                  {avg_revisit_hash_us:.1f} us")
 print(f"    Gating Speedup vs Full Frame Diff:           {avg_naive_ms / avg_gate_ms:.1f}x faster")
 
-candidate_sessions = [
-    Path(r"C:\Users\enup1\output\2026-10-11_014623"),
-    Path("./output/2026-10-11_014623")
-]
-for session_dir in candidate_sessions:
-    if (session_dir / "raw" / "slides").exists():
-        n_slides = len(list((session_dir / "raw" / "slides").glob("*.png")))
-        session_sec = 600
-        clock_file = session_dir / "clock.json"
-        if clock_file.exists():
-            c_data = json.loads(clock_file.read_text(encoding="utf-8"))
-            session_sec = max(60, int(c_data.get("accumulated_seconds", 600)))
-        total_potential_frames = session_sec
-        reduction = ((total_potential_frames - n_slides) / total_potential_frames) * 100.0
-        print(f"\n[3] SESSION COMPUTE REDUCTION (Real Lecture: {session_dir.name})")
-        print(f"    Session Duration:               {session_sec} seconds (~{session_sec/60:.1f} minutes)")
-        print(f"    Naive 1 FPS OCR Invocations:    {total_potential_frames} calls")
-        print(f"    LectureLens Gated Invocations:  {n_slides} calls")
-        print(f"    Empirical Compute Reduction:    {reduction:.1f}%")
-        break
+found_session = False
+output_dir = Path("./output")
+if output_dir.exists():
+    for session_dir in sorted(output_dir.iterdir(), reverse=True):
+        slides_dir = session_dir / "raw" / "slides"
+        if slides_dir.exists():
+            n_slides = len(list(slides_dir.glob("*.png")))
+            session_sec = 600
+            clock_file = session_dir / "clock.json"
+            if clock_file.exists():
+                try:
+                    c_data = json.loads(clock_file.read_text(encoding="utf-8"))
+                    session_sec = max(60, int(c_data.get("accumulated_seconds", 600)))
+                except Exception:
+                    pass
+            total_potential_frames = session_sec
+            reduction = ((total_potential_frames - n_slides) / total_potential_frames) * 100.0
+            print(f"\n[3] SESSION COMPUTE REDUCTION (Real Lecture: {session_dir.name})")
+            print(f"    Session Duration:               {session_sec} seconds (~{session_sec/60:.1f} minutes)")
+            print(f"    Naive 1 FPS OCR Invocations:    {total_potential_frames} calls")
+            print(f"    LectureLens Gated Invocations:  {n_slides} calls")
+            print(f"    Empirical Compute Reduction:    {reduction:.1f}%")
+            found_session = True
+            break
 
-print(f"\n[4] MARKDOWN AST SANITIZATION BENCHMARK")
+if not found_session:
+    print("\n[3] SESSION COMPUTE REDUCTION")
+    print("    No recorded session directory found in ./output. Run a lecture with `lecturelens start` to inspect session savings.")
+
+print(f"\n[4] MARKDOWN POST-PROCESSING & SANITIZATION BENCHMARK")
 dirty_markdown = """01:51:40
-Expert academic note taker. O. Henry's "Hearts and Hands".
-Sub-topic 1: The Reinforcement of the Persona.
-Heading 1: The Persona
-Drafting Section 1: Detail text here.
-Refining Section 1: Better academic words.
+Drafting Section 1: Algorithmic Complexity analysis.
 Markdown headings? Yes.
-No Roman numerals? Yes.
 Ignore the DP slide? Yes.
-## The Reinforcement of the False Persona
+#### Computational Complexity & Invariant Analysis
 
-The second man accompanying Mr. Easton inadvertently serves as a catalyst for the misdirection.
+The partition step in quicksort guarantees that the pivot element is placed in its final position.
 - $A = 2$
 - $B = 4$
 $$
-x^2 + 2x + 1 = 0
+T(n) = 2T(n/2) + O(n)
 $$
 """
 clean_times = []
@@ -183,6 +189,6 @@ for _ in range(200):
     clean_times.append(time.perf_counter() - t0)
 
 avg_clean_us = (sum(clean_times) / len(clean_times)) * 1_000_000.0
-print(f"    Cleaning & AST Formatting Latency: {avg_clean_us:.1f} us (0.0{int(avg_clean_us/10)} ms)")
+print(f"    Cleaning & Markdown Formatting Latency: {avg_clean_us:.1f} us (0.0{int(avg_clean_us/10)} ms)")
 
 print("=" * 60)

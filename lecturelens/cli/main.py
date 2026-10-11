@@ -1,5 +1,6 @@
 import asyncio
 import os
+import shutil
 import sys
 import time
 import urllib.request
@@ -283,15 +284,19 @@ def run_shutdown(monitor: AgentMonitor, session_dir: Path, planned_agents: list[
         if name in CAPTURE_AGENT_NAMES or name == "gateway":
             capture_names.append(name)
     phases: list[tuple[list[str], str, Optional[float]]] = [
-        (capture_names, STOP_FLAG_NAME, None),
-        (["sync_agent"], SYNC_STOP_FLAG_NAME, None),
-        (["structuring_agent"], FINALIZE_FLAG_NAME, None)
+        (capture_names, STOP_FLAG_NAME, 5.0),
+        (["sync_agent"], SYNC_STOP_FLAG_NAME, 10.0),
+        (["structuring_agent"], FINALIZE_FLAG_NAME, 30.0)
     ]
     with console.status("[bold cyan]Stopping agents, flushing timeline, and generating final notes with LLM...[/bold cyan]", spinner="dots"):
         monitor.run_shutdown_sequence(session_dir, phases)
     session_meta.finish_run(session_dir)
     set_flag(session_dir, SESSION_FINISHED_FLAG_NAME)
-    console.print("[green]Session stopped. Notes saved.[/green]")
+    notes_file = session_dir / "notes.md"
+    if notes_file.exists() and notes_file.stat().st_size > 0:
+        console.print("[green]Session stopped. Notes saved.[/green]")
+    else:
+        console.print("[yellow]Session stopped. Final notes not generated or empty.[/yellow]")
     display_session_output_summary(session_dir, console)
 
 
@@ -444,7 +449,7 @@ def start(
 def stop(
     session: Optional[str] = typer.Option(None, "--session"),
     wait: bool = typer.Option(True, "--wait/--no-wait"),
-    timeout_seconds: Optional[float] = typer.Option(None, "--timeout"),
+    timeout_seconds: float = typer.Option(60.0, "--timeout"),
 ) -> None:
     settings = Settings()
     session_id = resolve_session(settings, session)
@@ -568,6 +573,14 @@ def reprocess(
     if meta.get("course_name"):
         settings.course_name = meta["course_name"]
 
+    backup_files: dict[str, tuple[Path, Path]] = {}
+    for filename in ("notes.md", "context.json", "flashcards.jsonl", f"{session}.apkg", "flashcards.apkg"):
+        p = session_dir / filename
+        if p.exists():
+            backup_p = session_dir / f"{filename}.bak"
+            shutil.copy2(p, backup_p)
+            backup_files[filename] = (p, backup_p)
+
     async def run() -> int:
         from lecturelens.agents.structuring_agent import StructuringAgent
         from lecturelens.router.llm_router import build_router_for_task, load_router_config
@@ -586,7 +599,13 @@ def reprocess(
 
     try:
         batches = asyncio.run(run())
+        for _, (_, backup_p) in backup_files.items():
+            if backup_p.exists():
+                backup_p.unlink()
     except Exception as error:
+        for _, (p, backup_p) in backup_files.items():
+            if backup_p.exists():
+                shutil.move(backup_p, p)
         fail(f"Reprocess failed: {error}")
     console.print(f"[green]Reprocessed {batches} batch(es).[/green]")
 

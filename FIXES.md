@@ -46,10 +46,10 @@ Numbers refer to the bug list from the code review.
 37. Rate limiter creates its key with a TTL before incrementing; breaker checked before the limiter.
 38. Dependencies corrected (`zeroconf` removed, `httpx`, `typing-extensions`, `reportlab` added).
 39. Models: `gemini-2.0-flash` was shut down by Google, replaced with `gemini-3.5-flash`; the OpenRouter entry now uses `openrouter/free`. Check both against your accounts.
-40. 220 tests, including process-pool recovery, offsets, partial lines, shutdown ordering and gateway security.
+40. 260 tests, including process-pool recovery, offsets, partial lines, shutdown ordering, gateway security, and markdown formatting resilience.
 
 ## Use cases
-Pause/resume (`pause`, `resume`), duplicate slide detection, code-friendly OCR settings, course tagging, disk-space warning, Redis stream length cap.
+Pause/resume (`pause`, `resume`), duplicate slide detection, code-friendly OCR settings, course tagging, disk-space warning, Redis stream length cap, notes in the lecture language.
 
 ## Not done
-Speaker diarization, pre-recorded video files as input, notes in the lecture language, echo cancellation for `--audio-source both`.
+Speaker diarization, pre-recorded video files as input, echo cancellation for `--audio-source both`.

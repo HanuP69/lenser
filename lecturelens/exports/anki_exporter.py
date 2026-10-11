@@ -1,4 +1,5 @@
 import html
+import re
 import zlib
 from pathlib import Path
 from typing import Any
@@ -13,8 +14,15 @@ def compute_stable_deck_id(deck_name: str) -> int:
     return (1 << 30) + (checksum % (1 << 30))
 
 
+def convert_markdown_math_to_anki(text: str) -> str:
+    display_converted = re.sub(r"\$\$(.+?)\$\$", r"\\[\1\\]", text, flags=re.DOTALL)
+    inline_converted = re.sub(r"\$([^$\n]+?)\$", r"\\(\1\\)", display_converted)
+    return inline_converted
+
+
 def format_card_field_html(text: str) -> str:
-    escaped = html.escape(text)
+    math_converted = convert_markdown_math_to_anki(text)
+    escaped = html.escape(math_converted)
     escaped = escaped.replace("\r\n", "\n")
     return escaped.replace("\n", "<br/>")
 
@@ -52,7 +60,7 @@ def create_anki_deck(
         note = genanki.Note(
             model=model,
             fields=[format_card_field_html(question), format_card_field_html(answer)],
-            guid=genanki.guid_for(question)
+            guid=genanki.guid_for(deck_name, question)
         )
         deck.add_note(note)
         added_count += 1

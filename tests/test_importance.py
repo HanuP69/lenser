@@ -74,3 +74,10 @@ class TestImportanceFalsePositives(unittest.TestCase):
 
     def test_curly_apostrophe_confusion(self) -> None:
         self.assertIn("confusion", detect_importance_flags("I don\u2019t understand this step."))
+
+    def test_bare_test_false_positive_avoided(self) -> None:
+        self.assertEqual(detect_importance_flags("This is a good test of the system."), [])
+
+    def test_dhyaan_variants_detected(self) -> None:
+        self.assertIn("exam_relevant", detect_importance_flags("Is point par dhyaan do."))
+        self.assertIn("exam_relevant", detect_importance_flags("Is point par dhyan do."))

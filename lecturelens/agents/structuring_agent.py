@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -82,8 +83,26 @@ def extract_json_payload(raw_output: str) -> Any:
         clean_json = clean_json.split("```")[1].split("```")[0].strip()
     try:
         return json.loads(clean_json)
-    except ValueError:
-        return None
+    except (ValueError, TypeError):
+        pass
+
+    arr_match = re.search(r"\[[\s\S]*\]", raw_output)
+    if arr_match:
+        try:
+            return json.loads(arr_match.group(0))
+        except (ValueError, TypeError):
+            pass
+
+    obj_match = re.search(r"\{[\s\S]*\}", raw_output)
+    if obj_match:
+        try:
+            return json.loads(obj_match.group(0))
+        except (ValueError, TypeError):
+            pass
+
+    if len(raw_output.strip()) > 0:
+        logger.warning("failed to parse JSON payload from LLM response: %s", raw_output[:300])
+    return None
 
 
 def truncate_text(text: str, limit: int) -> str:
@@ -211,7 +230,7 @@ NEW LECTURE TIMELINE SLICE (transcript, slide OCR, board captures; lines tagged 
 {new_timeline_text}
 
 FORMATTING GUIDELINES:
-1. HEADINGS: Use clear Markdown headings (## for concepts, ### for subsections) to organize notes logically.
+1. HEADINGS: Organize concepts and subtopics logically with clean Markdown headings (#### for major concepts, ##### for subsections) so they nest properly under the section header.
 2. CONTINUITY: Seamless narrative from earlier notes. Never repeat titles with (Cont.) or (Continued).
 3. NO EMOJIS: Never output emojis or icons.
 4. MATH: Single dollar inline ($formula$). Display math on its own lines:
@@ -323,9 +342,10 @@ EXAM-RELEVANT POINTS FLAGGED BY INSTRUCTOR:
 FLASHCARD QUALITY & FORMULATION REQUIREMENTS:
 1. STRICT PROHIBITION ON ROTE DEFINITION QUESTIONS:
    - Do NOT write generic "What is the definition of [X]?", "Define [X]", or "What is [Person/Term]?" questions.
-   - Adapt the question style to the academic discipline and concept type:
-     * Literature / Humanities / Social Sciences: Focus on character roles, motivations, thematic conflicts, narrative devices, dramatic irony, or plot mechanics (e.g. "In O. Henry's 'Hearts and Hands', what role does Ms. Fairchild play in the narrative deception, and how does her presence influence Mr. Easton's actions?").
-     * STEM / Computer Science / Mathematics / Engineering: Focus on mechanisms, step-by-step logic, invariants, time/space complexity trade-offs, edge cases, and failure modes (e.g. "Why does Dijkstra's algorithm require non-negative edge weights, and how does a negative weight break the greedy invariant?").
+   - Adapt question formulations to the subject domain and concept type:
+     * Humanities & Literature: Analyze character dynamics, authorial intent, thematic conflicts, narrative techniques, and textual subtext.
+     * Science & Engineering: Probe underlying physical/computational mechanisms, governing laws, boundary conditions, trade-offs, and failure modes.
+     * Mathematics & Formal Logic: Focus on proof techniques, invariant preservation, edge cases, and structural properties.
    - Frame questions that test active recall, analytical comprehension, cause-and-effect, and practical/exam application.
 
 2. COMPREHENSIVE, DEEP, DETAILED ANSWERS:
@@ -430,16 +450,23 @@ class StructuringAgent:
 
     def load_state(self) -> dict[str, Any]:
         if not self.context_path.exists():
-            return {"running_context": "", "processed_byte_offset": 0, "overlap_entries": []}
+            return {"running_context": "", "processed_byte_offset": 0, "overlap_entries": [], "notes_byte_offset": 0}
         try:
             with open(self.context_path, "r", encoding="utf-8") as file_handle:
                 data = json.load(file_handle)
         except (ValueError, OSError):
-            return {"running_context": "", "processed_byte_offset": 0, "overlap_entries": []}
+            return {"running_context": "", "processed_byte_offset": 0, "overlap_entries": [], "notes_byte_offset": 0}
+        notes_byte_offset = int(data.get("notes_byte_offset", 0))
+        if self.notes_path.exists() and notes_byte_offset > 0:
+            current_notes_size = self.notes_path.stat().st_size
+            if current_notes_size > notes_byte_offset:
+                with open(self.notes_path, "r+b") as fh:
+                    fh.truncate(notes_byte_offset)
         return {
             "running_context": str(data.get("running_context", "")),
             "processed_byte_offset": int(data.get("processed_byte_offset", 0)),
-            "overlap_entries": list(data.get("overlap_entries", []))
+            "overlap_entries": list(data.get("overlap_entries", [])),
+            "notes_byte_offset": notes_byte_offset
         }
 
     def save_state(
@@ -448,10 +475,12 @@ class StructuringAgent:
         processed_byte_offset: int,
         overlap_entries: Optional[list[dict[str, Any]]] = None
     ) -> None:
+        notes_byte_offset = self.notes_path.stat().st_size if self.notes_path.exists() else 0
         payload = {
             "running_context": running_context[: self.settings.context_max_characters],
             "processed_byte_offset": processed_byte_offset,
-            "overlap_entries": overlap_entries or []
+            "overlap_entries": overlap_entries or [],
+            "notes_byte_offset": notes_byte_offset
         }
         atomic_write_text(self.context_path, json.dumps(payload, ensure_ascii=False))
 

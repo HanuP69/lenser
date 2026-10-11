@@ -86,5 +86,24 @@ class TestMarkdownFormatter(unittest.TestCase):
         self.assertIn("Actual content of the lecture notes starts here.", cleaned)
 
 
+    def test_code_blocks_and_indentation_preserved(self) -> None:
+        raw = "```python\ndef solve():\n    x = 10\n    return x\n```"
+        formatted = format_clean_markdown(raw)
+        self.assertIn("    x = 10", formatted)
+        self.assertNotIn("## return x", formatted)
+
+    def test_equations_not_promoted_to_headings(self) -> None:
+        raw = "F = ma\nE = mc^2"
+        formatted = format_clean_markdown(raw)
+        self.assertNotIn("## F = ma", formatted)
+        self.assertNotIn("## E = mc^2", formatted)
+
+    def test_unicode_math_symbols_preserved(self) -> None:
+        raw = "Formula: \U0001D465 = \u2300 / 2"
+        cleaned = clean_mojibake_and_emojis(raw)
+        self.assertIn("\U0001D465", cleaned)
+        self.assertIn("\u2300", cleaned)
+
+
 if __name__ == "__main__":
     unittest.main()

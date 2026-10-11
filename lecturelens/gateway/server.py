@@ -128,6 +128,10 @@ class GatewayServer:
         return session_id
 
     async def handle_message(self, runtime: SessionRuntime, message: dict[str, Any]) -> dict[str, Any]:
+        capture_timestamp = message.get("timestamp_epoch")
+        if isinstance(capture_timestamp, (int, float)) and capture_timestamp > 0:
+            runtime.clock.reference_wall_time = float(capture_timestamp)
+            runtime.clock.reference_monotonic_time = time.monotonic()
         message_type = message.get("type")
         if message_type == "audio":
             wav_bytes = decode_base64_field(message, "wav_b64")
@@ -167,6 +171,7 @@ class GatewayServer:
     async def handle_connection(self, websocket: Any) -> None:
         runtime: Optional[SessionRuntime] = None
         limiter = MessageRateLimiter(self.settings.gateway_messages_per_second)
+        session_id: Optional[str] = None
         try:
             first_frame = await asyncio.wait_for(websocket.recv(), timeout=10.0)
             try:

@@ -91,6 +91,16 @@ class TestAnkiExporter(unittest.TestCase):
         self.assertNotIn("<b>yes</b>", fields)
         self.assertNotIn("duplicate", fields)
 
+    def test_math_converted_to_anki_mathjax(self) -> None:
+        flashcards = [
+            {"question": "What is $e^{i\\pi} + 1$?", "answer": "It is $$0$$."}
+        ]
+        count = create_anki_deck("Math deck", flashcards, self.output_path)
+        self.assertEqual(count, 1)
+        fields = read_note_fields(self.output_path, self.work_dir)
+        self.assertIn(r"\(e^{i\pi} + 1\)", fields)
+        self.assertIn(r"\[0\]", fields)
+
 
 if __name__ == "__main__":
     unittest.main()

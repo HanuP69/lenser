@@ -358,6 +358,7 @@ class TestBatchHelpers(unittest.TestCase):
         self.assertEqual(extract_json_payload('["a"]'), ["a"])
         self.assertEqual(extract_json_payload('```json\n["a"]\n```'), ["a"])
         self.assertEqual(extract_json_payload('```\n["a"]\n```'), ["a"])
+        self.assertEqual(extract_json_payload('Sure! Here is the JSON:\n[{"term": "BST"}]\nHope this helps!'), [{"term": "BST"}])
         self.assertIsNone(extract_json_payload("not json"))
 
     def test_split_entries_into_batches_offsets(self) -> None:

@@ -38,6 +38,7 @@ class SessionClock:
         data["reference_wall_time"] = self.reference_wall_time
         data["reference_monotonic_time"] = self.reference_monotonic_time
         data["elapsed_offset_seconds"] = self.elapsed_offset_seconds
+        data["accumulated_seconds"] = self.get_elapsed_seconds()
         return data
 
     @classmethod

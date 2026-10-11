@@ -179,6 +179,8 @@ class TestRedisBusReliability(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received, ["orphan"])
 
     async def test_publish_resilient_buffers_then_flushes(self) -> None:
+        if not self.redis_available:
+            self.skipTest("Redis not available on localhost:6379")
         original_publish = self.bus.publish
         state = {"down": True}
 
