@@ -109,54 +109,6 @@ def format_entry_line(item: dict[str, Any]) -> str:
     return f"[{source}]{flag_text} {text}"
 
 
-def sanitize_flashcard_question(question: str) -> str:
-    cleaned = question.strip()
-    if len(cleaned) == 0:
-        return ""
-    lower = cleaned.lower()
-    definition_prefixes = [
-        "what is the definition of ",
-        "what's the definition of ",
-        "what is the meaning of ",
-        "what's the meaning of ",
-        "what is the definition for ",
-    ]
-    for prefix in definition_prefixes:
-        if lower.startswith(prefix):
-            term = cleaned[len(prefix):].strip().rstrip("?.")
-            if not term:
-                return cleaned
-            first_word = term.split()[0].rstrip(".,") if term.split() else ""
-            honorifics = {"ms", "ms.", "mr", "mr.", "mrs", "mrs.", "miss", "dr", "dr.", "prof", "prof.", "professor"}
-            if first_word.lower() in honorifics:
-                return f"What is the characterization, role, and narrative significance of {term}?"
-            return f"What is the core concept, mechanism, and academic significance of {term}?"
-
-    if lower.startswith("define "):
-        term = cleaned[len("define "):].strip().rstrip("?.")
-        if term:
-            first_word = term.split()[0].rstrip(".,") if term.split() else ""
-            honorifics = {"ms", "ms.", "mr", "mr.", "mrs", "mrs.", "miss", "dr", "dr.", "prof", "prof.", "professor"}
-            if first_word.lower() in honorifics:
-                return f"What is the characterization, role, and narrative significance of {term}?"
-            return f"What is the core concept, mechanism, and academic significance of {term}?"
-
-    if not cleaned.endswith("?"):
-        cleaned = cleaned + "?"
-    return cleaned
-
-
-def enhance_flashcard_answer(answer: str, term_fallback: str = "") -> str:
-    cleaned = answer.strip()
-    if len(cleaned) == 0:
-        if term_fallback:
-            return f"**Core Concept**: {term_fallback}\n\n**Academic Significance**: Key foundational topic introduced in this lecture. Understanding this concept is essential for analyzing related mechanisms, contextual implications, and exam assessments."
-        return ""
-    if len(cleaned) < 80 and not ("\n" in cleaned or "**" in cleaned):
-        return f"**Core Concept**: {cleaned}\n\n**Academic Significance**: Key foundational topic introduced in this lecture. Understanding this concept is essential for analyzing related mechanisms, contextual implications, and exam assessments."
-    return cleaned
-
-
 def split_entries_into_batches(
     records: list[tuple[Optional[dict[str, Any]], int]],
     max_characters: int,
@@ -397,38 +349,13 @@ Respond strictly in valid JSON format as a list of objects with 'question' and '
         if isinstance(parsed, list):
             for item in parsed:
                 if isinstance(item, dict) and "question" in item and "answer" in item:
-                    q = sanitize_flashcard_question(str(item["question"]))
-                    a = enhance_flashcard_answer(str(item["answer"]))
+                    q = str(item["question"]).strip()
+                    a = str(item["answer"]).strip()
                     if len(q) > 0 and len(a) > 0:
                         flashcards.append({
                             "question": q,
                             "answer": a
                         })
-
-        if len(flashcards) == 0 and len(definitions) > 0:
-            for definition_item in definitions:
-                term = str(definition_item.get("term", "")).strip()
-                explanation = str(definition_item.get("definition", "")).strip()
-                if len(term) == 0 or len(explanation) == 0:
-                    continue
-                raw_q = f"What is the definition of {term}?"
-                sanitized_q = sanitize_flashcard_question(raw_q)
-                first_word = term.split()[0].rstrip(".,") if term.split() else ""
-                honorifics = {"ms", "ms.", "mr", "mr.", "mrs", "mrs.", "miss", "dr", "dr.", "prof", "prof.", "professor"}
-                if first_word.lower() in honorifics:
-                    formatted_answer = (
-                        f"**Role & Characterization**: {explanation}\n\n"
-                        f"**Context & Narrative Significance**: Key figure introduced in this narrative. Understanding their characterization, motivations, and interactions is critical for analyzing the plot progression, dramatic irony, and thematic conclusions."
-                    )
-                else:
-                    formatted_answer = (
-                        f"**Core Concept & Mechanism**: {explanation}\n\n"
-                        f"**Context & Academic Significance**: Foundational concept introduced in this lecture. Understanding this principle is essential for mastering related mechanisms, analytical problem-solving, and exam assessments."
-                    )
-                flashcards.append({
-                    "question": sanitized_q,
-                    "answer": formatted_answer
-                })
 
         return {"flashcards": flashcards}
 

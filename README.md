@@ -10,7 +10,7 @@
 2. [Data Flow & Lifecycle of a Session](#data-flow--lifecycle-of-a-session)
 3. [Meet the Agents (Personalities & Roles)](#meet-the-agents-personalities--roles)
 4. [Empirical Benchmarks & Reproducible Metrics](#empirical-benchmarks--reproducible-metrics)
-5. [Automated Test Suite (257 Tests)](#automated-test-suite-257-tests)
+5. [Automated Test Suite (254 Tests)](#automated-test-suite-254-tests)
 6. [CLI Command Reference](#cli-command-reference)
 7. [Session Artifacts & Output Structure](#session-artifacts--output-structure)
 8. [Configuration & Environment Variables](#configuration--environment-variables)
@@ -216,7 +216,7 @@ The following benchmarks were recorded directly on an Intel multi-core CPU and a
 | **Slide Change Gate** *(1920x1080 FHD)* | **Frame Check Latency** | Full 1080p Matrix Diff: 23.35 ms | **Thumbnail + 64-bit dHash**: **15.11 ms** | **1.5x Check Speedup** *(Kernel: 25.3 $\mu$s)* |
 | **OCR Compute Load** *(10 min Lecture)* | **OCR / Vision Model Calls** | Blind 1 FPS sampling: 600 calls | **LectureLens Perceptual Gate**: **7 calls** | **98.8% Reduction in compute calls** |
 | **Markdown Normalizer** *(AST Cleaner)* | **Sanitization Latency** | LLM Reprompting (~3,000 ms) | **AST Regex & Stripper**: **32.3 $\mu$s** | **Near-Instantaneous (0.03 ms)** |
-| **Test Suite Coverage** | **Automated Tests** | 0 tests | **257 Unit & Integration Tests** | **100% Passing** in ~30.6s |
+| **Test Suite Coverage** | **Automated Tests** | 0 tests | **254 Unit & Integration Tests** | **100% Passing** in ~30.4s |
 
 ### Reproducing the Benchmarks on Your Machine
 
@@ -227,13 +227,13 @@ python benchmark_reproducible.py
 
 ---
 
-## Automated Test Suite (257 Tests)
+## Automated Test Suite (254 Tests)
 
-LectureLens maintains a comprehensive test suite of **257 unit and integration tests** verifying concurrency, resilience, audio processing, computer vision, and LLM state machines:
+LectureLens maintains a comprehensive test suite of **254 unit and integration tests** verifying concurrency, resilience, audio processing, computer vision, and LLM state machines:
 
 ```
 ----------------------------------------------------------------------
-Ran 257 tests in 30.602s
+Ran 254 tests in 30.441s
 
 OK
 ```
@@ -242,7 +242,7 @@ OK
 
 | Test Module | Test Count | Scope & Behaviors Verified |
 | :--- | :--- | :--- |
-| `test_structuring_agent.py` | **35 tests** | LangGraph multi-step pipeline, rolling 120s window, 20s context overlap, byte-offset tracking, definitions extraction, domain-aware high-yield flashcard synthesis (anti-rote question sanitization & structured answer detailing). |
+| `test_structuring_agent.py` | **32 tests** | LangGraph multi-step pipeline, rolling 120s window, 20s context overlap, byte-offset tracking, definitions extraction, pure LLM-driven dynamic flashcard synthesis (zero hardcoded templates). |
 | `test_cli_and_runtime.py` | **31 tests** | CLI commands (`start`, `stop`, `pause`, `resume`, `status`, `export`), process flag coordination, option validations, disk space warnings. |
 | `test_gateway.py` | **18 tests** | WebSocket gateway server, HMAC authentication, base64 payload decoding, connection multiplexing, remote streaming. |
 | `test_audio_agent.py` | **17 tests** | RMS VAD energy gating, speech segmentation, audio mixing, faster-whisper chunking, hallucination filtering. |

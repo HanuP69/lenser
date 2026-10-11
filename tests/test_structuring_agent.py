@@ -8,9 +8,7 @@ from typing import Any
 from lecturelens.agents.structuring_agent import (
     SliceBatch,
     StructuringAgent,
-    enhance_flashcard_answer,
     extract_json_payload,
-    sanitize_flashcard_question,
     split_entries_into_batches
 )
 from lecturelens.config.settings import Settings
@@ -425,68 +423,52 @@ class TestSlidingOverlap(StructuringTestBase):
         self.assertEqual(agent2.current_overlap[-1]["content"], "Beta concept ending at 100s")
 
 
-class TestFlashcardEnhancements(StructuringTestBase):
-    def test_sanitize_character_question_avoids_definition_phrasing(self) -> None:
-        q1 = sanitize_flashcard_question("What is the definition of Ms Fairchild?")
-        self.assertNotIn("definition of", q1.lower())
-        self.assertIn("Ms Fairchild", q1)
-        self.assertIn("narrative significance", q1)
-
-        q2 = sanitize_flashcard_question("What is the definition of Mr. Easton?")
-        self.assertNotIn("definition of", q2.lower())
-        self.assertIn("Mr. Easton", q2)
-        self.assertIn("narrative significance", q2)
-
-    def test_sanitize_concept_question_uses_mechanisms_and_principles(self) -> None:
-        q1 = sanitize_flashcard_question("What is the definition of Binary Search?")
-        self.assertNotIn("definition of", q1.lower())
-        self.assertIn("Binary Search", q1)
-        self.assertIn("mechanism", q1)
-
-        q2 = sanitize_flashcard_question("Define Dijkstra's Algorithm")
-        self.assertNotIn("define ", q2.lower())
-        self.assertIn("Dijkstra's Algorithm", q2)
-
-    def test_preserve_already_deep_questions(self) -> None:
-        deep = "In O. Henry's 'Hearts and Hands', how does the handcuffs motif create dramatic irony?"
-        self.assertEqual(sanitize_flashcard_question(deep), deep)
-
-    def test_enhance_flashcard_answer_expands_brief_snippets(self) -> None:
-        snippet = "A greedy shortest path algorithm."
-        enhanced = enhance_flashcard_answer(snippet)
-        self.assertIn("Core Concept", enhanced)
-        self.assertIn("Academic Significance", enhanced)
-        self.assertIn(snippet, enhanced)
-
-    def test_enhance_flashcard_answer_preserves_substantive_content(self) -> None:
-        substantive = "Binary Search partitions the sorted array at each midpoint, reducing the search space by half per iteration. This yields a logarithmic recurrence relation of T(n) = T(n/2) + O(1), achieving O(log n) efficiency."
-        self.assertEqual(enhance_flashcard_answer(substantive), substantive)
-
-    async def test_fallback_generates_detailed_cards_without_rote_questions(self) -> None:
-        class EmptyFlashcardRouter(MockRouter):
+class TestLLMFlashcardGeneration(StructuringTestBase):
+    async def test_llm_generated_flashcards_are_preserved_directly_without_hardcoding(self) -> None:
+        class RichCardRouter(MockRouter):
             async def ainvoke(self, messages: list) -> str:
                 text = str(messages[0].content)
                 self.prompts.append(text)
                 if "key technical terms" in text:
-                    return json.dumps([{"term": "Ms Fairchild", "definition": "An elegant passenger whose presence causes Mr. Easton to hide his true convict status."}])
+                    return json.dumps([{"term": "Ms Fairchild", "definition": "An elegant passenger."}])
                 if "action items" in text:
                     return "[]"
                 if "study flashcards" in text:
-                    return "[]"
+                    return json.dumps([
+                        {
+                            "question": "In 'Hearts and Hands', what role does Ms. Fairchild play in enabling Mr. Easton's deception?",
+                            "answer": "Ms. Fairchild's high social standing and prior acquaintance create pressure for Easton, prompting him to feign being the Marshal to conceal his convict status."
+                        }
+                    ])
                 if "Compress the following" in text:
                     return "Summary context."
-                return "## Literature Analysis\nMs Fairchild travels on the train."
+                return "## Literature Analysis\nDiscussion of Hearts and Hands."
 
-        agent = self.make_agent(router=EmptyFlashcardRouter())
-        self.write_lines([timeline_line(1.0, "transcript", "Today we discuss Ms Fairchild in Hearts and Hands.")])
+        agent = self.make_agent(router=RichCardRouter())
+        self.write_lines([timeline_line(1.0, "transcript", "Today we discuss Hearts and Hands.")])
         await agent.process_all_pending()
         cards = agent.load_flashcards()
-        self.assertGreaterEqual(len(cards), 1)
-        for card in cards:
-            self.assertNotIn("What is the definition of", card["question"])
-            self.assertIn("Ms Fairchild", card["question"])
-            self.assertIn("Characterization", card["answer"])
-            self.assertIn("Significance", card["answer"])
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["question"], "In 'Hearts and Hands', what role does Ms. Fairchild play in enabling Mr. Easton's deception?")
+        self.assertIn("Ms. Fairchild's high social standing", cards[0]["answer"])
+
+    async def test_flashcard_prompt_provides_full_lecture_context_to_llm(self) -> None:
+        agent = self.make_agent()
+        self.write_lines([
+            timeline_line(1.0, "transcript", "Binary search runs in O(log n).", ["exam_relevant"])
+        ])
+        await agent.process_all_pending()
+        flashcard_prompts = [p for p in self.router.prompts if "study flashcards" in p]
+        self.assertEqual(len(flashcard_prompts), 1)
+        self.assertIn("LECTURE SUMMARY:", flashcard_prompts[0])
+        self.assertIn("KEY CONCEPTS & DEFINITIONS DISCUSSED:", flashcard_prompts[0])
+
+    async def test_flashcards_empty_when_no_content_in_slice(self) -> None:
+        agent = self.make_agent()
+        self.write_lines([timeline_line(1.0, "transcript", "")])
+        await agent.process_all_pending()
+        cards = agent.load_flashcards()
+        self.assertEqual(len(cards), 0)
 
 
 if __name__ == "__main__":
