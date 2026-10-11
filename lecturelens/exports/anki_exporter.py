@@ -13,6 +13,12 @@ def compute_stable_deck_id(deck_name: str) -> int:
     return (1 << 30) + (checksum % (1 << 30))
 
 
+def format_card_field_html(text: str) -> str:
+    escaped = html.escape(text)
+    escaped = escaped.replace("\r\n", "\n")
+    return escaped.replace("\n", "<br/>")
+
+
 def create_anki_deck(
     deck_name: str,
     flashcards: list[dict[str, Any]],
@@ -28,7 +34,8 @@ def create_anki_deck(
                 "qfmt": "{{Question}}",
                 "afmt": "{{FrontSide}}<hr id=\"answer\">{{Answer}}"
             }
-        ]
+        ],
+        css=".card { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 18px; text-align: left; color: rgb(31, 41, 55); line-height: 1.6; padding: 20px; } hr { border: 0; height: 1px; background: rgb(229, 231, 235); margin: 20px 0; } strong { color: rgb(17, 24, 39); } code { background: rgb(243, 244, 246); padding: 2px 4px; border-radius: 4px; font-family: monospace; font-size: 0.9em; }"
     )
     deck = genanki.Deck(compute_stable_deck_id(deck_name), deck_name)
 
@@ -44,7 +51,7 @@ def create_anki_deck(
         seen_questions.add(question)
         note = genanki.Note(
             model=model,
-            fields=[html.escape(question), html.escape(answer)],
+            fields=[format_card_field_html(question), format_card_field_html(answer)],
             guid=genanki.guid_for(question)
         )
         deck.add_note(note)

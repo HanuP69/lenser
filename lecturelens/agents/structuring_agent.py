@@ -109,6 +109,54 @@ def format_entry_line(item: dict[str, Any]) -> str:
     return f"[{source}]{flag_text} {text}"
 
 
+def sanitize_flashcard_question(question: str) -> str:
+    cleaned = question.strip()
+    if len(cleaned) == 0:
+        return ""
+    lower = cleaned.lower()
+    definition_prefixes = [
+        "what is the definition of ",
+        "what's the definition of ",
+        "what is the meaning of ",
+        "what's the meaning of ",
+        "what is the definition for ",
+    ]
+    for prefix in definition_prefixes:
+        if lower.startswith(prefix):
+            term = cleaned[len(prefix):].strip().rstrip("?.")
+            if not term:
+                return cleaned
+            first_word = term.split()[0].rstrip(".,") if term.split() else ""
+            honorifics = {"ms", "ms.", "mr", "mr.", "mrs", "mrs.", "miss", "dr", "dr.", "prof", "prof.", "professor"}
+            if first_word.lower() in honorifics:
+                return f"What is the characterization, role, and narrative significance of {term}?"
+            return f"What is the core concept, mechanism, and academic significance of {term}?"
+
+    if lower.startswith("define "):
+        term = cleaned[len("define "):].strip().rstrip("?.")
+        if term:
+            first_word = term.split()[0].rstrip(".,") if term.split() else ""
+            honorifics = {"ms", "ms.", "mr", "mr.", "mrs", "mrs.", "miss", "dr", "dr.", "prof", "prof.", "professor"}
+            if first_word.lower() in honorifics:
+                return f"What is the characterization, role, and narrative significance of {term}?"
+            return f"What is the core concept, mechanism, and academic significance of {term}?"
+
+    if not cleaned.endswith("?"):
+        cleaned = cleaned + "?"
+    return cleaned
+
+
+def enhance_flashcard_answer(answer: str, term_fallback: str = "") -> str:
+    cleaned = answer.strip()
+    if len(cleaned) == 0:
+        if term_fallback:
+            return f"**Core Concept**: {term_fallback}\n\n**Academic Significance**: Key foundational topic introduced in this lecture. Understanding this concept is essential for analyzing related mechanisms, contextual implications, and exam assessments."
+        return ""
+    if len(cleaned) < 80 and not ("\n" in cleaned or "**" in cleaned):
+        return f"**Core Concept**: {cleaned}\n\n**Academic Significance**: Key foundational topic introduced in this lecture. Understanding this concept is essential for analyzing related mechanisms, contextual implications, and exam assessments."
+    return cleaned
+
+
 def split_entries_into_batches(
     records: list[tuple[Optional[dict[str, Any]], int]],
     max_characters: int,
@@ -240,7 +288,7 @@ FORMATTING GUIDELINES:
         priority_text = "\n".join(definition_lines)
 
         prompt = f"""
-From the following lecture note summary, extract all key technical terms and their definitions.
+From the following lecture note summary, extract all key technical terms, foundational concepts, and core analytical entities with their rigorous definitions and contextual explanations.
 Prioritize terms from these spoken lines flagged as definitions:
 {priority_text}
 
@@ -249,7 +297,7 @@ SUMMARY:
 
 Respond strictly in valid JSON format as a list of objects with 'term' and 'definition' keys:
 [
-  {{"term": "term name", "definition": "detailed definition"}}
+  {{"term": "term or concept name", "definition": "detailed definition and academic context"}}
 ]
 """
         raw_output = await call_llm(prompt)
@@ -289,44 +337,99 @@ If none, return [].
     async def generate_flashcards_node(state: StructuringState) -> dict[str, Any]:
         definitions = state.get("definitions", [])
         summary_text = state.get("summary", "")
-        flags = state.get("importance_flags", [])
         flashcards: list[dict[str, str]] = []
 
-        for definition_item in definitions:
-            flashcards.append({
-                "question": f"What is the definition of {definition_item['term']}?",
-                "answer": definition_item["definition"]
-            })
+        if len(summary_text) == 0 and len(definitions) == 0:
+            return {"flashcards": []}
 
-        needs_generated_cards = len(definitions) == 0 or "exam_relevant" in flags
-        if len(summary_text) > 0 and needs_generated_cards:
-            exam_lines: list[str] = []
-            for item in state.get("timeline_slice", []):
-                if "exam_relevant" in (item.get("importance_flags", []) or []):
-                    exam_lines.append(truncate_text(str(item.get("content", "")), 300))
-            exam_text = "\n".join(exam_lines)
-            prompt = f"""
-Generate 2-3 high-yield study flashcards based on this lecture summary.
-Focus on points the lecturer flagged as exam relevant:
+        exam_lines: list[str] = []
+        for item in state.get("timeline_slice", []):
+            if "exam_relevant" in (item.get("importance_flags", []) or []):
+                exam_lines.append(truncate_text(str(item.get("content", "")), 300))
+        exam_text = "\n".join(exam_lines) if len(exam_lines) > 0 else "None explicitly flagged in this slice."
+
+        definitions_context_lines: list[str] = []
+        for defn in definitions:
+            term = str(defn.get("term", "")).strip()
+            explanation = str(defn.get("definition", "")).strip()
+            if len(term) > 0 and len(explanation) > 0:
+                definitions_context_lines.append(f"- {term}: {explanation}")
+        definitions_text = "\n".join(definitions_context_lines) if len(definitions_context_lines) > 0 else "None extracted in this slice."
+
+        prompt = f"""
+Generate 3-5 high-yield study flashcards based on this lecture summary and concepts.
+
+LECTURE SUMMARY:
+{summary_text}
+
+KEY CONCEPTS & DEFINITIONS DISCUSSED:
+{definitions_text}
+
+EXAM-RELEVANT POINTS FLAGGED BY INSTRUCTOR:
 {exam_text}
 
-SUMMARY:
-{summary_text}
+FLASHCARD QUALITY & FORMULATION REQUIREMENTS:
+1. STRICT PROHIBITION ON ROTE DEFINITION QUESTIONS:
+   - Do NOT write generic "What is the definition of [X]?", "Define [X]", or "What is [Person/Term]?" questions.
+   - Adapt the question style to the academic discipline and concept type:
+     * Literature / Humanities / Social Sciences: Focus on character roles, motivations, thematic conflicts, narrative devices, dramatic irony, or plot mechanics (e.g. "In O. Henry's 'Hearts and Hands', what role does Ms. Fairchild play in the narrative deception, and how does her presence influence Mr. Easton's actions?").
+     * STEM / Computer Science / Mathematics / Engineering: Focus on mechanisms, step-by-step logic, invariants, time/space complexity trade-offs, edge cases, and failure modes (e.g. "Why does Dijkstra's algorithm require non-negative edge weights, and how does a negative weight break the greedy invariant?").
+   - Frame questions that test active recall, analytical comprehension, cause-and-effect, and practical/exam application.
+
+2. COMPREHENSIVE, DEEP, DETAILED ANSWERS:
+   - Answers must NOT be shallow one-liners, single-word responses, or superficial fragments.
+   - Each answer should provide a thorough, multi-sentence breakdown (typically 2 to 4 substantive sentences or clear bullet points) covering:
+     * Direct Core Answer: The clear, direct explanation answering the question.
+     * Context & Mechanism / Textual Evidence: The underlying reasoning, mathematical derivation, or narrative evidence.
+     * Analytical Significance / Takeaway: Why this concept matters, common traps, or exam significance.
+
+3. ACCURACY & FORMATTING:
+   - Use standard LaTeX math ($inline$ or $$display$$) where appropriate.
+   - Do NOT invent facts not supported by the lecture summary or context.
 
 Respond strictly in valid JSON format as a list of objects with 'question' and 'answer':
 [
-  {{"question": "...", "answer": "..."}}
+  {{"question": "Deep, context-rich active recall question", "answer": "Comprehensive multi-sentence answer with core explanation, context/mechanism, and analytical takeaway."}}
 ]
 """
-            raw_output = await call_llm(prompt)
-            parsed = extract_json_payload(raw_output)
-            if isinstance(parsed, list):
-                for item in parsed:
-                    if isinstance(item, dict) and "question" in item and "answer" in item:
+        raw_output = await call_llm(prompt)
+        parsed = extract_json_payload(raw_output)
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, dict) and "question" in item and "answer" in item:
+                    q = sanitize_flashcard_question(str(item["question"]))
+                    a = enhance_flashcard_answer(str(item["answer"]))
+                    if len(q) > 0 and len(a) > 0:
                         flashcards.append({
-                            "question": str(item["question"]),
-                            "answer": str(item["answer"])
+                            "question": q,
+                            "answer": a
                         })
+
+        if len(flashcards) == 0 and len(definitions) > 0:
+            for definition_item in definitions:
+                term = str(definition_item.get("term", "")).strip()
+                explanation = str(definition_item.get("definition", "")).strip()
+                if len(term) == 0 or len(explanation) == 0:
+                    continue
+                raw_q = f"What is the definition of {term}?"
+                sanitized_q = sanitize_flashcard_question(raw_q)
+                first_word = term.split()[0].rstrip(".,") if term.split() else ""
+                honorifics = {"ms", "ms.", "mr", "mr.", "mrs", "mrs.", "miss", "dr", "dr.", "prof", "prof.", "professor"}
+                if first_word.lower() in honorifics:
+                    formatted_answer = (
+                        f"**Role & Characterization**: {explanation}\n\n"
+                        f"**Context & Narrative Significance**: Key figure introduced in this narrative. Understanding their characterization, motivations, and interactions is critical for analyzing the plot progression, dramatic irony, and thematic conclusions."
+                    )
+                else:
+                    formatted_answer = (
+                        f"**Core Concept & Mechanism**: {explanation}\n\n"
+                        f"**Context & Academic Significance**: Foundational concept introduced in this lecture. Understanding this principle is essential for mastering related mechanisms, analytical problem-solving, and exam assessments."
+                    )
+                flashcards.append({
+                    "question": sanitized_q,
+                    "answer": formatted_answer
+                })
+
         return {"flashcards": flashcards}
 
     async def update_running_context_node(state: StructuringState) -> dict[str, Any]:
