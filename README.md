@@ -1,6 +1,6 @@
 # LectureLens
 
-> **Real-time, local-first, multimodal multi-agent lecture intelligence system.**  
+> **Real-time, multimodal multi-agent lecture intelligence system. Fully local by default (Ollama); cloud providers are opt-in.**  
 > Automatically captures spoken audio, computer slides, and physical whiteboard video, aligns them into a unified chronological event stream, and synthesizes textbook-quality Markdown notes, concept graphs, and Anki flashcards.
 
 ---
@@ -9,8 +9,8 @@
 1. [System Architecture](#system-architecture)
 2. [Data Flow & Lifecycle of a Session](#data-flow--lifecycle-of-a-session)
 3. [Meet the Agents (Personalities & Roles)](#meet-the-agents-personalities--roles)
-4. [Empirical Benchmarks & Reproducible Metrics](#empirical-benchmarks--reproducible-metrics)
-5. [Automated Test Suite (268 Tests)](#automated-test-suite-268-tests)
+4. [Benchmarks](#benchmarks-what-they-do-and-do-not-show)
+5. [Automated Test Suite (329 Tests)](#automated-test-suite-329-tests)
 6. [CLI Command Reference](#cli-command-reference)
 7. [Session Artifacts & Output Structure](#session-artifacts--output-structure)
 8. [Configuration & Environment Variables](#configuration--environment-variables)
@@ -139,8 +139,8 @@ LectureLens models each background subsystem with a distinct anime personality a
   > *"Haaai! I'm Deredere! I listen to everything with all my heart! Whether you're in an auditorium with a microphone or watching an online lecture with system audio loopback, I capture every sound wave at 16,000 samples per second! I use Voice Activity Detection so we never waste time on awkward silences. When the teacher speaks, I transcribe it with faster-whisper! If they switch between English and Hindi, or say 'dhyaan do' or 'this will be on the exam', I immediately tag it for you with big bright flags! Let's get an A+ together!"*
 * **Core Technical Duties**:
   - Dual-source audio ingestion (Windows WASAPI loopback + SoundDevice microphone).
-  - Real-time RMS energy Voice Activity Detection (VAD) with silence threshold gating.
-  - Streaming CTranslate2 `faster-whisper` transcription with configurable language locking.
+  - Real-time RMS energy Voice Activity Detection (VAD). The threshold is `vad_energy_threshold` (0.01) and only rises when the room's background level (rolling 10th percentile of the last ~60 s) is above it, capped at 4x. Quiet rooms never ratchet the threshold up.
+  - Streaming CTranslate2 `faster-whisper` transcription. Language is auto-detected per chunk; locking after a confident detection is opt-in (`whisper_lock_language`) because it breaks code-switched (Hinglish) lectures.
   - Contextual importance cue detection (e.g., "crucial", "definition", "dhyaan do", "exam").
 
 ### 2. Screen Agent ("Tsundere" — The Picky Presentation Gatekeeper)
@@ -151,7 +151,8 @@ LectureLens models each background subsystem with a distinct anime personality a
   - Desktop screen grabbing via `mss` frame grabber at 1 FPS.
   - `SlideChangeGate`: Grayscale thumbnailing, changed-pixel fraction thresholding, and multi-poll settle verification.
   - Hamming distance revisit cache (64-bit dHash, hamming distance $\le 3$, remembering up to 200 slides).
-  - Tesseract OCR execution with automatic fallback to multimodal cloud vision (Gemma / Gemini).
+  - Tesseract OCR execution with automatic fallback to multimodal vision (Gemma / Gemini).
+  - Slide timestamps are the capture time, not the time OCR finished. If both OCR and vision fail, the slide is still published (empty text) and vision is retried in the background (15 s, 45 s, 120 s); a recovered text is published as a late update with the original timestamp.
 
 ### 3. Camera Agent ("Yandere" — The Obsessive Board Stalker)
 * **Personality**: Intense, laser-focused, obsessively tracking the physical blackboard without blinking.
@@ -161,16 +162,17 @@ LectureLens models each background subsystem with a distinct anime personality a
   - Video feed polling with frame-to-frame motion score estimation.
   - 4-point perspective contour detection and warp correction for skewed classroom whiteboard angles.
   - Laplacian blur variance filtering and stillness stability verification.
+  - Occlusion hold: a sudden change covering more than 35% of the board (a person stepping in front) is held back until it persists for 3 stillness checks. This is a heuristic, not person detection; someone standing still in front of the board for that long will still be captured.
   - Multimodal handwritten mathematics and diagram transcription.
 
 ### 4. Sync Agent ("Kuudere" — The Emotionless Chrono-Synchronizer)
 * **Personality**: Calm, stoic, analytical, speaks strictly in logical facts.
 * **In Her Own Words**:
-  > *"Emotion is irrelevant. Temporal alignment is absolute. I sit quietly on the Redis Streams message bus under consumer group 'group:kuudere'. Audio transcript chunks, slide captures, and whiteboard events arrive asynchronously at different speeds. Within my 30-second sliding correlation merge window, I match spoken utterances with nearby visual slide/board anchors within 5 seconds, assign correlation IDs, and sort them into a chronological timeline. Chaos in. Structured timeline out."*
+  > *"Emotion is irrelevant. Temporal alignment is absolute. I sit quietly on the Redis Streams message bus under consumer group 'group:kuudere'. Audio transcript chunks, slide captures, and whiteboard events arrive asynchronously at different speeds. I hold events for a 30-second arrival-based merge window so late arrivals can be ordered, then give each spoken utterance the correlation ID of the slide or board that was on screen (the latest anchor before it, up to 10 minutes back; speech within 3 seconds before a slide change joins the new slide), and write a chronological timeline. Chaos in. Structured timeline out."*
 * **Core Technical Duties**:
   - Redis Streams consumer group processing with resilient backoff buffers.
-  - Sliding correlation window alignment across multimodal events.
-  - Anchor-based correlation ID assignment linking speech chunks to active visual slides.
+  - Anchor-based correlation: speech is linked to the currently visible slide/board (`correlation_active_seconds`, `correlation_lead_seconds`), falling back to the nearest anchor within `correlation_window_seconds`. Speech that arrives in a later flush than its slide can be linked, but a slide that arrives after its speech has already been flushed cannot retro-link it.
+  - At-least-once delivery with duplicate protection: messages are acknowledged only after the `timeline.jsonl` write, replays are de-duplicated by (stream, message id) and by content fingerprint, and the reclaim idle time is always longer than the hold window.
   - Chronological event logging to `timeline.jsonl`.
 
 ### 5. Structuring Agent ("Dandere" — The Quiet Scholar & Note Weaver)
@@ -183,6 +185,8 @@ LectureLens models each background subsystem with a distinct anime personality a
   - Robust JSON parsing capable of handling prose-wrapped model outputs without data loss.
   - Post-processing: stripping model reasoning scratchpads, checklist echoes, and normalizing LaTeX math blocks.
   - Exporting structured lecture notes to `notes.md` and Anki flashcard decks to `.apkg`.
+  - Crash-safe notes: the end offset of the last appended batch is stored in `notes_marker.json`, so a crash between writing notes and saving state never duplicates a section, and hand edits to `notes.md` are never truncated.
+  - Concept links across lectures use normalized names (case, hyphens, articles, simple plurals, parenthetical acronyms) plus fuzzy matching, so "Depth-First Search (DFS)" and "depth first searches" match.
 
 ### 6. LLM Router ("Himedere" — The Regal Model Dispatcher)
 * **Personality**: Royal, haughty, demanding maximum elegance, resilience, and zero downtime.
@@ -200,59 +204,62 @@ LectureLens models each background subsystem with a distinct anime personality a
   > *"Behold! Why restrict capture to the host workstation? The Gateway accepts remote client streams over WebSockets! Stream raw audio and video frames over authenticated WebSocket connections; I ingest, validate, and multiplex them across our internal agent bus simultaneously."*
 * **Core Technical Duties**:
   - Asynchronous WebSocket server accepting remote audio blocks and slide images.
-  - Pre-shared API key validation via `hmac.compare_digest` in the hello frame.
-  - Fixed session capacity (`gateway_max_sessions = 8`) to bound server memory.
+  - Pre-shared API key validation via `hmac.compare_digest` in the hello frame. The key is sent in the clear over `ws://`; put the gateway behind a TLS-terminating proxy (or an SSH tunnel) for anything beyond a trusted LAN.
+  - Session capacity (`gateway_max_sessions = 8`) bounds server memory. Sessions with no connected client are released (oldest idle first) when a new session needs room.
+  - Clients send a capture timestamp with every frame. The server accepts it only if it is within 10 minutes in the past or 5 seconds in the future of the server clock, and uses it for the event time without touching the shared session clock.
 
 ---
 
-## Empirical Benchmarks & Reproducible Metrics
+## Benchmarks (what they do and do not show)
 
-LectureLens includes a standalone benchmarking tool (`benchmark_reproducible.py`) to measure latency, real-time factors (RTF), and compute reduction on actual lecture recordings.
+`benchmark_reproducible.py` times the slide gate, the revisit hash, the markdown sanitizer, and (when `faster-whisper` and a model are available) Whisper transcription. It uses real recordings from `./output/**/raw/audio` and `./output/**/raw/slides` when they exist; otherwise it falls back to a synthetic tone / white slide **and prints a warning**. Whisper's VAD drops a pure tone, so ASR timings from the synthetic sample are meaningless. Run it on your own recorded session to get numbers that mean something.
 
-The following benchmarks were recorded directly on an Intel multi-core CPU and an NVIDIA GeForce RTX 4050 Laptop GPU (6 GB VRAM) using real 1080p lecture slides and 16kHz lecture speech:
+Sample run (2-core Linux sandbox CPU, synthetic 1920x1080 slide, no GPU, no ASR):
 
-| Pipeline Component | Metric Tested | Baseline / Naive Approach | LectureLens Implementation | Measured Improvement |
-| :--- | :--- | :--- | :--- | :--- |
-| **Speech-to-Text (ASR)** *(5.0s Audio)* | **Transcription Latency** | CPU (INT8): **802.7 ms** *(6.2x real-time)* | **GPU CUDA (FP16)**: **113.3 ms** *(44.1x real-time)* | **7.1x Speedup** *(RTF: 0.1605 $\to$ 0.0227)* |
-| **Slide Change Gate** *(1920x1080 FHD)* | **Frame Check Latency** | Full 1080p Matrix Diff: **34.39 ms** | **Production SlideChangeGate (640px)**: **8.66 ms** | **4.0x Check Speedup** *(Revisit dHash: 73.2 $\mu$s)* |
-| **OCR Compute Load** *(10 min Lecture)* | **OCR / Vision Model Calls** | Blind 1 FPS sampling: 600 calls | **LectureLens Gated Invocations**: Dynamic per slide transition | **Significantly reduces vision calls by filtering static frames** |
-| **Markdown Post-Processing** | **Sanitization Latency** | Full LLM Reprompting | **Regex Sanitizer & Math Normalizer**: **57.2 $\mu$s** | **Near-Instantaneous (0.05 ms)** |
+| Measurement | Result | What it means |
+| :--- | :--- | :--- |
+| Naive full-frame 1080p RGB difference | 12.2 ms | The comparison baseline. |
+| Thumbnail build (1080p to 640 px gray) | 6.8 ms | Paid once per captured frame; dominates the gate cost. |
+| `SlideChangeGate.evaluate` (settled / changed) | 0.09 ms / 0.10 ms | The comparison itself is nearly free. |
+| Gate total per frame vs naive diff | about 1.8x faster | The diff is not where the savings are. |
+| Revisit dHash kernel | about 40 us | Used only for the revisit cache. |
+| Markdown sanitizer | about 55 us | Regex pipeline, no LLM involved. |
 
-### Reproducing the Benchmarks on Your Machine
+The real saving is downstream: the gate decides when to run OCR / vision-LLM calls. On a recorded session the script prints how many slides were captured against a worst-case "OCR every second" baseline. That baseline is a strawman, not a competing product, so treat the percentage as an upper bound on the benefit. If the session duration cannot be determined, the script says so instead of assuming one.
 
-To execute the benchmark suite and verify these numbers:
 ```bash
 python benchmark_reproducible.py
 ```
 
 ---
 
-## Automated Test Suite (268 Tests)
+## Automated Test Suite (329 Tests)
 
-LectureLens maintains an automated test suite of **268 unit and integration tests** verifying concurrency, resilience, audio processing, computer vision, and LLM state machines:
+LectureLens maintains an automated test suite of **329 unit and integration tests** verifying concurrency, resilience, audio processing, computer vision, and LLM state machines:
 
 ```
 ----------------------------------------------------------------------
-Ran 268 tests in 38.067s
+Ran 329 tests in ~35s
 
 OK
 ```
-*(When running offline without Redis, Redis-dependent tests skip cleanly with 0 failures).*
+*(Without a Redis server, the Redis-dependent tests skip cleanly with 0 failures. All LLM, Whisper, OCR and embedding calls in the suite are mocked; the suite does not exercise real models, real capture hardware, or a real Ollama / cloud endpoint.)*
 
 ### Module Breakdown:
 
 | Test Module | Test Count | Scope & Behaviors Verified |
 | :--- | :--- | :--- |
+| `test_hardening.py` | **57 tests** | Regression coverage: replay-without-spin, duplicate protection, active-slide correlation, notes idempotency and marker, JSON recovery, adaptive VAD scenarios, vision retry, capture timestamps, board occlusion hold, formatter/Anki/PDF edge cases, concept normalization, live-session guard. |
 | `test_structuring_agent.py` | **32 tests** | LangGraph pipeline, rolling 120s window, 20s context overlap, byte-offset tracking, robust JSON extraction, crash rollback. |
 | `test_cli_and_runtime.py` | **31 tests** | CLI commands (`start`, `stop`, `pause`, `resume`, `status`, `export`), process flag coordination, option validations, disk space warnings. |
-| `test_gateway.py` | **18 tests** | WebSocket gateway server, API key validation, base64 payload decoding, connection multiplexing, remote streaming. |
+| `test_gateway.py` | **22 tests** | WebSocket gateway server, API key validation, base64 payload decoding, connection multiplexing, remote streaming. |
 | `test_audio_agent.py` | **17 tests** | RMS VAD energy gating, speech segmentation, audio mixing, faster-whisper chunking, language locking. |
 | `test_camera_agent.py` | **17 tests** | 4-point perspective warp, motion thresholding, blur variance, stillness gating, whiteboard detection. |
 | `test_importance.py` | **17 tests** | Verbal cue classification across English, Hindi, and Hinglish ("definition", "exam_relevant", "dhyaan do", bare test false-positive avoidance). |
 | `test_sync_agent.py` | **16 tests** | Redis Streams consumption, sliding merge window, cross-modal correlation IDs, chronological timeline serialization. |
 | `test_interactive.py` | **16 tests** | Interactive terminal wizard, live UnoRouter API health check, Ollama local model detection, model filtering. |
 | `test_screen_agent.py` | **14 tests** | MSS screenshot grabbing, perceptual dHash hashing, Hamming distance slide cache, OCR fallback to vision LLM. |
-| `test_markdown_formatter.py`| **14 tests** | Code block indentation preservation, equation heading protection, unicode math preservation, display math block normalization. |
+| `test_markdown_formatter.py` | **14 tests** | Code block indentation preservation, equation heading protection, unicode math preservation, display math block normalization. |
 | `test_llm_router.py` | **13 tests** | Multimodal task routing, OpenAI-compatible provider, Google GenAI, Ollama, circuit breaker rate-limiting, retries. |
 | `test_clock_and_files.py` | **11 tests** | SessionClock persistence, elapsed duration calculation, accumulated_seconds tracking, atomic file writes. |
 | `test_redis_bus.py` | **9 tests** | Redis Streams resilient publishing, offline memory outbox buffer, dead-letter stream, consumer group acknowledgements. |
@@ -305,6 +312,7 @@ Triggers the multi-phase graceful shutdown: capture agents stop (30s timeout), r
 ```bash
 lecturelens stop --session "os_lecture_01"
 ```
+`stop` waits up to 300 s by default (`--timeout`), which covers the worst-case shutdown (30 s + 30 s + 120 s).
 *(Alternatively, press `Ctrl + C` in the dashboard terminal).*
 
 ### 4. `lecturelens status`
@@ -333,7 +341,7 @@ lecturelens export --session "os_lecture_01" --format all --output ./my_exports
 ```
 
 ### 8. `lecturelens reprocess`
-Safely backs up existing notes and re-runs the LangGraph structuring pipeline over `timeline.jsonl`:
+Refuses to run while the session still has live agents. Backs up notes, context, flashcards, the Anki deck, and both the session and course concept databases, re-runs the LangGraph structuring pipeline over `timeline.jsonl`, and restores everything if the run fails:
 ```bash
 lecturelens reprocess --session "os_lecture_01"
 ```
@@ -357,7 +365,8 @@ output/
     ├── timeline.jsonl           # Chronological, correlated event timeline
     ├── session_meta.json        # Run metadata (start/stop epochs, agents, durations)
     ├── clock.json               # Monotonic elapsed session clock with accumulated_seconds
-    ├── context.json             # Rolling summary context, byte-offset pointer & note length
+    ├── context.json             # Rolling summary context and byte-offset pointer
+    ├── notes_marker.json        # End offset of the last batch appended to notes.md (duplicate guard)
     ├── flashcards.apkg          # Generated Anki flashcard deck (.apkg)
     ├── raw/
     │   ├── audio/               # Voice-detected 16kHz WAV audio chunks (chunk_00001.wav)
@@ -387,8 +396,34 @@ LectureLens can be configured via environment variables or a `.env` file:
 | `LECTURELENS_WHISPER_DEVICE` | `cpu` | `cpu` or `cuda` (NVIDIA GPU acceleration). |
 | `LECTURELENS_WHISPER_MODEL_SIZE`| `base` | Whisper model size (`tiny`, `base`, `small`, `medium`). |
 | `LECTURELENS_OUTPUT_DIR` | `./output` | Root directory for session outputs. |
+| `LECTURELENS_LOCAL_MODEL` | `gemma4:e4b` | Local Ollama chat model (also the QA fallback model). |
+| `LECTURELENS_EMBEDDING_MODEL` | `nomic-embed-text` | Ollama embedding model used by `lecturelens ask`. |
+| `LECTURELENS_WHISPER_LOCK_LANGUAGE` | `false` | Lock the transcription language after one confident detection. |
+| `LECTURELENS_CORRELATION_ACTIVE_SECONDS` | `600` | How long a slide/board stays the "active" anchor for speech (0 = nearest-anchor only). |
 | `LECTURELENS_GATEWAY_HOST` | `127.0.0.1` | Gateway bind host (`0.0.0.0` for remote clients). |
 | `LECTURELENS_GATEWAY_API_KEY` | `None` | Required authentication key for remote clients. |
+
+---
+
+## Privacy & Data Flow
+
+* **`local` mode (default):** audio, slides, board photos, transcripts and notes stay on your machine. Only Ollama on `LECTURELENS_OLLAMA_URL` is contacted.
+* **`cloud` / `hybrid` modes:** slide images, whiteboard photos and transcript text are sent to the configured gateway (UnoRouter, OpenRouter, Google). These are third-party services; read their data policies before using them for lectures you do not have the right to share. The interactive wizard defaults to local and warns before the cloud option.
+* **`lecturelens ask`** always needs a reachable Ollama with the embedding model pulled (`ollama pull nomic-embed-text`), even when chat runs in cloud mode.
+* API keys are read from the environment or `.env` (git-ignored). The wizard saves a key only after its health check passes.
+
+---
+
+## Known Limitations
+
+* No speaker diarization. `speaker_id` is always empty.
+* `--audio-source both` sums microphone and loopback without echo cancellation or sample-accurate alignment; if one source stalls, the older blocks of the other are dropped to bound drift.
+* Board capture uses frame differences, not person detection. The occlusion hold is a heuristic.
+* Correlation is time-based. A slide event that reaches the sync agent after the speech around it has already been flushed cannot retroactively link that speech.
+* Notes headings that models forget to mark are recovered heuristically (standalone Title Case lines become `####` headings), which can occasionally promote a short line that was not a heading.
+* PDF export uses the built-in ReportLab fonts, so LaTeX is converted to a readable plain-text approximation (fractions as `(a)/(b)`, Greek letters spelled out), not typeset.
+* The structuring pipeline is a linear LangGraph chain with no branching or retries inside the graph; retries happen at the batch level.
+* The test suite mocks every model and capture device. Real Whisper / Tesseract / vision / Ollama behaviour is only verified by running the app.
 
 ---
 

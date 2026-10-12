@@ -10,10 +10,11 @@ from langchain_core.messages import HumanMessage
 
 from lecturelens.core.logging_setup import get_logger
 from lecturelens.router.messages import response_to_text
+from lecturelens.config.defaults import DEFAULT_EMBEDDING_MODEL, DEFAULT_LOCAL_MODEL
 
 logger = get_logger("lecturelens.qa_engine")
 
-EMBEDDING_MODEL = "nomic-embed-text"
+EMBEDDING_MODEL = DEFAULT_EMBEDDING_MODEL
 TIMELINE_CHUNK_CHARACTERS = 600
 NOTES_CHUNK_CHARACTERS = 900
 EMBED_BATCH_SIZE = 32
@@ -46,8 +47,12 @@ class QAEngine:
         ollama_url: str = "http://localhost:11434",
         llm_router: Any = None,
         top_k: int = 5,
-        llm_timeout_seconds: float = 180.0
+        llm_timeout_seconds: float = 180.0,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        fallback_model: str = DEFAULT_LOCAL_MODEL
     ) -> None:
+        self.embedding_model: str = embedding_model
+        self.fallback_model: str = fallback_model
         self.session_dir: Path = Path(session_dir)
         self.ollama_url: str = ollama_url.rstrip("/")
         self.llm_router: Any = llm_router
@@ -65,7 +70,7 @@ class QAEngine:
                 batch_texts = texts[start_index:start_index + EMBED_BATCH_SIZE]
                 response = await client.post(
                     f"{self.ollama_url}/api/embed",
-                    json={"model": EMBEDDING_MODEL, "input": batch_texts, "keep_alive": "10m"}
+                    json={"model": self.embedding_model, "input": batch_texts, "keep_alive": "10m"}
                 )
                 response.raise_for_status()
                 payload = response.json()
@@ -227,7 +232,7 @@ class QAEngine:
         async with httpx.AsyncClient(timeout=self.llm_timeout_seconds) as client:
             response = await client.post(
                 f"{self.ollama_url}/api/generate",
-                json={"model": "gemma4:e4b", "prompt": prompt, "stream": False}
+                json={"model": self.fallback_model, "prompt": prompt, "stream": False}
             )
             response.raise_for_status()
             return str(response.json().get("response", "")).strip()

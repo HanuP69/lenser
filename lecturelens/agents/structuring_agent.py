@@ -460,6 +460,7 @@ class StructuringAgent:
         self.timeline_path: Path = session_dir / "timeline.jsonl"
         self.notes_path: Path = session_dir / "notes.md"
         self.context_path: Path = session_dir / "context.json"
+        self.notes_marker_path: Path = session_dir / "notes_marker.json"
         self.flashcards_path: Path = session_dir / "flashcards.jsonl"
         self.anki_path: Path = session_dir / "flashcards.apkg"
         self.control: AgentControl = AgentControl(session_dir, "structuring_agent", FINALIZE_FLAG_NAME)
@@ -473,20 +474,30 @@ class StructuringAgent:
         initial_state_data = self.load_state()
         self.current_overlap: list[dict[str, Any]] = list(initial_state_data.get("overlap_entries", []))
 
+    def load_notes_marker(self) -> int:
+        if not self.notes_marker_path.exists():
+            return -1
+        try:
+            with open(self.notes_marker_path, "r", encoding="utf-8") as file_handle:
+                return int(json.load(file_handle).get("last_end_offset", -1))
+        except (ValueError, OSError, TypeError, AttributeError):
+            return -1
+
+    def save_notes_marker(self, end_offset: int) -> None:
+        atomic_write_text(self.notes_marker_path, json.dumps({"last_end_offset": end_offset}))
+
     def load_state(self) -> dict[str, Any]:
         if not self.context_path.exists():
-            return {"running_context": "", "processed_byte_offset": 0, "overlap_entries": [], "notes_byte_offset": 0}
+            return {"running_context": "", "processed_byte_offset": 0, "overlap_entries": []}
         try:
             with open(self.context_path, "r", encoding="utf-8") as file_handle:
                 data = json.load(file_handle)
         except (ValueError, OSError):
-            return {"running_context": "", "processed_byte_offset": 0, "overlap_entries": [], "notes_byte_offset": 0}
-        notes_byte_offset = int(data.get("notes_byte_offset", 0))
+            return {"running_context": "", "processed_byte_offset": 0, "overlap_entries": []}
         return {
             "running_context": str(data.get("running_context", "")),
             "processed_byte_offset": int(data.get("processed_byte_offset", 0)),
-            "overlap_entries": list(data.get("overlap_entries", [])),
-            "notes_byte_offset": notes_byte_offset
+            "overlap_entries": list(data.get("overlap_entries", []))
         }
 
     def save_state(
@@ -495,12 +506,10 @@ class StructuringAgent:
         processed_byte_offset: int,
         overlap_entries: Optional[list[dict[str, Any]]] = None
     ) -> None:
-        notes_byte_offset = self.notes_path.stat().st_size if self.notes_path.exists() else 0
         payload = {
             "running_context": running_context[: self.settings.context_max_characters],
             "processed_byte_offset": processed_byte_offset,
-            "overlap_entries": overlap_entries or [],
-            "notes_byte_offset": notes_byte_offset
+            "overlap_entries": overlap_entries or []
         }
         atomic_write_text(self.context_path, json.dumps(payload, ensure_ascii=False))
 
@@ -702,15 +711,14 @@ class StructuringAgent:
         previous_mentions = self.find_previous_mentions(definitions)
         section_text = self.build_notes_section(batch, result_state, previous_mentions)
         if len(section_text) > 0:
-            first_timestamp = float(batch.entries[0].get("timestamp_epoch", 0.0))
-            heading_time = time.strftime("%H:%M:%S", time.localtime(first_timestamp))
-            section_marker = f"### {heading_time}"
-            existing_notes = self.notes_path.read_text(encoding="utf-8") if self.notes_path.exists() else ""
-            if section_marker in existing_notes:
-                logger.info("section %s already present in notes, skipping append to prevent duplicate", section_marker)
+            if self.notes_path.exists() and self.load_notes_marker() >= batch.end_offset:
+                logger.info(
+                    "batch ending at byte %d already written to notes, skipping append", batch.end_offset
+                )
             else:
                 with open(self.notes_path, "a", encoding="utf-8", newline="\n") as file_handle:
                     file_handle.write(section_text)
+                self.save_notes_marker(batch.end_offset)
 
         self.append_flashcards(result_state.get("flashcards", []) or [])
         first_timestamp = float(batch.entries[0].get("timestamp_epoch", 0.0))
@@ -742,7 +750,7 @@ class StructuringAgent:
         return await self.process_all_pending()
 
     def reset_outputs(self) -> None:
-        for path in (self.notes_path, self.context_path, self.flashcards_path, self.anki_path):
+        for path in (self.notes_path, self.context_path, self.flashcards_path, self.anki_path, self.notes_marker_path):
             if path.exists():
                 path.unlink()
         self.current_overlap = []

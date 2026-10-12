@@ -14,15 +14,29 @@ def compute_stable_deck_id(deck_name: str) -> int:
     return (1 << 30) + (checksum % (1 << 30))
 
 
+MATH_SYNTAX_CHARACTERS: tuple[str, ...] = ("\\", "=", "+", "-", "*", "/", "^", "_", "{", "}", "<", ">")
+PROSE_PATTERN = re.compile(r"[A-Za-z]{3,}\s+[A-Za-z]{3,}")
+SHORT_SYMBOL_PATTERN = re.compile(r"^[0-9A-Za-z(),|.'\s\[\]!]+$")
+CURRENCY_RANGE_PATTERN = re.compile(r"^\d[\d.,]*\s*[-\u2013\u2014]\s*$")
+
+
 def is_valid_math_expression(content: str) -> bool:
     stripped = content.strip()
     if len(stripped) == 0:
         return False
     if re.match(r"^\d+(?:[.,]\d+)?$", stripped):
         return False
-    has_math_syntax = any(char in stripped for char in ("\\", "=", "+", "-", "*", "/", "^", "_", "{", "}", "<", ">"))
-    is_variable = bool(re.match(r"^[A-Za-z](?:\[[0-9A-Za-z]+\]|\([0-9A-Za-z]+\))?$", stripped))
-    return has_math_syntax or is_variable
+    if CURRENCY_RANGE_PATTERN.match(content):
+        return False
+    if any(char in stripped for char in MATH_SYNTAX_CHARACTERS):
+        return True
+    if PROSE_PATTERN.search(stripped):
+        return False
+    return (
+        len(stripped) <= 30
+        and bool(SHORT_SYMBOL_PATTERN.match(stripped))
+        and any(character.isalpha() for character in stripped)
+    )
 
 
 def convert_markdown_math_to_anki(text: str) -> str:
@@ -30,7 +44,9 @@ def convert_markdown_math_to_anki(text: str) -> str:
 
     def replace_inline(match: re.Match) -> str:
         inner = match.group(1)
-        if is_valid_math_expression(inner):
+        following_character = match.string[match.end():match.end() + 1]
+        looks_like_price = bool(re.match(r"^\d", inner)) and following_character.isdigit()
+        if not looks_like_price and is_valid_math_expression(inner):
             return f"\\({inner}\\)"
         return match.group(0)
 

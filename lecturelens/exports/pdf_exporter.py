@@ -8,6 +8,7 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.platypus import Paragraph, Preformatted, SimpleDocTemplate, Spacer, Table, TableStyle
 
+CODE_MAX_LINE_LENGTH: int = 88
 BOLD_PATTERN = re.compile(r"\*\*(.+?)\*\*")
 MATH_INLINE_PATTERN = re.compile(r"\$([^$\n]+?)\$")
 EMOJI_REPLACEMENTS: dict[str, str] = {
@@ -16,13 +17,70 @@ EMOJI_REPLACEMENTS: dict[str, str] = {
 }
 
 
+LATEX_SYMBOLS: dict[str, str] = {
+    "\\times": "\u00d7", "\\cdot": "\u00b7", "\\pm": "\u00b1", "\\div": "\u00f7",
+    "\\leq": "<=", "\\le": "<=", "\\geq": ">=", "\\ge": ">=", "\\neq": "!=", "\\ne": "!=",
+    "\\approx": "~", "\\sim": "~", "\\to": "->", "\\rightarrow": "->", "\\leftarrow": "<-",
+    "\\Rightarrow": "=>", "\\Leftrightarrow": "<=>", "\\infty": "inf", "\\sum": "sum",
+    "\\prod": "prod", "\\int": "int", "\\partial": "d", "\\nabla": "grad", "\\in": " in ",
+    "\\forall": "for all", "\\exists": "exists", "\\log": "log", "\\ln": "ln", "\\sin": "sin",
+    "\\cos": "cos", "\\tan": "tan", "\\max": "max", "\\min": "min", "\\lim": "lim",
+    "\\ldots": "...", "\\dots": "...", "\\cdots": "...", "\\mid": "|", "\\land": "AND",
+    "\\lor": "OR", "\\neg": "NOT", "\\subset": "subset", "\\cup": "union", "\\cap": "intersect",
+}
+GREEK_LETTERS: tuple[str, ...] = (
+    "alpha", "beta", "gamma", "delta", "epsilon", "theta", "lambda", "mu", "pi", "sigma",
+    "tau", "phi", "omega", "eta", "rho", "kappa", "nu", "xi", "zeta", "psi", "chi",
+    "Gamma", "Delta", "Theta", "Lambda", "Sigma", "Phi", "Omega", "Pi", "Psi"
+)
+TEXT_COMMAND_PATTERN = re.compile(r"\\(?:text|mathrm|mathbf|mathit|operatorname|mathcal|mathbb)\{([^{}]*)\}")
+FRAC_PATTERN = re.compile(r"\\d?frac\{([^{}]*)\}\{([^{}]*)\}")
+SQRT_PATTERN = re.compile(r"\\sqrt\{([^{}]*)\}")
+BRACED_SUPERSCRIPT = re.compile(r"\^\{([^{}]*)\}")
+BRACED_SUBSCRIPT = re.compile(r"_\{([^{}]*)\}")
+SIMPLE_SUPERSCRIPT = re.compile(r"\^([A-Za-z0-9+\-])")
+SIMPLE_SUBSCRIPT = re.compile(r"_([A-Za-z0-9])")
+
+
+def latex_to_markup(expression: str) -> str:
+    text = expression
+    for _ in range(4):
+        text = TEXT_COMMAND_PATTERN.sub(lambda match: match.group(1), text)
+        text = FRAC_PATTERN.sub(lambda match: f"({match.group(1)})/({match.group(2)})", text)
+        text = SQRT_PATTERN.sub(lambda match: f"sqrt({match.group(1)})", text)
+    text = text.replace("\\left", "").replace("\\right", "")
+    for command in sorted(LATEX_SYMBOLS, key=len, reverse=True):
+        text = re.sub(re.escape(command) + r"(?![A-Za-z])", lambda match, c=command: LATEX_SYMBOLS[c], text)
+    for letter in GREEK_LETTERS:
+        text = re.sub(r"\\" + letter + r"(?![A-Za-z])", letter, text)
+    text = re.sub(r"\\[,;:!\s]", " ", text)
+    text = re.sub(r"\\([A-Za-z]+)", r"\1", text)
+    safe = escape(text)
+    safe = BRACED_SUPERSCRIPT.sub(lambda match: f"<super>{match.group(1)}</super>", safe)
+    safe = BRACED_SUBSCRIPT.sub(lambda match: f"<sub>{match.group(1)}</sub>", safe)
+    safe = SIMPLE_SUPERSCRIPT.sub(lambda match: f"<super>{match.group(1)}</super>", safe)
+    safe = SIMPLE_SUBSCRIPT.sub(lambda match: f"<sub>{match.group(1)}</sub>", safe)
+    return safe.replace("{", "").replace("}", "")
+
+
 def convert_inline_markup(raw_text: str) -> str:
     replaced = raw_text
     for emoji, replacement in EMOJI_REPLACEMENTS.items():
         replaced = replaced.replace(emoji, replacement)
-    safe_text = escape(replaced)
+    math_segments: list[str] = []
+
+    def stash_math(match: re.Match) -> str:
+        math_segments.append(latex_to_markup(match.group(1)))
+        return f"\x00M{len(math_segments) - 1}\x00"
+
+    tokenized = MATH_INLINE_PATTERN.sub(stash_math, replaced)
+    safe_text = escape(tokenized)
     bolded = BOLD_PATTERN.sub(lambda match: f"<b>{match.group(1)}</b>", safe_text)
-    return MATH_INLINE_PATTERN.sub(lambda match: f"<i>{match.group(1)}</i>", bolded)
+    return re.sub(
+        "\x00M(\\d+)\x00",
+        lambda match: f"<i>{math_segments[int(match.group(1))]}</i>",
+        bolded
+    )
 
 
 def is_table_separator(row_cells: list[str]) -> bool:
@@ -80,7 +138,7 @@ def create_pdf_from_markdown(markdown_text: str, output_file_path: Path, title: 
             if line_index < len(lines):
                 line_index += 1
             code_content = "\n".join(code_lines)
-            story.append(Preformatted(code_content, code_style))
+            story.append(Preformatted(code_content, code_style, maxLineLength=CODE_MAX_LINE_LENGTH))
             continue
 
         if stripped.startswith("$$"):
@@ -96,7 +154,7 @@ def create_pdf_from_markdown(markdown_text: str, output_file_path: Path, title: 
                 inline_content = stripped.strip("$").strip()
                 math_lines.append(inline_content)
                 line_index += 1
-            story.append(Paragraph(convert_inline_markup(" ".join(math_lines)), math_style))
+            story.append(Paragraph(latex_to_markup(" ".join(math_lines)), math_style))
             continue
 
         if stripped.startswith("|"):

@@ -72,7 +72,8 @@ def normalize_headings(text: str) -> str:
             processed_lines.append("")
             continue
 
-        stripped = re.sub(r"\s*\((?:Cont\.?|Continued)\)", "", stripped, flags=re.IGNORECASE)
+        line = re.sub(r"\s*\((?:Cont\.?|Continued)\)", "", line, flags=re.IGNORECASE)
+        stripped = line.strip()
 
         if stripped.startswith("#"):
             processed_lines.append(stripped)
@@ -93,9 +94,11 @@ def normalize_headings(text: str) -> str:
             continue
 
         words = stripped.split()
+        previous_is_blank = len(processed_lines) == 0 or processed_lines[-1].strip() == ""
         is_equation_or_code = any(c in stripped for c in ("=", "<", ">", "{", "}", ";", "\\", "$", "^"))
         if (
-            len(words) <= 7
+            previous_is_blank
+            and len(words) <= 7
             and not is_equation_or_code
             and not stripped.endswith((".", ":", ",", ";", "?", "!"))
             and not stripped.startswith(("-", "*", ">", "$", "#", "|"))

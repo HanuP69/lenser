@@ -1,4 +1,5 @@
 import asyncio
+from collections import deque
 import io
 import queue
 import re
@@ -162,6 +163,14 @@ def transcribe_audio_chunk(
     return result
 
 
+NOISE_HISTORY_BLOCKS: int = 600
+NOISE_MIN_BLOCKS: int = 100
+NOISE_UPDATE_EVERY_BLOCKS: int = 5
+NOISE_FLOOR_PERCENTILE: float = 10.0
+NOISE_MARGIN_FACTOR: float = 1.3
+NOISE_MAX_THRESHOLD_FACTOR: float = 4.0
+
+
 class SpeechSegmenter:
     def __init__(
         self,
@@ -174,8 +183,10 @@ class SpeechSegmenter:
     ) -> None:
         self.sample_rate: int = sample_rate
         self.energy_threshold: float = energy_threshold
-        self.noise_floor: float = energy_threshold * 0.5
+        self.noise_floor: float = 0.0
         self.adaptive: bool = True
+        self.rms_history: deque = deque(maxlen=NOISE_HISTORY_BLOCKS)
+        self.blocks_since_floor_update: int = 0
         self.min_chunk_seconds: float = min_chunk_seconds
         self.max_chunk_seconds: float = max_chunk_seconds
         self.silence_gap_seconds: float = silence_gap_seconds
@@ -188,6 +199,21 @@ class SpeechSegmenter:
         self.active_sample_count: int = 0
         self.has_speech: bool = False
         self.silence_run_samples: int = 0
+
+    def update_noise_floor(self, rms: float) -> None:
+        if not self.adaptive:
+            return
+        self.rms_history.append(rms)
+        self.blocks_since_floor_update += 1
+        if len(self.rms_history) < NOISE_MIN_BLOCKS or self.blocks_since_floor_update < NOISE_UPDATE_EVERY_BLOCKS:
+            return
+        self.blocks_since_floor_update = 0
+        self.noise_floor = float(np.percentile(np.asarray(self.rms_history), NOISE_FLOOR_PERCENTILE))
+
+    def effective_threshold(self) -> float:
+        if not self.adaptive or self.noise_floor < self.energy_threshold:
+            return self.energy_threshold
+        return min(self.noise_floor * NOISE_MARGIN_FACTOR, self.energy_threshold * NOISE_MAX_THRESHOLD_FACTOR)
 
     def mark_discontinuity(self) -> list[AudioChunk]:
         emitted = self.flush()
@@ -218,12 +244,8 @@ class SpeechSegmenter:
         block_start_sample = self.consumed_samples
         self.consumed_samples += block.size
         rms = compute_rms_energy(block)
-        effective_threshold = self.energy_threshold
-        if self.adaptive:
-            effective_threshold = max(self.energy_threshold, self.noise_floor * 2.2)
-        speech_present = rms >= effective_threshold
-        if not speech_present:
-            self.noise_floor = 0.95 * self.noise_floor + 0.05 * rms
+        self.update_noise_floor(rms)
+        speech_present = rms >= self.effective_threshold()
 
         if len(self.active_blocks) == 0:
             if not speech_present:
@@ -609,14 +631,21 @@ class AudioAgent:
         self.control.increment_stat("transcripts_published")
         return chunk_event
 
-    async def ingest_wav_bytes(self, wav_bytes: bytes) -> Optional[TranscriptChunk]:
+    async def ingest_wav_bytes(
+        self,
+        wav_bytes: bytes,
+        capture_epoch: Optional[float] = None
+    ) -> Optional[TranscriptChunk]:
         self.chunk_counter += 1
         wav_path = await run_in_thread_pool(
             save_audio_chunk, wav_bytes, str(self.raw_audio_dir), self.chunk_counter
         )
         with wave.open(io.BytesIO(wav_bytes), "rb") as wav_reader:
             duration_seconds = wav_reader.getnframes() / float(wav_reader.getframerate())
-        end_seconds = self.session_clock.get_elapsed_seconds()
+        if capture_epoch is not None:
+            end_seconds = self.session_clock.elapsed_for_epoch(capture_epoch)
+        else:
+            end_seconds = self.session_clock.get_elapsed_seconds()
         start_seconds = max(0.0, end_seconds - duration_seconds)
         pending = PendingTranscription(
             wav_bytes=wav_bytes,

@@ -178,6 +178,7 @@ class ScreenAgent:
         self.slide_hashes: list[tuple[int, int, np.ndarray]] = []
         self.slide_texts: dict[int, str] = {}
         self.consecutive_capture_errors: int = 0
+        self.retry_tasks: set[asyncio.Task] = set()
 
     def find_revisited_slide(self, difference_hash: int, small_thumbnail: np.ndarray) -> int:
         for slide_number, stored_hash, stored_thumbnail in reversed(self.slide_hashes):
@@ -235,7 +236,13 @@ class ScreenAgent:
                     await asyncio.sleep(0.5 * (attempt + 1))
         return ""
 
-    async def accept_png(self, png_bytes: bytes, thumbnail: np.ndarray) -> SlideCaptured:
+    async def accept_png(
+        self,
+        png_bytes: bytes,
+        thumbnail: np.ndarray,
+        capture_epoch: Optional[float] = None
+    ) -> SlideCaptured:
+        capture_timestamp = capture_epoch if capture_epoch is not None else self.session_clock.get_timestamp()
         self.slide_counter += 1
         slide_number = self.slide_counter
         image_path = await run_in_thread_pool(
@@ -257,7 +264,7 @@ class ScreenAgent:
 
         slide_event = SlideCaptured(
             session_id=self.session_id,
-            timestamp_epoch=self.session_clock.get_timestamp(),
+            timestamp_epoch=capture_timestamp,
             slide_number=slide_number,
             monitor_index=self.settings.monitor_index,
             image_file_path=image_path,
@@ -266,13 +273,73 @@ class ScreenAgent:
         )
         await self.redis_bus.publish_resilient(self.stream_name, slide_event)
         self.control.increment_stat("slides_published")
+        needs_text_retry = (
+            len(extracted_text.strip()) == 0
+            and revisited_number == 0
+            and self.llm_router is not None
+            and not self.control.stop_requested()
+        )
+        if needs_text_retry:
+            self.schedule_text_retry(slide_number, image_path, capture_timestamp, difference_hash, small_thumbnail)
         return slide_event
 
-    async def ingest_png_bytes(self, png_bytes: bytes) -> SlideCaptured:
+    def schedule_text_retry(
+        self,
+        slide_number: int,
+        image_path: str,
+        capture_timestamp: float,
+        difference_hash: int,
+        small_thumbnail: np.ndarray
+    ) -> None:
+        task = asyncio.create_task(
+            self.retry_slide_text(slide_number, image_path, capture_timestamp, difference_hash, small_thumbnail)
+        )
+        self.retry_tasks.add(task)
+        task.add_done_callback(self.retry_tasks.discard)
+
+    async def retry_slide_text(
+        self,
+        slide_number: int,
+        image_path: str,
+        capture_timestamp: float,
+        difference_hash: int,
+        small_thumbnail: np.ndarray
+    ) -> None:
+        for delay_seconds in self.settings.vision_retry_delays_seconds:
+            await asyncio.sleep(delay_seconds)
+            if self.control.stop_requested():
+                return
+            try:
+                png_bytes = await run_in_thread_pool(Path(image_path).read_bytes)
+            except OSError:
+                return
+            recovered_text = await self.run_vision_fallback(png_bytes, max_retries=1)
+            if len(recovered_text.strip()) == 0:
+                continue
+            self.remember_slide(slide_number, difference_hash, small_thumbnail, recovered_text)
+            update_event = SlideCaptured(
+                session_id=self.session_id,
+                timestamp_epoch=capture_timestamp,
+                slide_number=slide_number,
+                monitor_index=self.settings.monitor_index,
+                image_file_path=image_path,
+                extracted_text=recovered_text,
+                revisited_slide_number=0
+            )
+            await self.redis_bus.publish_resilient(self.stream_name, update_event)
+            self.control.increment_stat("slide_text_recovered")
+            return
+        logger.warning("slide %d text could not be recovered after retries", slide_number)
+
+    async def ingest_png_bytes(
+        self,
+        png_bytes: bytes,
+        capture_epoch: Optional[float] = None
+    ) -> SlideCaptured:
         thumbnail = await run_in_thread_pool(
             build_thumbnail_from_png, png_bytes, self.settings.slide_thumbnail_width
         )
-        return await self.accept_png(png_bytes, thumbnail)
+        return await self.accept_png(png_bytes, thumbnail, capture_epoch)
 
     async def run(self) -> None:
         self.is_running = True
@@ -313,6 +380,8 @@ class ScreenAgent:
 
     def stop(self) -> None:
         self.is_running = False
+        for task in list(self.retry_tasks):
+            task.cancel()
 
 
 async def main() -> None:

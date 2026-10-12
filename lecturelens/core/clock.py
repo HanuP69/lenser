@@ -33,6 +33,12 @@ class SessionClock:
     def epoch_for_elapsed(self, elapsed_seconds: float) -> float:
         return self.reference_wall_time + (elapsed_seconds - self.elapsed_offset_seconds)
 
+    def elapsed_for_epoch(self, epoch_seconds: float) -> float:
+        elapsed = (epoch_seconds - self.reference_wall_time) + self.elapsed_offset_seconds
+        if elapsed < self.elapsed_offset_seconds:
+            return self.elapsed_offset_seconds
+        return elapsed
+
     def to_dict(self) -> dict:
         data = {}
         data["reference_wall_time"] = self.reference_wall_time

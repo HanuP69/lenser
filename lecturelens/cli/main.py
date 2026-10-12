@@ -452,11 +452,25 @@ def start(
     run_shutdown(monitor, session_dir, planned_agents)
 
 
+LIVE_HEARTBEAT_MAX_AGE_SECONDS: float = 15.0
+
+
+def session_has_live_agents(session_dir: Path) -> bool:
+    now = time.time()
+    for heartbeat in read_heartbeats(session_dir).values():
+        state = str(heartbeat.get("state", ""))
+        if state in ("stopped", "finished", "failed"):
+            continue
+        if now - float(heartbeat.get("time", 0.0)) <= LIVE_HEARTBEAT_MAX_AGE_SECONDS:
+            return True
+    return False
+
+
 @app.command()
 def stop(
     session: Optional[str] = typer.Option(None, "--session"),
     wait: bool = typer.Option(True, "--wait/--no-wait"),
-    timeout_seconds: float = typer.Option(60.0, "--timeout"),
+    timeout_seconds: float = typer.Option(300.0, "--timeout"),
 ) -> None:
     settings = Settings()
     session_id = resolve_session(settings, session)
@@ -576,13 +590,15 @@ def reprocess(
     session_dir = ensure_session_exists(settings, session)
     if not (session_dir / "timeline.jsonl").exists():
         fail("No timeline.jsonl in this session.")
+    if session_has_live_agents(session_dir):
+        fail("This session still has live agents. Run 'lecturelens stop' first, then reprocess.")
     meta = session_meta.load_session_meta(session_dir)
     if meta.get("course_name"):
         settings.course_name = meta["course_name"]
 
     course_db_path = settings.get_course_database_path(settings.course_name)
     backup_files: dict[str, tuple[Path, Path]] = {}
-    for filename in ("notes.md", "context.json", "flashcards.jsonl", f"{session}.apkg", "flashcards.apkg", "concepts.db"):
+    for filename in ("notes.md", "context.json", "flashcards.jsonl", f"{session}.apkg", "flashcards.apkg", "concepts.db", "notes_marker.json"):
         p = session_dir / filename
         if p.exists():
             backup_p = session_dir / f"{filename}.bak"
@@ -648,7 +664,13 @@ def ask(
                 )
             except Exception as error:
                 console.print(f"[yellow]Router unavailable, using Ollama directly: {error}[/yellow]")
-            engine = QAEngine(session_dir, settings.ollama_url, router)
+            engine = QAEngine(
+                session_dir,
+                settings.ollama_url,
+                router,
+                embedding_model=settings.embedding_model,
+                fallback_model=settings.local_model
+            )
             return await engine.ask_with_sources(question)
         finally:
             await bus.close()

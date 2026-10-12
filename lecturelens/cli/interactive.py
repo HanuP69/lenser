@@ -14,6 +14,7 @@ from lecturelens.config.settings import Settings
 
 
 import time
+from lecturelens.config.defaults import DEFAULT_CLOUD_MODEL, DEFAULT_LOCAL_MODEL
 
 
 def fetch_ollama_models(
@@ -155,7 +156,7 @@ def configure_ollama_flow(settings: Settings, console: Console) -> tuple[str, st
 
     if len(models) == 0:
         console.print(f"[yellow]Ollama is currently unreachable at {settings.ollama_url}.[/yellow]")
-        console.print("[dim]You can still proceed with 'gemma4:e4b' and start Ollama in another terminal.[/dim]")
+        console.print(f"[dim]You can still proceed with {DEFAULT_LOCAL_MODEL} and start Ollama in another terminal.[/dim]")
         choice = Prompt.ask(
             "Select action",
             choices=["default", "custom", "unorouter"],
@@ -164,15 +165,15 @@ def configure_ollama_flow(settings: Settings, console: Console) -> tuple[str, st
         if choice == "unorouter":
             return configure_unorouter_flow(console)
         if choice == "custom":
-            custom_model = Prompt.ask("Enter custom Ollama model name", default="gemma4:e4b")
+            custom_model = Prompt.ask("Enter custom Ollama model name", default=DEFAULT_LOCAL_MODEL)
             return "gemma", custom_model, "local", "gemma"
-        return "gemma", "gemma4:e4b", "local", "gemma"
+        return "gemma", DEFAULT_LOCAL_MODEL, "local", "gemma"
 
     compatible = filter_gemma4_models(models)
     if len(compatible) == 0:
         console.print(f"[yellow]Ollama is running, but no Gemma 4 models were detected.[/yellow]")
         console.print(f"[dim]Models installed: {', '.join(models)}[/dim]")
-        console.print("[dim]Recommended: Run 'ollama pull gemma4:e4b' in a terminal for local inference.[/dim]")
+        console.print(f"[dim]Recommended: Run 'ollama pull {DEFAULT_LOCAL_MODEL}' in a terminal for local inference.[/dim]")
         choice = Prompt.ask(
             "Select action",
             choices=["pull-default", "custom", "unorouter"],
@@ -184,14 +185,14 @@ def configure_ollama_flow(settings: Settings, console: Console) -> tuple[str, st
             custom_model = Prompt.ask("Enter Ollama model name to use", default=models[0])
             return "gemma", custom_model, "local", "gemma"
         if choice == "pull-default":
-            console.print("[cyan]Running 'ollama pull gemma4:e4b'...[/cyan]")
+            console.print(f"[cyan]Running 'ollama pull {DEFAULT_LOCAL_MODEL}'...[/cyan]")
             try:
                 import subprocess
-                subprocess.run(["ollama", "pull", "gemma4:e4b"], check=False)
+                subprocess.run(["ollama", "pull", DEFAULT_LOCAL_MODEL], check=False)
             except Exception as pull_err:
                 console.print(f"[yellow]Could not execute ollama pull: {pull_err}[/yellow]")
-            return "gemma", "gemma4:e4b", "local", "gemma"
-        return "gemma", "gemma4:e4b", "local", "gemma"
+            return "gemma", DEFAULT_LOCAL_MODEL, "local", "gemma"
+        return "gemma", DEFAULT_LOCAL_MODEL, "local", "gemma"
 
     if len(compatible) == 1:
         selected = compatible[0]
@@ -250,12 +251,12 @@ def configure_unorouter_flow(console: Console, mode: str = "cloud") -> tuple[str
             retry = Prompt.ask("Do you want to re-enter?", choices=["y", "n"], default="y")
             if retry.lower() == "n":
                 api_key = entered_key
-                persist_api_key_to_env(api_key)
+                console.print("[yellow]Using this key for this session only (not saved to .env because the health check failed).[/yellow]")
                 break
 
     os.environ["UNOROUTER_API_KEY"] = api_key
     os.environ["LECTURELENS_UNOROUTER_API_KEY"] = api_key
-    selected_model = "gemma-4-26b:free"
+    selected_model = DEFAULT_CLOUD_MODEL
     console.print(f"[green]UnoRouter active with multimodal vision model: {selected_model} (mode: {mode})[/green]")
     return "unorouter", selected_model, mode, "unorouter"
 
@@ -265,7 +266,7 @@ def select_llm_provider(settings: Settings, console: Console) -> tuple[str, str,
         Panel(
             "[bold white]Step 1: Choose LLM Provider[/bold white]\n\n"
             "  [1] [bold green]Local Ollama[/bold green] (Offline, RTX GPU/CPU, Gemma 4)\n"
-            "  [2] [bold cyan]UnoRouter (Cloud)[/bold cyan] (Pure Cloud, Multimodal Vision gemma-4-26b:free, 262k context)\n"
+            f"  [2] [bold cyan]UnoRouter (Cloud)[/bold cyan] (Cloud, multimodal vision {DEFAULT_CLOUD_MODEL}; slide images and transcripts are sent to a third-party gateway)\n"
             "  [3] [bold yellow]Hybrid Mode[/bold yellow] (UnoRouter Cloud with Local Ollama fallback)",
             title="LectureLens AI Backend",
             border_style="blue"

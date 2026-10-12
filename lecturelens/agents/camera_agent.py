@@ -219,6 +219,7 @@ class CameraAgent:
         self.stillness_counter: int = 0
         self.last_published_thumbnail: Optional[np.ndarray] = None
         self.last_publish_time: float = 0.0
+        self.occlusion_hold_count: int = 0
         self.consecutive_capture_errors: int = 0
 
     def has_board_changed(self, thumbnail: np.ndarray, now_seconds: float) -> bool:
@@ -227,6 +228,13 @@ class CameraAgent:
         if (now_seconds - self.last_publish_time) < self.settings.board_min_interval_seconds:
             return False
         fraction = compute_changed_fraction(self.last_published_thumbnail, thumbnail, 25)
+        if fraction >= self.settings.board_occlusion_fraction:
+            self.occlusion_hold_count += 1
+            if self.occlusion_hold_count < self.settings.board_occlusion_patience:
+                return False
+            self.occlusion_hold_count = 0
+            return True
+        self.occlusion_hold_count = 0
         return fraction >= self.settings.board_change_threshold
 
     async def read_vision_text(self, image_bytes: bytes, max_retries: int = 2) -> tuple[str, float, str]:
@@ -246,7 +254,12 @@ class CameraAgent:
                     await asyncio.sleep(0.5 * (attempt + 1))
         return "", 0.0, "none"
 
-    async def process_still_frame(self, frame_bytes: bytes) -> Optional[BoardCaptured]:
+    async def process_still_frame(
+        self,
+        frame_bytes: bytes,
+        capture_epoch: Optional[float] = None
+    ) -> Optional[BoardCaptured]:
+        capture_timestamp = capture_epoch if capture_epoch is not None else self.session_clock.get_timestamp()
         thumbnail = await run_in_thread_pool(build_board_thumbnail, frame_bytes)
         now_seconds = time.monotonic()
         if not self.has_board_changed(thumbnail, now_seconds):
@@ -278,7 +291,7 @@ class CameraAgent:
 
         board_event = BoardCaptured(
             session_id=self.session_id,
-            timestamp_epoch=self.session_clock.get_timestamp(),
+            timestamp_epoch=capture_timestamp,
             image_file_path=corrected_path,
             raw_ocr_text=text,
             confidence=confidence,
@@ -288,11 +301,15 @@ class CameraAgent:
         self.control.increment_stat("boards_published")
         return board_event
 
-    async def ingest_jpeg_bytes(self, frame_bytes: bytes) -> Optional[BoardCaptured]:
+    async def ingest_jpeg_bytes(
+        self,
+        frame_bytes: bytes,
+        capture_epoch: Optional[float] = None
+    ) -> Optional[BoardCaptured]:
         blur_score = await run_in_thread_pool(compute_blur_score, frame_bytes)
         if blur_score < self.settings.blur_variance_threshold:
             return None
-        return await self.process_still_frame(frame_bytes)
+        return await self.process_still_frame(frame_bytes, capture_epoch)
 
     async def run(self) -> None:
         self.is_running = True

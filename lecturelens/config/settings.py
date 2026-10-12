@@ -1,3 +1,4 @@
+from lecturelens.config.defaults import DEFAULT_EMBEDDING_MODEL, DEFAULT_LOCAL_MODEL
 from pathlib import Path
 from typing import Optional
 
@@ -17,6 +18,8 @@ class Settings(BaseSettings):
 
     redis_url: str = Field(default="redis://localhost:6379")
     ollama_url: str = Field(default="http://localhost:11434")
+    local_model: str = Field(default=DEFAULT_LOCAL_MODEL)
+    embedding_model: str = Field(default=DEFAULT_EMBEDDING_MODEL)
 
     tesseract_path: str = Field(default="C:\\Program Files\\Tesseract-OCR\\tesseract.exe")
     docker_ocr_url: Optional[str] = Field(default=None)
@@ -52,6 +55,7 @@ class Settings(BaseSettings):
 
     screenshot_interval_seconds: float = Field(default=1.0)
     slide_diff_threshold: float = Field(default=0.004)
+    vision_retry_delays_seconds: list[float] = Field(default_factory=lambda: [15.0, 45.0, 120.0])
     slide_pixel_delta: int = Field(default=25)
     slide_min_interval_seconds: float = Field(default=5.0)
     slide_thumbnail_width: int = Field(default=640)
@@ -67,11 +71,15 @@ class Settings(BaseSettings):
     board_change_threshold: float = Field(default=0.01)
     board_min_interval_seconds: float = Field(default=10.0)
     board_min_area_ratio: float = Field(default=0.2)
+    board_occlusion_fraction: float = Field(default=0.35)
+    board_occlusion_patience: int = Field(default=3)
 
     structuring_interval_seconds: int = Field(default=120)
     max_slice_characters: int = Field(default=12000)
     context_max_characters: int = Field(default=4000)
     correlation_window_seconds: float = Field(default=5.0)
+    correlation_active_seconds: float = Field(default=600.0)
+    correlation_lead_seconds: float = Field(default=3.0)
     sync_merge_window_seconds: float = Field(default=30.0)
 
     gateway_host: str = Field(default="127.0.0.1")

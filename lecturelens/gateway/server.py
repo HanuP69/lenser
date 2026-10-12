@@ -22,6 +22,8 @@ from lecturelens.schemas.events import BoardCaptured, SlideCaptured, TranscriptC
 logger = get_logger("lecturelens.gateway")
 
 LOOPBACK_HOSTS: tuple[str, ...] = ("127.0.0.1", "localhost", "::1")
+CAPTURE_PAST_TOLERANCE_SECONDS: float = 600.0
+CAPTURE_FUTURE_TOLERANCE_SECONDS: float = 5.0
 EVENT_SOURCE_TYPES: tuple[str, ...] = ("transcript", "slide", "board")
 EVENT_CLASSES: dict[str, Any] = {
     "transcript": TranscriptChunk,
@@ -59,6 +61,7 @@ class SessionRuntime:
     screen_agent: ScreenAgent
     camera_agent: CameraAgent
     connection_count: int = 0
+    last_active: float = field(default_factory=time.monotonic)
 
 
 def validate_gateway_binding(host: str, api_key: Optional[str]) -> None:
@@ -70,6 +73,17 @@ def validate_gateway_binding(host: str, api_key: Optional[str]) -> None:
 
 def keys_match(provided_key: str, expected_key: str) -> bool:
     return hmac.compare_digest(provided_key.encode("utf-8"), expected_key.encode("utf-8"))
+
+
+def resolve_capture_epoch(message: dict[str, Any], clock: SessionClock) -> Optional[float]:
+    raw_value = message.get("timestamp_epoch")
+    if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+        return None
+    candidate = float(raw_value)
+    server_now = clock.get_timestamp()
+    if server_now - CAPTURE_PAST_TOLERANCE_SECONDS <= candidate <= server_now + CAPTURE_FUTURE_TOLERANCE_SECONDS:
+        return candidate
+    return None
 
 
 def decode_base64_field(message: dict[str, Any], field_name: str) -> bytes:
@@ -101,6 +115,8 @@ class GatewayServer:
         if existing is not None:
             return existing
         if len(self.sessions) >= self.settings.gateway_max_sessions:
+            self.evict_idle_sessions(len(self.sessions) - self.settings.gateway_max_sessions + 1)
+        if len(self.sessions) >= self.settings.gateway_max_sessions:
             raise ValueError("session limit reached")
         session_dir = self.settings.create_session_directories(session_id)
         clock = SessionClock.load_or_create(session_dir / "clock.json")
@@ -113,6 +129,26 @@ class GatewayServer:
         )
         self.sessions[session_id] = runtime
         return runtime
+
+    def evict_idle_sessions(self, count: int) -> int:
+        idle_runtimes = sorted(
+            (runtime for runtime in self.sessions.values() if runtime.connection_count <= 0),
+            key=lambda runtime: runtime.last_active
+        )
+        evicted = 0
+        for runtime in idle_runtimes[:max(0, count)]:
+            self.release_session(runtime.session_id)
+            evicted += 1
+        return evicted
+
+    def release_session(self, session_id: str) -> None:
+        runtime = self.sessions.pop(session_id, None)
+        if runtime is None:
+            return
+        runtime.audio_agent.stop()
+        runtime.screen_agent.stop()
+        runtime.camera_agent.stop()
+        logger.info("released idle gateway session %s", session_id)
 
     def authenticate(self, hello_message: dict[str, Any]) -> str:
         if hello_message.get("type") != "hello":
@@ -128,22 +164,20 @@ class GatewayServer:
         return session_id
 
     async def handle_message(self, runtime: SessionRuntime, message: dict[str, Any]) -> dict[str, Any]:
-        capture_timestamp = message.get("timestamp_epoch")
-        if isinstance(capture_timestamp, (int, float)) and capture_timestamp > 0:
-            runtime.clock.reference_wall_time = float(capture_timestamp)
-            runtime.clock.reference_monotonic_time = time.monotonic()
+        runtime.last_active = time.monotonic()
+        capture_epoch = resolve_capture_epoch(message, runtime.clock)
         message_type = message.get("type")
         if message_type == "audio":
             wav_bytes = decode_base64_field(message, "wav_b64")
-            await runtime.audio_agent.ingest_wav_bytes(wav_bytes)
+            await runtime.audio_agent.ingest_wav_bytes(wav_bytes, capture_epoch)
             return {"status": "acknowledged"}
         if message_type == "screen":
             png_bytes = decode_base64_field(message, "png_b64")
-            await runtime.screen_agent.ingest_png_bytes(png_bytes)
+            await runtime.screen_agent.ingest_png_bytes(png_bytes, capture_epoch)
             return {"status": "acknowledged"}
         if message_type == "camera":
             jpeg_bytes = decode_base64_field(message, "jpeg_b64")
-            await runtime.camera_agent.ingest_jpeg_bytes(jpeg_bytes)
+            await runtime.camera_agent.ingest_jpeg_bytes(jpeg_bytes, capture_epoch)
             return {"status": "acknowledged"}
         if message_type == "event":
             source_type = message.get("source_type")
@@ -211,6 +245,7 @@ class GatewayServer:
         finally:
             if runtime is not None:
                 runtime.connection_count -= 1
+                runtime.last_active = time.monotonic()
 
     async def start(self, host: Optional[str] = None, port: Optional[int] = None) -> None:
         try:

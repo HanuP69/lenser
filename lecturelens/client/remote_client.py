@@ -21,9 +21,16 @@ from lecturelens.core.logging_setup import get_logger
 logger = get_logger("lecturelens.client")
 
 
-def encode_message(message_type: str, field_name: str, payload: bytes) -> str:
+def encode_message(
+    message_type: str,
+    field_name: str,
+    payload: bytes,
+    capture_epoch: Optional[float] = None
+) -> str:
+    if capture_epoch is None:
+        capture_epoch = time.time()
     encoded = base64.b64encode(payload).decode("ascii")
-    return json.dumps({"type": message_type, field_name: encoded})
+    return json.dumps({"type": message_type, field_name: encoded, "timestamp_epoch": capture_epoch})
 
 
 async def send_and_wait(websocket: Any, text_frame: str) -> None:
@@ -52,7 +59,9 @@ async def stream_audio(websocket: Any, settings: Settings, stop_event: asyncio.E
                 continue
             for chunk in segmenter.push(block, time.monotonic() - started):
                 wav_bytes = convert_numpy_to_wav_bytes(chunk.samples, settings.mic_sample_rate)
-                await send_and_wait(websocket, encode_message("audio", "wav_b64", wav_bytes))
+                await send_and_wait(
+                    websocket, encode_message("audio", "wav_b64", wav_bytes, time.time())
+                )
     finally:
         await run_in_thread_pool(source.stop)
 
@@ -69,8 +78,11 @@ async def stream_screen(websocket: Any, settings: Settings, stop_event: asyncio.
                 capture_screen_frame, settings.monitor_index, settings.slide_thumbnail_width
             )
             if gate.evaluate(frame.thumbnail, time.monotonic()):
+                captured_at = time.time()
                 png_bytes = await run_in_thread_pool(encode_frame_as_png, frame)
-                await send_and_wait(websocket, encode_message("screen", "png_b64", png_bytes))
+                await send_and_wait(
+                    websocket, encode_message("screen", "png_b64", png_bytes, captured_at)
+                )
         except Exception as error:
             logger.error("screen streaming error: %s", error)
         await asyncio.sleep(settings.screenshot_interval_seconds)
@@ -83,6 +95,7 @@ async def stream_camera(websocket: Any, settings: Settings, stop_event: asyncio.
     while not stop_event.is_set():
         try:
             frame_bytes = await run_in_thread_pool(camera.read_jpeg)
+            frame_captured_at = time.time()
             if previous_frame is not None:
                 motion = await run_in_thread_pool(compute_motion_score, previous_frame, frame_bytes)
                 if motion > settings.motion_threshold:
@@ -92,7 +105,9 @@ async def stream_camera(websocket: Any, settings: Settings, stop_event: asyncio.
                 if still_count >= settings.motion_stillness_required_frames:
                     blur = await run_in_thread_pool(compute_blur_score, frame_bytes)
                     if blur >= settings.blur_variance_threshold:
-                        await send_and_wait(websocket, encode_message("camera", "jpeg_b64", frame_bytes))
+                        await send_and_wait(
+                            websocket, encode_message("camera", "jpeg_b64", frame_bytes, frame_captured_at)
+                        )
                         still_count = 0
             previous_frame = frame_bytes
         except Exception as error:

@@ -1,8 +1,36 @@
+import difflib
 import json
+import re
 import sqlite3
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Optional
+
+
+FUZZY_MATCH_RATIO: float = 0.88
+LEADING_ARTICLES: tuple[str, ...] = ("the ", "a ", "an ")
+
+
+def singularize_word(word: str) -> str:
+    if len(word) > 4 and word.endswith("ies"):
+        return word[:-3] + "y"
+    if len(word) > 4 and word.endswith(("ches", "shes", "xes", "sses", "zes")):
+        return word[:-2]
+    if len(word) > 3 and word.endswith("s") and not word.endswith(("ss", "us", "is")):
+        return word[:-1]
+    return word
+
+
+def normalize_concept_name(name: str) -> str:
+    lowered = name.strip().lower()
+    lowered = re.sub(r"\([^)]*\)", " ", lowered)
+    lowered = re.sub(r"[-_/]", " ", lowered)
+    lowered = re.sub(r"[^\w\s]", "", lowered)
+    lowered = re.sub(r"\s+", " ", lowered).strip()
+    for article in LEADING_ARTICLES:
+        if lowered.startswith(article):
+            lowered = lowered[len(article):]
+    return " ".join(singularize_word(word) for word in lowered.split(" ")).strip()
 
 
 class ConceptGraph:
@@ -102,7 +130,7 @@ class ConceptGraph:
         related_concepts: list[str],
         course_name: Optional[str] = None
     ) -> None:
-        normalized_name = concept_name.strip().lower()
+        normalized_name = normalize_concept_name(concept_name)
         if len(normalized_name) == 0:
             return
         related_json = json.dumps(related_concepts)
@@ -123,16 +151,33 @@ class ConceptGraph:
             connection.commit()
 
     def find_concept(self, concept_name: str) -> list[dict[str, Any]]:
-        normalized_name = concept_name.strip().lower()
+        normalized_name = normalize_concept_name(concept_name)
+        if len(normalized_name) == 0:
+            return []
         with closing(self.connect()) as connection:
+            stored_names = [
+                row[0] for row in connection.execute("SELECT DISTINCT concept_name FROM concepts").fetchall()
+            ]
+            matching_names = [
+                stored for stored in stored_names
+                if self.names_match(normalized_name, normalize_concept_name(stored))
+            ]
+            if len(matching_names) == 0:
+                return []
+            placeholders = ",".join("?" for _ in matching_names)
             rows = connection.execute(
-                "SELECT * FROM concepts WHERE concept_name = ? ORDER BY timestamp_epoch ASC",
-                (normalized_name,)
+                f"SELECT * FROM concepts WHERE concept_name IN ({placeholders}) ORDER BY timestamp_epoch ASC",
+                matching_names
             ).fetchall()
-        results: list[dict[str, Any]] = []
-        for row in rows:
-            results.append(self.row_to_dict(row))
-        return results
+        return [self.row_to_dict(row) for row in rows]
+
+    @staticmethod
+    def names_match(left: str, right: str) -> bool:
+        if left == right:
+            return True
+        if min(len(left), len(right)) < 6:
+            return False
+        return difflib.SequenceMatcher(None, left, right).ratio() >= FUZZY_MATCH_RATIO
 
     def find_concept_in_other_sessions(
         self,

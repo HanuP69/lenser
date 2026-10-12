@@ -9,7 +9,7 @@ Numbers refer to the bug list from the code review.
 4. Only complete lines (ending in a newline) are consumed; a half-written line waits for the next pass.
 5. Real `stop` command and graceful shutdown: capture agents, then sync (drains Redis and flushes), then a final structuring pass. Ctrl+C in `start` does the same. (`cli/main.py`, `core/recovery.py`, `core/agent_runtime.py`)
 6. Sync holds entries by arrival time (`sync_merge_window_seconds`, default 30 s), orders each batch by event time, and structuring sorts its slice. (`sync_agent.py`)
-7. Correlation rewritten around slide/board anchors: nearest anchor wins, older links are never overwritten, anchors persist across flush batches.
+7. Correlation rewritten around slide/board anchors; see v0.3.0 for the active-slide rule.
 8. Camera only publishes when the board changed since the last published capture, with a minimum interval. (`camera_agent.py`)
 9. Audio capture is continuous and decoupled from transcription; chunks are cut at pauses, with a bounded transcription queue. (`audio_agent.py`)
 10. Raw files are numbered from the highest existing index; starting an existing session needs `--resume`.
@@ -27,7 +27,7 @@ Numbers refer to the bug list from the code review.
 20. OCR fallbacks run in pools/threads; Docker OCR is opt-in via `docker_ocr_url`.
 21. Image messages use the `{"url": ...}` form.
 22. Fallback only on provider failures; cloud providers are opt-in (`--llm-mode hybrid|cloud`) and skipped without API keys; per-call timeout; `num_ctx` set for Ollama.
-23. Whisper: VAD filter, no-speech/logprob filtering, hallucination phrase filter, language locked after a confident detection.
+23. Whisper: VAD filter, no-speech/logprob filtering, hallucination phrase filter; language locking is opt-in (`whisper_lock_language`).
 24. `both` mixes mic and loopback into one stream (summed and clipped) instead of two transcripts.
 25. Camera stays open across frames with warm-up frames and reopens on failure.
 26. Perspective warp validates area, convexity and aspect ratio, else keeps the raw frame.
@@ -46,10 +46,42 @@ Numbers refer to the bug list from the code review.
 37. Rate limiter creates its key with a TTL before incrementing; breaker checked before the limiter.
 38. Dependencies corrected (`zeroconf` removed, `httpx`, `typing-extensions`, `reportlab` added).
 39. Models: `gemini-2.0-flash` was shut down by Google, replaced with `gemini-3.5-flash`; the OpenRouter entry now uses `openrouter/free`. Check both against your accounts.
-40. 260 tests, including process-pool recovery, offsets, partial lines, shutdown ordering, gateway security, and markdown formatting resilience.
+40. Test suite covering process-pool recovery, offsets, partial lines, shutdown ordering, gateway security, and markdown formatting resilience (see README for the current count).
 
 ## Use cases
 Pause/resume (`pause`, `resume`), duplicate slide detection, code-friendly OCR settings, course tagging, disk-space warning, Redis stream length cap, notes in the lecture language.
 
 ## Not done
 Speaker diarization, pre-recorded video files as input, echo cancellation for `--audio-source both`.
+
+# Fix log (v0.3.0)
+
+Second review round. Everything below was reproduced before it was fixed and has a regression test in `tests/test_hardening.py`.
+
+## Data safety
+1. Redis consumer: with `auto_ack=False`, replaying the unacked backlog on restart spun forever (thousands of deliveries of the same messages). The backlog is now read with an advancing cursor.
+2. Sync agent: acks only after the `timeline.jsonl` write; replays and reclaims are de-duplicated by (stream, message id) and by content fingerprint (restored from the timeline tail on start); the reclaim idle time is `merge window + 60 s` so buffered messages are never reclaimed while they wait.
+3. Structuring: notes are guarded by `notes_marker.json` (end offset of the last appended batch) instead of searching for a `### HH:MM:SS` heading. Crashes on the first batch no longer duplicate notes, batches that share a wall-clock second are no longer skipped, and `notes.md` is never truncated on startup, so hand edits survive.
+4. `reprocess`: refuses while agents are live, backs up the notes marker as well, and restores both the session and the course concept databases when the run fails.
+
+## Correctness
+5. Slide and board events are stamped with the capture time instead of the time OCR / vision finished.
+6. Speech is correlated with the slide that is on screen (latest anchor up to `correlation_active_seconds`), with a short lead (`correlation_lead_seconds`) for speech right before a slide change.
+7. Adaptive VAD no longer ratchets up on quiet speech: the floor is a rolling 10th percentile of block energy, it only raises the threshold when the room is louder than `vad_energy_threshold`, and the threshold is capped at 4x.
+8. A slide whose OCR and vision both failed is retried in the background and published as a late update with its original timestamp.
+9. Camera: a sudden large change (someone stepping in front of the board) is held for `board_occlusion_patience` stillness checks.
+10. `(Cont.)` / `(Continued)` markers are removed from every line, not only from lines that became headings.
+11. Heading recovery only promotes standalone lines (preceded by a blank line).
+12. Gateway: idle sessions are evicted (oldest first) instead of exhausting `gateway_max_sessions` forever; client capture timestamps no longer overwrite the shared session clock (they are range-checked and used per event). The remote client now sends them.
+13. Anki: prices such as `$5-$10` are left alone; short symbolic math (`$NP$`, `$f(x, y)$`, `$P(A|B)$`, `$2n$`) is converted.
+14. PDF: long code lines wrap instead of running off the page; inline and display LaTeX are converted to readable markup (fractions, sub/superscripts, Greek, relations).
+15. Concept graph: names are normalized and fuzzy-matched, so cross-lecture links survive rephrasing.
+16. `stop --timeout` defaults to 300 s (the worst-case shutdown is 180 s).
+17. Wizard: a key that failed its health check is no longer written to `.env`; model names come from `config/defaults.py` and settings (`local_model`, `embedding_model`) instead of being repeated in five files.
+
+## Benchmarks and docs
+18. `benchmark_reproducible.py` warns loudly when it falls back to synthetic data, skips ASR cleanly when `faster-whisper` is missing, includes the thumbnail cost in the gate comparison, no longer assumes a 600 s session, and prints correct ms values.
+19. README claims were corrected (privacy, limitations, benchmark meaning, test counts).
+
+## Not done
+Speaker diarization, pre-recorded video input, echo cancellation for `--audio-source both`, person detection for the board camera.

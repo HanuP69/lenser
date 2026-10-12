@@ -23,7 +23,7 @@ print("=" * 60)
 print("       LECTURELENS EMPIRICAL REPRODUCIBLE BENCHMARK")
 print("=" * 60)
 
-def resolve_audio_sample() -> tuple[bytes, float]:
+def resolve_audio_sample() -> tuple[bytes, float, bool]:
     candidate_patterns = [
         "output/**/raw/audio/*.wav",
     ]
@@ -34,7 +34,7 @@ def resolve_audio_sample() -> tuple[bytes, float]:
             try:
                 with wave.open(str(target_path), "rb") as wf:
                     duration = wf.getnframes() / float(wf.getframerate())
-                return target_path.read_bytes(), duration
+                return target_path.read_bytes(), duration, False
             except Exception:
                 pass
 
@@ -49,9 +49,9 @@ def resolve_audio_sample() -> tuple[bytes, float]:
         for i in range(num_samples):
             sample = int(32767.0 * 0.3 * math.sin(2.0 * math.pi * 440.0 * i / sample_rate))
             wf.writeframes(struct.pack("<h", sample))
-    return buffer.getvalue(), duration
+    return buffer.getvalue(), duration, True
 
-def resolve_slide_sample() -> Image.Image:
+def resolve_slide_sample() -> tuple[Image.Image, bool]:
     candidate_patterns = [
         "output/**/raw/slides/*.png",
     ]
@@ -59,7 +59,7 @@ def resolve_slide_sample() -> Image.Image:
         matches = glob.glob(pattern, recursive=True)
         if len(matches) > 0:
             try:
-                return Image.open(matches[0])
+                return Image.open(matches[0]), False
             except Exception:
                 pass
 
@@ -67,44 +67,56 @@ def resolve_slide_sample() -> Image.Image:
     draw = ImageDraw.Draw(img)
     draw.rectangle([100, 100, 1820, 980], outline=(0, 0, 0), width=4)
     draw.text((200, 200), "LectureLens Empirical Slide Benchmark", fill=(0, 0, 0))
-    return img
+    return img, True
 
-audio_bytes, audio_duration_sec = resolve_audio_sample()
+audio_bytes, audio_duration_sec, audio_is_synthetic = resolve_audio_sample()
 print(f"\n[1] AUDIO TRANSCRIPTION (ASR) BENCHMARK")
 print(f"    Audio Duration: {audio_duration_sec:.2f} seconds")
-
-_ = transcribe_audio_chunk(audio_bytes, "base", device="cpu")
-
-cpu_times = []
-for _ in range(3):
-    t0 = time.perf_counter()
-    _ = transcribe_audio_chunk(audio_bytes, "base", device="cpu")
-    cpu_times.append(time.perf_counter() - t0)
-
-avg_cpu_time = sum(cpu_times) / len(cpu_times)
-cpu_rtf = avg_cpu_time / audio_duration_sec
-print(f"    CPU (INT8): {avg_cpu_time*1000:.1f} ms | RTF: {cpu_rtf:.4f} (Speed: {audio_duration_sec/avg_cpu_time:.1f}x real-time)")
+if audio_is_synthetic:
+    print("    WARNING: no recorded audio found in ./output/**/raw/audio. Using a synthetic 440 Hz tone.")
+    print("             Whisper's VAD discards a pure tone, so these timings are NOT representative of speech.")
+else:
+    print("    Source: real recorded chunk from ./output")
 
 try:
-    import torch
-    if torch.cuda.is_available():
-        _ = transcribe_audio_chunk(audio_bytes, "base", device="cuda")
-        cuda_times = []
-        for _ in range(5):
-            t0 = time.perf_counter()
+    _ = transcribe_audio_chunk(audio_bytes, "base", device="cpu")
+
+    cpu_times = []
+    for _ in range(3):
+        t0 = time.perf_counter()
+        _ = transcribe_audio_chunk(audio_bytes, "base", device="cpu")
+        cpu_times.append(time.perf_counter() - t0)
+
+    avg_cpu_time = sum(cpu_times) / len(cpu_times)
+    cpu_rtf = avg_cpu_time / audio_duration_sec
+    print(f"    CPU (INT8): {avg_cpu_time*1000:.1f} ms | RTF: {cpu_rtf:.4f} (Speed: {audio_duration_sec/avg_cpu_time:.1f}x real-time)")
+
+    try:
+        import torch
+        if torch.cuda.is_available():
             _ = transcribe_audio_chunk(audio_bytes, "base", device="cuda")
-            cuda_times.append(time.perf_counter() - t0)
-        avg_cuda_time = sum(cuda_times) / len(cuda_times)
-        cuda_rtf = avg_cuda_time / audio_duration_sec
-        print(f"    GPU (CUDA FP16): {avg_cuda_time*1000:.1f} ms | RTF: {cuda_rtf:.4f} (Speed: {audio_duration_sec/avg_cuda_time:.1f}x real-time)")
-        print(f"    GPU vs CPU Speedup: {avg_cpu_time / avg_cuda_time:.1f}x")
-except Exception:
-    pass
+            cuda_times = []
+            for _ in range(5):
+                t0 = time.perf_counter()
+                _ = transcribe_audio_chunk(audio_bytes, "base", device="cuda")
+                cuda_times.append(time.perf_counter() - t0)
+            avg_cuda_time = sum(cuda_times) / len(cuda_times)
+            cuda_rtf = avg_cuda_time / audio_duration_sec
+            print(f"    GPU (CUDA FP16): {avg_cuda_time*1000:.1f} ms | RTF: {cuda_rtf:.4f} (Speed: {audio_duration_sec/avg_cuda_time:.1f}x real-time)")
+            print(f"    GPU vs CPU Speedup: {avg_cpu_time / avg_cuda_time:.1f}x")
+    except Exception:
+        pass
+except Exception as asr_error:
+    print(f"    ASR benchmark skipped: {type(asr_error).__name__}: {asr_error}")
 
 print(f"\n[2] SCREEN CHANGE DETECTION (VISION) BENCHMARK")
-slide_img = resolve_slide_sample()
+slide_img, slide_is_synthetic = resolve_slide_sample()
 width, height = slide_img.size
 print(f"    Slide Resolution: {width}x{height}")
+if slide_is_synthetic:
+    print("    WARNING: no recorded slide found in ./output/**/raw/slides. Using a synthetic white slide.")
+else:
+    print("    Source: real captured slide from ./output")
 
 img_arr1 = np.array(slide_img.convert("RGB"))
 img_arr2 = np.copy(img_arr1)
@@ -139,6 +151,15 @@ for i in range(50):
     changing_times.append(time.perf_counter() - t0)
 avg_changing_ms = (sum(changing_times) / len(changing_times)) * 1000.0
 
+thumbnail_times = []
+for _ in range(20):
+    t0 = time.perf_counter()
+    _ = build_gray_thumbnail(slide_img, 640)
+    thumbnail_times.append(time.perf_counter() - t0)
+avg_thumbnail_ms = (sum(thumbnail_times) / len(thumbnail_times)) * 1000.0
+total_settled_ms = avg_thumbnail_ms + avg_settled_ms
+total_changing_ms = avg_thumbnail_ms + avg_changing_ms
+
 revisit_hash_times = []
 thumb_pre = build_gray_thumbnail(slide_img, 640)
 for _ in range(200):
@@ -148,11 +169,14 @@ for _ in range(200):
 avg_revisit_hash_us = (sum(revisit_hash_times) / len(revisit_hash_times)) * 1_000_000.0
 
 print(f"    Method 1: Naive 1080p RGB Matrix Difference:    {avg_naive_ms:.2f} ms")
-print(f"    Method 2a: SlideChangeGate Settled (640px):     {avg_settled_ms:.2f} ms")
-print(f"    Method 2b: SlideChangeGate Changed (640px):     {avg_changing_ms:.2f} ms")
+print(f"    Thumbnail build (full frame -> 640px gray):     {avg_thumbnail_ms:.2f} ms (paid once per captured frame)")
+print(f"    Method 2a: SlideChangeGate.evaluate Settled:    {avg_settled_ms:.2f} ms")
+print(f"    Method 2b: SlideChangeGate.evaluate Changed:    {avg_changing_ms:.2f} ms")
+print(f"    Method 2 total per frame (thumbnail + settled): {total_settled_ms:.2f} ms")
+print(f"    Method 2 total per frame (thumbnail + changed): {total_changing_ms:.2f} ms")
 print(f"    Revisit Cache dHash Kernel:                     {avg_revisit_hash_us:.1f} us")
-print(f"    Gating Speedup vs Full Frame Diff (Settled):    {avg_naive_ms / avg_settled_ms:.1f}x faster")
-print(f"    Gating Speedup vs Full Frame Diff (Changed):    {avg_naive_ms / avg_changing_ms:.1f}x faster")
+print(f"    Gating Speedup vs Full Frame Diff (Settled):    {avg_naive_ms / total_settled_ms:.1f}x faster")
+print(f"    Gating Speedup vs Full Frame Diff (Changed):    {avg_naive_ms / total_changing_ms:.1f}x faster")
 
 found_session = False
 output_dir = Path("./output")
@@ -191,15 +215,17 @@ if output_dir.exists():
                             session_sec = int(last_t - first_t)
                 except Exception:
                     pass
+            print(f"\n[3] SESSION COMPUTE REDUCTION (Recorded session: {session_dir.name})")
             if session_sec == 0:
-                session_sec = 600
-            total_potential_frames = session_sec
-            reduction = ((total_potential_frames - n_slides) / total_potential_frames) * 100.0
-            print(f"\n[3] SESSION COMPUTE REDUCTION (Real Lecture: {session_dir.name})")
-            print(f"    Session Duration:               {session_sec} seconds (~{session_sec/60:.1f} minutes)")
-            print(f"    Naive 1 FPS OCR Invocations:    {total_potential_frames} calls")
-            print(f"    LectureLens Gated Invocations:  {n_slides} calls")
-            print(f"    Empirical Compute Reduction:    {reduction:.1f}%")
+                print("    Session duration could not be determined from session_meta.json, clock.json or timeline.jsonl.")
+                print(f"    LectureLens gated invocations: {n_slides} calls (no baseline comparison without a duration).")
+            else:
+                total_potential_frames = session_sec
+                reduction = ((total_potential_frames - n_slides) / total_potential_frames) * 100.0
+                print(f"    Session Duration:               {session_sec} seconds (~{session_sec/60:.1f} minutes)")
+                print(f"    OCR-every-second baseline:      {total_potential_frames} calls (worst-case strawman, not a real competitor)")
+                print(f"    LectureLens Gated Invocations:  {n_slides} calls")
+                print(f"    Reduction vs that baseline:     {reduction:.1f}%")
             found_session = True
             break
 
@@ -228,6 +254,6 @@ for _ in range(200):
     clean_times.append(time.perf_counter() - t0)
 
 avg_clean_us = (sum(clean_times) / len(clean_times)) * 1_000_000.0
-print(f"    Cleaning & Markdown Formatting Latency: {avg_clean_us:.1f} us (0.0{int(avg_clean_us/10)} ms)")
+print(f"    Cleaning & Markdown Formatting Latency: {avg_clean_us:.1f} us ({avg_clean_us/1000.0:.3f} ms)")
 
 print("=" * 60)

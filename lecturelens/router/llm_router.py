@@ -10,6 +10,7 @@ from langchain_core.runnables import RunnableLambda
 
 from lecturelens.core.circuit_breaker import RedisRateLimiter, RedisCircuitBreaker
 from lecturelens.core.logging_setup import get_logger
+from lecturelens.config.defaults import DEFAULT_LOCAL_MODEL
 
 logger = get_logger("lecturelens.router")
 
@@ -47,7 +48,7 @@ def load_router_config(config_path: Path) -> dict[str, Any]:
                 "gemma": {
                     "type": "ollama",
                     "cloud": False,
-                    "model": "gemma4:e4b",
+                    "model": DEFAULT_LOCAL_MODEL,
                     "num_ctx": 8192,
                     "rate_limit": {"max_rpm": 120, "window_seconds": 60},
                     "circuit_breaker": {"failure_threshold": 3, "cooldown_seconds": 30}

@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import time
 from collections import deque
@@ -25,6 +26,21 @@ def event_to_redis_fields(event: BaseModel) -> dict[str, str]:
         else:
             event_data[key] = str(value)
     return event_data
+
+
+def handler_accepts_message_id(handler: Callable[..., Any]) -> bool:
+    try:
+        parameters = inspect.signature(handler).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    positional = [
+        parameter for parameter in parameters
+        if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    has_var_positional = any(
+        parameter.kind == inspect.Parameter.VAR_POSITIONAL for parameter in inspect.signature(handler).parameters.values()
+    )
+    return len(positional) >= 2 or has_var_positional
 
 
 class RedisBus:
@@ -131,13 +147,14 @@ class RedisBus:
         stream_name: str,
         group_name: str,
         consumer_name: str,
-        batch_size: int
+        batch_size: int,
+        idle_ms: Optional[int] = None
     ) -> list[tuple[str, dict[str, str]]]:
         result = await self.client.xautoclaim(
             stream_name,
             group_name,
             consumer_name,
-            min_idle_time=self.reclaim_idle_ms,
+            min_idle_time=idle_ms if idle_ms is not None else self.reclaim_idle_ms,
             start_id="0-0",
             count=batch_size
         )
@@ -176,12 +193,11 @@ class RedisBus:
         handler: Callable[..., Awaitable[Any]],
         auto_ack: bool = True
     ) -> None:
+        pass_message_id = handler_accepts_message_id(handler)
         for message_id, message_data in messages:
             failure_key = f"{stream_name}|{message_id}"
             try:
-                import inspect
-                sig = inspect.signature(handler)
-                if len(sig.parameters) >= 2:
+                if pass_message_id:
                     await handler(message_data, message_id)
                 else:
                     await handler(message_data)
@@ -217,10 +233,13 @@ class RedisBus:
         batch_size: int = 10,
         block_ms: int = 2000,
         should_stop: Optional[Callable[[], bool]] = None,
-        auto_ack: bool = True
+        auto_ack: bool = True,
+        reclaim_idle_ms: Optional[int] = None
     ) -> None:
         backoff_seconds = 0.5
         backlog_drained = False
+        backlog_cursor = "0"
+
         last_reclaim_time = 0.0
         group_ready = False
         while True:
@@ -231,19 +250,20 @@ class RedisBus:
 
                 if not backlog_drained:
                     messages = await self.read_group_messages(
-                        stream_name, group_name, consumer_name, "0", batch_size, None
+                        stream_name, group_name, consumer_name, backlog_cursor, batch_size, None
                     )
                     if len(messages) == 0:
                         backlog_drained = True
                         continue
                     await self.dispatch_messages(stream_name, group_name, messages, handler, auto_ack)
+                    backlog_cursor = messages[-1][0]
                     continue
 
                 current_time = time.monotonic()
                 if current_time - last_reclaim_time >= self.reclaim_interval_seconds:
                     last_reclaim_time = current_time
                     reclaimed = await self.reclaim_idle_messages(
-                        stream_name, group_name, consumer_name, batch_size
+                        stream_name, group_name, consumer_name, batch_size, reclaim_idle_ms
                     )
                     if len(reclaimed) > 0:
                         await self.dispatch_messages(stream_name, group_name, reclaimed, handler, auto_ack)
@@ -262,6 +282,8 @@ class RedisBus:
             except Exception as error:
                 logger.error("consume loop error on %s: %s", stream_name, error)
                 group_ready = False
+                backlog_drained = False
+                backlog_cursor = "0"
                 if should_stop is not None and should_stop():
                     return
                 await asyncio.sleep(backoff_seconds)

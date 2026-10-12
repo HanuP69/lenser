@@ -117,14 +117,60 @@ class TestGatewaySecurity(GatewayTestBase):
             self.assertEqual(socket.sent[0]["status"], "unauthorized", bad_session)
         self.assertEqual(self.gateway.sessions, {})
 
-    async def test_session_limit_is_enforced(self) -> None:
+    async def test_session_limit_is_enforced_while_sessions_are_connected(self) -> None:
         self.settings.gateway_max_sessions = 1
-        first = FakeWebSocket([hello(session="one")])
-        await self.gateway.handle_connection(first)
+        busy_runtime = self.gateway.get_or_create_session("one")
+        busy_runtime.connection_count = 1
         second = FakeWebSocket([hello(session="two")])
         await self.gateway.handle_connection(second)
-        self.assertEqual(first.sent[0]["status"], "authenticated")
         self.assertEqual(second.sent[0]["status"], "unauthorized")
+        self.assertIn("one", self.gateway.sessions)
+
+    async def test_idle_sessions_are_evicted_to_make_room(self) -> None:
+        self.settings.gateway_max_sessions = 2
+        for session_name in ("a", "b", "c", "d"):
+            socket = FakeWebSocket([hello(session=session_name)])
+            await self.gateway.handle_connection(socket)
+            self.assertEqual(socket.sent[0]["status"], "authenticated", session_name)
+        self.assertLessEqual(len(self.gateway.sessions), 2)
+        self.assertIn("d", self.gateway.sessions)
+
+    async def test_oldest_idle_session_is_evicted_first(self) -> None:
+        self.settings.gateway_max_sessions = 2
+        older = self.gateway.get_or_create_session("older")
+        newer = self.gateway.get_or_create_session("newer")
+        older.last_active = 1.0
+        newer.last_active = 2.0
+        self.gateway.get_or_create_session("third")
+        self.assertNotIn("older", self.gateway.sessions)
+        self.assertIn("newer", self.gateway.sessions)
+
+    def test_capture_epoch_is_accepted_only_when_plausible(self) -> None:
+        from lecturelens.core.clock import SessionClock
+        from lecturelens.gateway.server import resolve_capture_epoch
+        clock = SessionClock()
+        now = clock.get_timestamp()
+        self.assertAlmostEqual(resolve_capture_epoch({"timestamp_epoch": now - 2.0}, clock), now - 2.0, places=3)
+        self.assertIsNone(resolve_capture_epoch({"timestamp_epoch": now + 3600.0}, clock))
+        self.assertIsNone(resolve_capture_epoch({"timestamp_epoch": now - 86400.0}, clock))
+        self.assertIsNone(resolve_capture_epoch({"timestamp_epoch": "soon"}, clock))
+        self.assertIsNone(resolve_capture_epoch({"timestamp_epoch": True}, clock))
+        self.assertIsNone(resolve_capture_epoch({}, clock))
+
+    async def test_capture_epoch_does_not_reset_the_shared_session_clock(self) -> None:
+        runtime = self.gateway.get_or_create_session("clockroom")
+        before_reference = runtime.clock.reference_wall_time
+        captured: list[object] = []
+
+        async def fake_screen(data: bytes, capture_epoch: Any = None) -> None:
+            captured.append(capture_epoch)
+
+        runtime.screen_agent.ingest_png_bytes = fake_screen
+        stamp = runtime.clock.get_timestamp() - 1.5
+        message = {"type": "screen", "png_b64": base64.b64encode(b"png").decode(), "timestamp_epoch": stamp}
+        await self.gateway.handle_message(runtime, message)
+        self.assertEqual(runtime.clock.reference_wall_time, before_reference)
+        self.assertEqual(captured, [stamp])
 
     async def test_silent_connection_times_out(self) -> None:
         socket = FakeWebSocket([])
@@ -195,13 +241,13 @@ class TestGatewayMessages(GatewayTestBase):
         calls: list[tuple[str, bytes]] = []
         runtime = self.gateway.get_or_create_session("room1")
 
-        async def fake_audio(data: bytes) -> None:
+        async def fake_audio(data: bytes, capture_epoch: Any = None) -> None:
             calls.append(("audio", data))
 
-        async def fake_screen(data: bytes) -> None:
+        async def fake_screen(data: bytes, capture_epoch: Any = None) -> None:
             calls.append(("screen", data))
 
-        async def fake_camera(data: bytes) -> None:
+        async def fake_camera(data: bytes, capture_epoch: Any = None) -> None:
             calls.append(("camera", data))
 
         runtime.audio_agent.ingest_wav_bytes = fake_audio

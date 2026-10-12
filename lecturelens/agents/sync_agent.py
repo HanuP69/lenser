@@ -1,7 +1,9 @@
 import asyncio
+import hashlib
 import json
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -29,6 +31,12 @@ from lecturelens.schemas.events import (
 logger = get_logger("lecturelens.sync_agent")
 
 ANCHOR_SOURCE_TYPES: tuple[str, ...] = ("slide", "board")
+FINGERPRINT_HISTORY_LIMIT: int = 5000
+
+
+def entry_fingerprint(entry: TimelineEntry) -> str:
+    raw = f"{entry.source_type}|{entry.timestamp_epoch:.6f}|{entry.content}"
+    return hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()
 
 
 @dataclass
@@ -66,9 +74,40 @@ class SyncAgent:
         self.timeline_path: Path = session_dir / "timeline.jsonl"
         self.control: AgentControl = AgentControl(session_dir, "sync_agent", SYNC_STOP_FLAG_NAME)
         self.pending_buffer: list[BufferedEntry] = []
+        self.pending_message_ids: set[tuple[str, str]] = set()
+        self.written_fingerprints: set[str] = set()
+        self.fingerprint_order: deque = deque()
+        self.duplicates_skipped: int = 0
         self.recent_anchors: list[AnchorRecord] = []
         self.buffer_lock: asyncio.Lock = asyncio.Lock()
         self.entries_written: int = 0
+        self.load_written_fingerprints()
+
+    def load_written_fingerprints(self) -> None:
+        if not self.timeline_path.exists():
+            return
+        try:
+            with open(self.timeline_path, "r", encoding="utf-8") as file_handle:
+                tail_lines = deque(file_handle, maxlen=FINGERPRINT_HISTORY_LIMIT)
+        except OSError:
+            return
+        for raw_line in tail_lines:
+            raw_line = raw_line.strip()
+            if len(raw_line) == 0:
+                continue
+            try:
+                restored = TimelineEntry(**json.loads(raw_line))
+            except (ValueError, TypeError):
+                continue
+            self.remember_fingerprint(entry_fingerprint(restored))
+
+    def remember_fingerprint(self, fingerprint: str) -> None:
+        if fingerprint in self.written_fingerprints:
+            return
+        self.written_fingerprints.add(fingerprint)
+        self.fingerprint_order.append(fingerprint)
+        while len(self.fingerprint_order) > FINGERPRINT_HISTORY_LIMIT:
+            self.written_fingerprints.discard(self.fingerprint_order.popleft())
 
     def build_stream_name(self, source_type: str) -> str:
         return f"lecturelens:{self.session_id}:stream:{source_type}"
@@ -142,9 +181,32 @@ class SyncAgent:
         message_id: Optional[str] = None
     ) -> None:
         async with self.buffer_lock:
+            pending_key = (stream_name or "", message_id) if message_id is not None else None
+            if pending_key is not None and pending_key in self.pending_message_ids:
+                self.duplicates_skipped += 1
+                return
+            if entry_fingerprint(entry) in self.written_fingerprints:
+                self.duplicates_skipped += 1
+                await self.acknowledge(stream_name, group_name, message_id)
+                return
+            if pending_key is not None:
+                self.pending_message_ids.add(pending_key)
             self.pending_buffer.append(
                 BufferedEntry(entry, time.monotonic(), stream_name, group_name, message_id)
             )
+
+    async def acknowledge(
+        self,
+        stream_name: Optional[str],
+        group_name: Optional[str],
+        message_id: Optional[str]
+    ) -> None:
+        if not (stream_name and group_name and message_id):
+            return
+        try:
+            await self.redis_bus.client.xack(stream_name, group_name, message_id)
+        except Exception as ack_error:
+            logger.warning("failed to ack message %s: %s", message_id, ack_error)
 
     async def consume_stream(self, source_type: str) -> None:
         stream_name = self.build_stream_name(source_type)
@@ -166,8 +228,13 @@ class SyncAgent:
             batch_size=self.settings.redis_consumer_batch_size,
             block_ms=self.settings.redis_consumer_block_ms,
             should_stop=lambda: self.drain_requested,
-            auto_ack=False
+            auto_ack=False,
+            reclaim_idle_ms=self.reclaim_idle_milliseconds()
         )
+
+    def reclaim_idle_milliseconds(self) -> int:
+        hold_seconds = self.settings.sync_merge_window_seconds + 60.0
+        return int(max(hold_seconds, 1.0) * 1000)
 
     def find_nearest_anchor(self, timestamp_epoch: float, window_seconds: float) -> Optional[AnchorRecord]:
         best_record: Optional[AnchorRecord] = None
@@ -178,6 +245,37 @@ class SyncAgent:
                 best_distance = distance
                 best_record = record
         return best_record
+
+    def find_active_anchor(self, timestamp_epoch: float, max_age_seconds: float) -> Optional[AnchorRecord]:
+        best_record: Optional[AnchorRecord] = None
+        for record in self.recent_anchors:
+            age = timestamp_epoch - record.timestamp_epoch
+            if age < 0.0 or age > max_age_seconds:
+                continue
+            if best_record is None or record.timestamp_epoch > best_record.timestamp_epoch:
+                best_record = record
+        return best_record
+
+    def find_upcoming_anchor(self, timestamp_epoch: float, lead_seconds: float) -> Optional[AnchorRecord]:
+        best_record: Optional[AnchorRecord] = None
+        for record in self.recent_anchors:
+            lead = record.timestamp_epoch - timestamp_epoch
+            if lead <= 0.0 or lead > lead_seconds:
+                continue
+            if best_record is None or record.timestamp_epoch < best_record.timestamp_epoch:
+                best_record = record
+        return best_record
+
+    def select_anchor_for_speech(self, timestamp_epoch: float) -> Optional[AnchorRecord]:
+        window_seconds = self.settings.correlation_window_seconds
+        upcoming = self.find_upcoming_anchor(timestamp_epoch, self.settings.correlation_lead_seconds)
+        if upcoming is not None:
+            return upcoming
+        if self.settings.correlation_active_seconds > 0.0:
+            active = self.find_active_anchor(timestamp_epoch, self.settings.correlation_active_seconds)
+            if active is not None:
+                return active
+        return self.find_nearest_anchor(timestamp_epoch, window_seconds)
 
     def find_cross_type_anchor(
         self,
@@ -197,7 +295,7 @@ class SyncAgent:
         return best_record
 
     def prune_anchor_history(self, newest_timestamp: float, window_seconds: float) -> None:
-        horizon = max(60.0, window_seconds * 6.0)
+        horizon = max(60.0, window_seconds * 6.0, self.settings.correlation_active_seconds)
         kept: list[AnchorRecord] = []
         for record in self.recent_anchors:
             if newest_timestamp - record.timestamp_epoch <= horizon:
@@ -240,7 +338,7 @@ class SyncAgent:
                 continue
             if entry.correlation_id is not None:
                 continue
-            anchor = self.find_nearest_anchor(entry.timestamp_epoch, window_seconds)
+            anchor = self.select_anchor_for_speech(entry.timestamp_epoch)
             if anchor is not None:
                 entry.correlation_id = anchor.correlation_id
 
@@ -288,13 +386,10 @@ class SyncAgent:
                 logger.error("timeline write failed, entries kept in buffer: %s", error)
                 return 0
             for buffered in ready:
-                if buffered.stream_name and buffered.group_name and buffered.message_id:
-                    try:
-                        await self.redis_bus.client.xack(
-                            buffered.stream_name, buffered.group_name, buffered.message_id
-                        )
-                    except Exception as ack_err:
-                        logger.warning("failed to ack message %s: %s", buffered.message_id, ack_err)
+                self.remember_fingerprint(entry_fingerprint(buffered.entry))
+                if buffered.message_id is not None:
+                    self.pending_message_ids.discard((buffered.stream_name or "", buffered.message_id))
+                await self.acknowledge(buffered.stream_name, buffered.group_name, buffered.message_id)
             self.remove_flushed_entries(ready)
             self.entries_written += len(ordered_entries)
             self.control.set_stat("timeline_entries_written", self.entries_written)
