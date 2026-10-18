@@ -2,7 +2,6 @@ import asyncio
 import inspect
 import json
 import time
-from collections import deque
 from typing import Any, Awaitable, Callable, Optional
 
 import redis.asyncio as redis
@@ -47,7 +46,6 @@ class RedisBus:
     def __init__(
         self,
         redis_url: str,
-        outbox_capacity: int = 2000,
         stream_max_length: int = 200000,
         max_delivery_attempts: int = 5,
         reclaim_idle_ms: int = 30000,
@@ -55,8 +53,6 @@ class RedisBus:
     ) -> None:
         self.redis_url: str = redis_url
         self.client: redis.Redis = redis.from_url(redis_url, decode_responses=True)
-        self.outbox: deque = deque()
-        self.outbox_capacity: int = outbox_capacity
         self.stream_max_length: int = stream_max_length
         self.max_delivery_attempts: int = max_delivery_attempts
         self.reclaim_idle_ms: int = reclaim_idle_ms
@@ -73,37 +69,12 @@ class RedisBus:
         )
         return entry_id
 
-    async def flush_outbox(self) -> int:
-        flushed_count = 0
-        while len(self.outbox) > 0:
-            stream_name, event = self.outbox[0]
-            try:
-                await self.publish(stream_name, event)
-            except (redis.RedisError, OSError) as error:
-                logger.warning("outbox flush paused: %s", error)
-                return flushed_count
-            self.outbox.popleft()
-            flushed_count += 1
-        return flushed_count
-
     async def publish_resilient(self, stream_name: str, event: BaseModel) -> Optional[str]:
-        if len(self.outbox) > 0:
-            await self.flush_outbox()
-        if len(self.outbox) > 0:
-            self.append_to_outbox(stream_name, event)
-            return None
         try:
             return await self.publish(stream_name, event)
         except (redis.RedisError, OSError) as error:
-            logger.warning("publish failed, buffering event for %s: %s", stream_name, error)
-            self.append_to_outbox(stream_name, event)
+            logger.warning("publish failed for %s: %s", stream_name, error)
             return None
-
-    def append_to_outbox(self, stream_name: str, event: BaseModel) -> None:
-        if len(self.outbox) >= self.outbox_capacity:
-            self.outbox.popleft()
-            logger.error("outbox full, oldest buffered event dropped")
-        self.outbox.append((stream_name, event))
 
     async def ensure_consumer_group(self, stream_name: str, group_name: str) -> None:
         try:
@@ -167,24 +138,6 @@ class RedisBus:
             claimed.append((message_id, message_data))
         return claimed
 
-    async def move_to_dead_letter(
-        self,
-        stream_name: str,
-        group_name: str,
-        message_id: str,
-        message_data: dict[str, str],
-        error: Exception
-    ) -> None:
-        dead_stream_name = f"{stream_name}:dead"
-        dead_fields = {
-            "original_id": str(message_id),
-            "error": str(error)[:500],
-            "fields": json.dumps(message_data)
-        }
-        await self.client.xadd(dead_stream_name, dead_fields, maxlen=10000, approximate=True)
-        await self.client.xack(stream_name, group_name, message_id)
-        logger.error("message %s on %s moved to dead letter stream", message_id, stream_name)
-
     async def dispatch_messages(
         self,
         stream_name: str,
@@ -214,15 +167,23 @@ class RedisBus:
                     error
                 )
                 if failure_total >= self.max_delivery_attempts:
-                    await self.move_to_dead_letter(
-                        stream_name, group_name, message_id, message_data, error
+                    logger.error(
+                        "message %s on %s reached max attempts (%d), discarding: %s",
+                        message_id,
+                        stream_name,
+                        self.max_delivery_attempts,
+                        error
                     )
+                    await self.client.xack(stream_name, group_name, message_id)
                     del self.failure_counts[failure_key]
                 continue
             if auto_ack:
                 await self.client.xack(stream_name, group_name, message_id)
             if failure_key in self.failure_counts:
                 del self.failure_counts[failure_key]
+
+    async def acknowledge(self, stream_name: str, group_name: str, message_id: str) -> None:
+        await self.client.xack(stream_name, group_name, message_id)
 
     async def consume(
         self,
@@ -239,7 +200,6 @@ class RedisBus:
         backoff_seconds = 0.5
         backlog_drained = False
         backlog_cursor = "0"
-
         last_reclaim_time = 0.0
         group_ready = False
         while True:

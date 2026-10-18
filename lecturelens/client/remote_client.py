@@ -11,7 +11,6 @@ from lecturelens.agents.audio_agent import (
     build_block_source,
     convert_numpy_to_wav_bytes
 )
-from lecturelens.agents.camera_agent import CameraSource, compute_blur_score, compute_motion_score
 from lecturelens.agents.screen_agent import capture_screen_frame, encode_frame_as_png
 from lecturelens.config.settings import Settings
 from lecturelens.core.concurrency import run_in_thread_pool
@@ -88,34 +87,6 @@ async def stream_screen(websocket: Any, settings: Settings, stop_event: asyncio.
         await asyncio.sleep(settings.screenshot_interval_seconds)
 
 
-async def stream_camera(websocket: Any, settings: Settings, stop_event: asyncio.Event) -> None:
-    camera = CameraSource(settings.camera_device_index, settings.camera_warmup_frames)
-    previous_frame: Optional[bytes] = None
-    still_count = 0
-    while not stop_event.is_set():
-        try:
-            frame_bytes = await run_in_thread_pool(camera.read_jpeg)
-            frame_captured_at = time.time()
-            if previous_frame is not None:
-                motion = await run_in_thread_pool(compute_motion_score, previous_frame, frame_bytes)
-                if motion > settings.motion_threshold:
-                    still_count = 0
-                else:
-                    still_count += 1
-                if still_count >= settings.motion_stillness_required_frames:
-                    blur = await run_in_thread_pool(compute_blur_score, frame_bytes)
-                    if blur >= settings.blur_variance_threshold:
-                        await send_and_wait(
-                            websocket, encode_message("camera", "jpeg_b64", frame_bytes, frame_captured_at)
-                        )
-                        still_count = 0
-            previous_frame = frame_bytes
-        except Exception as error:
-            logger.error("camera streaming error: %s", error)
-        await asyncio.sleep(settings.camera_poll_interval_seconds)
-    await run_in_thread_pool(camera.close)
-
-
 async def run_remote_client(
     settings: Settings,
     server_url: str,
@@ -123,9 +94,11 @@ async def run_remote_client(
     session_id: str,
     use_audio: bool,
     use_screen: bool,
-    use_camera: bool,
-    stop_event: asyncio.Event
+    use_camera: bool = False,
+    stop_event: Optional[asyncio.Event] = None
 ) -> None:
+    if stop_event is None:
+        stop_event = asyncio.Event()
     from websockets import connect
     async with connect(server_url, max_size=settings.gateway_max_message_bytes) as audio_socket:
         await audio_socket.send(json.dumps({"type": "hello", "api_key": api_key, "session_id": session_id}))
@@ -138,9 +111,7 @@ async def run_remote_client(
         if use_audio:
             tasks.append(asyncio.create_task(stream_audio(audio_socket, settings, stop_event)))
 
-        for enabled, streamer in ((use_screen, stream_screen), (use_camera, stream_camera)):
-            if not enabled:
-                continue
+        if use_screen:
             extra_context = connect(server_url, max_size=settings.gateway_max_message_bytes)
             extra_socket = await extra_context.__aenter__()
             extra_sockets.append(extra_context)
@@ -148,7 +119,7 @@ async def run_remote_client(
             reply = json.loads(await extra_socket.recv())
             if reply.get("status") != "authenticated":
                 raise PermissionError(str(reply))
-            tasks.append(asyncio.create_task(streamer(extra_socket, settings, stop_event)))
+            tasks.append(asyncio.create_task(stream_screen(extra_socket, settings, stop_event)))
 
         try:
             if len(tasks) == 0:

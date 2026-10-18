@@ -385,6 +385,12 @@ class SyncAgent:
             except OSError as error:
                 logger.error("timeline write failed, entries kept in buffer: %s", error)
                 return 0
+            timeline_stream = f"lecturelens:{self.session_id}:stream:timeline"
+            for entry in ordered_entries:
+                try:
+                    await self.redis_bus.publish_resilient(timeline_stream, entry)
+                except Exception as pub_error:
+                    logger.warning("failed to publish timeline entry to stream: %s", pub_error)
             for buffered in ready:
                 self.remember_fingerprint(entry_fingerprint(buffered.entry))
                 if buffered.message_id is not None:
@@ -414,7 +420,7 @@ class SyncAgent:
     async def run(self) -> None:
         self.is_running = True
         consumer_tasks: list[asyncio.Task] = []
-        for source_type in ("transcript", "slide", "board"):
+        for source_type in ("transcript", "slide"):
             consumer_tasks.append(asyncio.create_task(self.consume_stream(source_type)))
         flush_task = asyncio.create_task(self.flush_loop())
         stop_watch_task = asyncio.create_task(self.watch_stop_flag())

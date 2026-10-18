@@ -26,7 +26,6 @@ from lecturelens.cli.helpers import (
     validate_export_format,
     validate_start_options
 )
-from lecturelens.cli.interactive import run_interactive_wizard
 from lecturelens.config.settings import Settings
 from lecturelens.core import session_meta
 from lecturelens.core.agent_runtime import (
@@ -43,14 +42,14 @@ from lecturelens.core.agent_runtime import (
     set_flag
 )
 from lecturelens.core.clock import SessionClock
-from lecturelens.core.recovery import AgentMonitor
+from lecturelens.core.process_manager import AgentProcessManager as AgentMonitor
 from lecturelens.core.redis_bus import RedisBus
 from lecturelens.core.validation import is_valid_course_name, is_valid_session_id
 
 app = typer.Typer(help="LectureLens - local-first multimodal lecture note taking")
 console = Console()
 
-CAPTURE_AGENT_NAMES: tuple[str, ...] = ("audio_agent", "screen_agent", "camera_agent")
+CAPTURE_AGENT_NAMES: tuple[str, ...] = ("audio_agent", "screen_agent")
 
 
 def fail(message: str) -> None:
@@ -136,15 +135,13 @@ def build_agent_environment(
 def plan_agents(
     mode: str,
     audio_only: bool,
-    no_camera: bool,
-    no_screen: bool
+    no_camera: bool = False,
+    no_screen: bool = False
 ) -> list[str]:
     planned = ["sync_agent", "structuring_agent", "audio_agent"]
     if not audio_only:
         if not no_screen:
             planned.append("screen_agent")
-        if not no_camera:
-            planned.append("camera_agent")
     if mode == "server":
         planned.append("gateway")
     return planned
@@ -325,39 +322,6 @@ def start(
     primary_provider: Optional[str] = None
     model_name: Optional[str] = None
 
-    should_interactive = False
-    if interactive is True:
-        should_interactive = True
-    elif interactive is None:
-        if sys.stdin.isatty() and os.environ.get("LECTURELENS_NON_INTERACTIVE") != "1":
-            should_interactive = True
-
-    if should_interactive:
-        session_id_initial = session or datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        wizard_config = {
-            "session_id": session_id_initial,
-            "audio_source": audio_source,
-            "no_camera": no_camera,
-            "no_screen": no_screen,
-            "audio_only": audio_only,
-            "course": course,
-            "monitor_index": monitor_index,
-            "llm_mode": llm_mode,
-            "provider": "gemma",
-            "model": "gemma4:e4b"
-        }
-        resolved = run_interactive_wizard(wizard_config, settings, console)
-        if resolved is None:
-            raise typer.Exit(code=0)
-        session = resolved["session_id"]
-        audio_source = resolved["audio_source"]
-        no_camera = resolved["no_camera"]
-        no_screen = resolved["no_screen"]
-        course = resolved["course"]
-        llm_mode = resolved["llm_mode"]
-        primary_provider = resolved.get("primary_provider")
-        model_name = resolved.get("model")
-
     try:
         validate_start_options(audio_source, llm_mode, mode)
     except ValueError as error:
@@ -381,25 +345,9 @@ def start(
             "Capture continues; structuring will retry when it returns.[/yellow]"
         )
 
-    if primary_provider == "unorouter" or (llm_mode in ("hybrid", "cloud") and primary_provider != "gemma"):
-        from lecturelens.cli.interactive import check_unorouter_health, load_env_api_key
-        unorouter_key = os.environ.get("UNOROUTER_API_KEY") or os.environ.get("LECTURELENS_UNOROUTER_API_KEY")
-        if not unorouter_key:
-            unorouter_key = load_env_api_key()
-            if unorouter_key:
-                os.environ["UNOROUTER_API_KEY"] = unorouter_key
-                os.environ["LECTURELENS_UNOROUTER_API_KEY"] = unorouter_key
-        if unorouter_key:
-            healthy, health_msg = check_unorouter_health(unorouter_key)
-            if healthy:
-                console.print(f"[green]UnoRouter API health check: {health_msg}[/green]")
-            else:
-                if primary_provider == "unorouter" or llm_mode == "cloud":
-                    fail(f"UnoRouter health check failed: {health_msg}. Please check your API key.")
-                else:
-                    console.print(f"[yellow]UnoRouter health check warning: {health_msg}. Local Ollama will be used as fallback.[/yellow]")
-        elif primary_provider == "unorouter":
-            fail("UnoRouter is selected as primary provider, but UNOROUTER_API_KEY is not set.")
+    unorouter_key = os.environ.get("UNOROUTER_API_KEY") or os.environ.get("LECTURELENS_UNOROUTER_API_KEY")
+    if primary_provider == "unorouter" and not unorouter_key:
+        fail("UnoRouter is selected as primary provider, but UNOROUTER_API_KEY is not set.")
 
     settings.create_session_directories(session_id)
     disk_warning = format_low_disk_warning(get_free_disk_bytes(settings.output_dir))
@@ -555,27 +503,10 @@ def export(
             console.print("[yellow]No notes.md yet.[/yellow]")
 
     if export_format in ("anki", "all"):
-        apkg_path = session_dir / "flashcards.apkg"
-        if apkg_path.exists():
-            destination = target_dir / f"{session_id}_flashcards.apkg"
-            destination.write_bytes(apkg_path.read_bytes())
-            console.print(f"Anki: {destination}")
-        else:
-            console.print("[yellow]No flashcards.apkg yet.[/yellow]")
+        console.print("[yellow]Anki export is handled via the student client.[/yellow]")
 
     if export_format in ("pdf", "all"):
-        if not notes_path.exists():
-            console.print("[yellow]No notes.md to convert to PDF.[/yellow]")
-        else:
-            try:
-                from lecturelens.exports.pdf_exporter import create_pdf_from_markdown
-            except ImportError:
-                fail("PDF export needs reportlab: pip install 'lecturelens[pdf]'")
-            destination = target_dir / f"{session_id}_notes.pdf"
-            create_pdf_from_markdown(
-                notes_path.read_text(encoding="utf-8"), destination, f"Lecture notes: {session_id}"
-            )
-            console.print(f"PDF: {destination}")
+        console.print("[yellow]PDF export is handled via the student client.[/yellow]")
 
 
 @app.command()
@@ -596,18 +527,13 @@ def reprocess(
     if meta.get("course_name"):
         settings.course_name = meta["course_name"]
 
-    course_db_path = settings.get_course_database_path(settings.course_name)
     backup_files: dict[str, tuple[Path, Path]] = {}
-    for filename in ("notes.md", "context.json", "flashcards.jsonl", f"{session}.apkg", "flashcards.apkg", "concepts.db", "notes_marker.json"):
+    for filename in ("notes.md", "context.json", "timeline.jsonl", "notes_marker.json"):
         p = session_dir / filename
         if p.exists():
             backup_p = session_dir / f"{filename}.bak"
             shutil.copy2(p, backup_p)
             backup_files[filename] = (p, backup_p)
-    if course_db_path.exists():
-        course_backup_p = course_db_path.with_suffix(".db.bak")
-        shutil.copy2(course_db_path, course_backup_p)
-        backup_files["course_db"] = (course_db_path, course_backup_p)
 
     async def run() -> int:
         from lecturelens.agents.structuring_agent import StructuringAgent
@@ -691,33 +617,8 @@ def review(
     course: Optional[str] = typer.Option(None, "--course"),
     session: Optional[str] = typer.Option(None, "--session"),
 ) -> None:
-    from lecturelens.knowledge.concept_graph import ConceptGraph
-
     settings = Settings()
-    if session is not None:
-        session_dir = ensure_session_exists(settings, session)
-        database_path = session_dir / "concepts.db"
-    else:
-        database_path = settings.get_course_database_path(course)
-    if not database_path.exists():
-        fail(f"No concept database found at {database_path}")
-
-    overview = ConceptGraph(database_path).get_course_overview()
-    if len(overview) == 0:
-        console.print("No concepts recorded yet.")
-        return
-    for session_key, concepts in overview.items():
-        table = Table(title=f"Session: {session_key}")
-        table.add_column("Concept")
-        table.add_column("Definition")
-        table.add_column("Related")
-        for concept in concepts:
-            table.add_row(
-                concept["concept_name"],
-                str(concept["definition"] or ""),
-                ", ".join(concept["related_concepts"])
-            )
-        console.print(table)
+    console.print("Concept review is available through Postgres storage and the student client graph.")
 
 
 @app.command()
@@ -755,6 +656,36 @@ def client(
         asyncio.run(run())
     except KeyboardInterrupt:
         console.print("Client stopped.")
+
+
+@app.command()
+def replay(
+    session: str = typer.Option(..., "--session"),
+    speed: float = typer.Option(1.0, "--speed", help="Playback speed multiplier (0 for instant)"),
+    target_session: Optional[str] = typer.Option(None, "--target-session", help="Session ID to emit events into"),
+) -> None:
+    from lecturelens.core.replay import ReplayEngine
+
+    settings = Settings()
+    session_id = resolve_session(settings, session)
+    session_dir = ensure_session_exists(settings, session_id)
+    timeline_path = session_dir / "timeline.jsonl"
+    if not timeline_path.exists():
+        fail(f"No timeline.jsonl found in {session_dir}")
+
+    async def run() -> int:
+        bus = RedisBus(settings.redis_url)
+        try:
+            engine = ReplayEngine(timeline_path, redis_bus=bus, speed=speed)
+            return await engine.replay(target_session_id=target_session or session_id)
+        finally:
+            await bus.close()
+
+    try:
+        count = asyncio.run(run())
+        console.print(f"[green]Replayed {count} event(s) at {speed}x speed.[/green]")
+    except Exception as error:
+        fail(f"Replay failed: {error}")
 
 
 if __name__ == "__main__":

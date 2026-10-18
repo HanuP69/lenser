@@ -231,12 +231,11 @@ class TestGatewayMessages(GatewayTestBase):
         await self.gateway.handle_connection(socket)
         self.assertEqual(socket.sent[1]["status"], "error")
 
-    async def test_audio_screen_camera_frames_are_processed_by_session_agents(self) -> None:
+    async def test_audio_screen_frames_are_processed_by_session_agents(self) -> None:
         socket = FakeWebSocket([
             hello(),
             json.dumps({"type": "audio", "wav_b64": base64.b64encode(b"wav").decode()}),
-            json.dumps({"type": "screen", "png_b64": base64.b64encode(b"png").decode()}),
-            json.dumps({"type": "camera", "jpeg_b64": base64.b64encode(b"jpg").decode()})
+            json.dumps({"type": "screen", "png_b64": base64.b64encode(b"png").decode()})
         ])
         calls: list[tuple[str, bytes]] = []
         runtime = self.gateway.get_or_create_session("room1")
@@ -247,15 +246,11 @@ class TestGatewayMessages(GatewayTestBase):
         async def fake_screen(data: bytes, capture_epoch: Any = None) -> None:
             calls.append(("screen", data))
 
-        async def fake_camera(data: bytes, capture_epoch: Any = None) -> None:
-            calls.append(("camera", data))
-
         runtime.audio_agent.ingest_wav_bytes = fake_audio
         runtime.screen_agent.ingest_png_bytes = fake_screen
-        runtime.camera_agent.ingest_jpeg_bytes = fake_camera
         await self.gateway.handle_connection(socket)
-        self.assertEqual(calls, [("audio", b"wav"), ("screen", b"png"), ("camera", b"jpg")])
-        self.assertEqual(pluck(socket.sent[1:], "status"), ["acknowledged"] * 3)
+        self.assertEqual(calls, [("audio", b"wav"), ("screen", b"png")])
+        self.assertEqual(pluck(socket.sent[1:], "status"), ["acknowledged"] * 2)
 
     async def test_processing_exception_returns_generic_error(self) -> None:
         runtime = self.gateway.get_or_create_session("room1")
@@ -282,6 +277,41 @@ class TestGatewayMessages(GatewayTestBase):
         socket = FakeWebSocket([hello()])
         await self.gateway.handle_connection(socket)
         self.assertEqual(self.gateway.sessions["room1"].connection_count, 0)
+
+    async def test_subscriber_receives_missed_notes_from_storage_replay(self) -> None:
+        class FakeNotesStorage:
+            async def get_general_notes_since(self, session_id: str, after_seq: int) -> list[dict]:
+                return [
+                    {"sequence_number": 2, "heading": "Part 2", "content": "Text 2"},
+                    {"sequence_number": 3, "heading": "Part 3", "content": "Text 3"}
+                ]
+
+        self.gateway.storage = FakeNotesStorage()
+        sub_hello = json.dumps({
+            "type": "hello",
+            "api_key": "secret",
+            "session_id": "room1",
+            "role": "subscriber",
+            "last_sequence_number": 1
+        })
+        socket = FakeWebSocket([sub_hello])
+        await self.gateway.handle_connection(socket)
+        sent_types = [msg.get("type") for msg in socket.sent]
+        self.assertIn("note_segment", sent_types)
+        note_payloads = [msg["payload"] for msg in socket.sent if msg.get("type") == "note_segment"]
+        self.assertEqual(len(note_payloads), 2)
+        self.assertEqual(note_payloads[0]["sequence_number"], 2)
+        self.assertEqual(note_payloads[1]["sequence_number"], 3)
+
+    async def test_broadcast_note_segment_fans_out_to_subscribers(self) -> None:
+        socket_a = FakeWebSocket([])
+        socket_b = FakeWebSocket([])
+        self.gateway.subscribers["room1"] = {socket_a, socket_b}
+        await self.gateway.broadcast_note_segment("room1", {"sequence_number": 5, "content": "Live Note"})
+        self.assertEqual(len(socket_a.sent), 1)
+        self.assertEqual(len(socket_b.sent), 1)
+        self.assertEqual(socket_a.sent[0]["payload"]["sequence_number"], 5)
+        self.assertEqual(socket_b.sent[0]["payload"]["sequence_number"], 5)
 
 
 class TestRateLimiter(unittest.TestCase):

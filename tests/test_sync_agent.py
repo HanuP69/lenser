@@ -182,7 +182,7 @@ class TestSyncEndToEnd(SyncTestBase):
             self.skipTest("Redis not available")
         session = "sync_e2e_session"
         agent = SyncAgent(self.settings, self.bus, SessionClock(), session)
-        for suffix in ("transcript", "slide", "board"):
+        for suffix in ("transcript", "slide"):
             await self.bus.client.delete(f"lecturelens:{session}:stream:{suffix}")
         base = time.time()
         await self.bus.publish(
@@ -199,13 +199,6 @@ class TestSyncEndToEnd(SyncTestBase):
                 image_file_path="s.png", extracted_text="Trees", revisited_slide_number=0
             )
         )
-        await self.bus.publish(
-            f"lecturelens:{session}:stream:board",
-            BoardCaptured(
-                session_id=session, timestamp_epoch=base + 2.0, image_file_path="b.jpg",
-                raw_ocr_text="T(n)", confidence=0.7, provider_used="gemma"
-            )
-        )
 
         async def stopper() -> None:
             await asyncio.sleep(1.0)
@@ -217,15 +210,15 @@ class TestSyncEndToEnd(SyncTestBase):
         for raw_line in agent.timeline_path.read_text(encoding="utf-8").splitlines():
             if raw_line.strip():
                 lines.append(json.loads(raw_line))
-        self.assertEqual(len(lines), 3)
+        self.assertEqual(len(lines), 2)
         kinds = pluck(lines, "source_type")
-        self.assertEqual(kinds, ["transcript", "slide", "board"])
+        self.assertEqual(kinds, ["transcript", "slide"])
         correlation_ids = set(pluck(lines, "correlation_id"))
         self.assertEqual(len(correlation_ids), 1)
         self.assertIsNotNone(next(iter(correlation_ids)))
         self.assertEqual(lines[0]["importance_flags"], ["definition"])
         self.assertEqual(lines[1]["metadata"]["slide_number"], 1)
-        for suffix in ("transcript", "slide", "board"):
+        for suffix in ("transcript", "slide"):
             await self.bus.client.delete(f"lecturelens:{session}:stream:{suffix}")
 
     async def test_restart_does_not_duplicate_entries(self) -> None:

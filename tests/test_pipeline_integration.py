@@ -12,7 +12,6 @@ from lecturelens.core.agent_runtime import FINALIZE_FLAG_NAME, SYNC_STOP_FLAG_NA
 from lecturelens.core.clock import SessionClock
 from lecturelens.core.redis_bus import RedisBus
 from lecturelens.schemas.events import SlideCaptured, TranscriptChunk
-from tests.support import pluck
 
 
 class RecordingRouter:
@@ -21,15 +20,17 @@ class RecordingRouter:
 
     async def ainvoke(self, messages: list) -> str:
         text = str(messages[0].content)
-        if "NEW LECTURE TIMELINE SLICE" in text:
+        if "CURRENT LECTURE EVENTS" in text or "NEW LECTURE TIMELINE SLICE" in text:
             self.summary_prompts.append(text)
             return "Notes about trees."
         if "key technical terms" in text:
             return json.dumps([{"term": "Tree", "definition": "A connected acyclic graph."}])
         if "action items" in text:
             return "[]"
-        if "study flashcards" in text:
-            return json.dumps([{"question": "What is a tree?", "answer": "Connected acyclic graph."}])
+        if "key points" in text:
+            return json.dumps(["A connected acyclic graph."])
+        if "concept tags" in text:
+            return json.dumps(["tree", "graph"])
         return "Trees were discussed."
 
 
@@ -41,7 +42,7 @@ class TestPipeline(unittest.IsolatedAsyncioTestCase):
         except Exception:
             self.skipTest("Redis not available")
         session = "pipeline_session"
-        for suffix in ("transcript", "slide", "board"):
+        for suffix in ("transcript", "slide", "board", "notes"):
             await bus.client.delete(f"lecturelens:{session}:stream:{suffix}")
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -51,7 +52,7 @@ class TestPipeline(unittest.IsolatedAsyncioTestCase):
             clock = SessionClock()
             router = RecordingRouter()
             sync = SyncAgent(settings, bus, clock, session)
-            structuring = StructuringAgent(settings, session, router)
+            structuring = StructuringAgent(settings, session, router, redis_bus=bus)
             session_dir = settings.get_session_output_dir(session)
 
             base = time.time()
@@ -86,11 +87,8 @@ class TestPipeline(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(router.summary_prompts), 1)
             prompt = router.summary_prompts[0]
             self.assertIn("[TRANSCRIPT][definition] A tree is defined as a connected acyclic graph. | [SLIDE] Trees: connected, acyclic", prompt)
-            self.assertTrue((session_dir / "flashcards.apkg").exists())
-            concepts = structuring.concept_graph.get_all_concepts_for_session(session)
-            self.assertEqual(pluck(concepts, "concept_name"), ["tree"])
 
-        for suffix in ("transcript", "slide", "board"):
+        for suffix in ("transcript", "slide", "board", "notes"):
             await bus.client.delete(f"lecturelens:{session}:stream:{suffix}")
         await bus.close()
 

@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     }
 
     redis_url: str = Field(default="redis://localhost:6379")
+    postgres_url: str = Field(default="postgresql://postgres:postgres@localhost:5432/lecturelens")
     ollama_url: str = Field(default="http://localhost:11434")
     local_model: str = Field(default=DEFAULT_LOCAL_MODEL)
     embedding_model: str = Field(default=DEFAULT_EMBEDDING_MODEL)

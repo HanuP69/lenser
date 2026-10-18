@@ -23,9 +23,6 @@ from lecturelens.config.settings import Settings
 from lecturelens.core.clock import SessionClock
 from lecturelens.core.markdown_formatter import format_clean_markdown, normalize_headings
 from lecturelens.core.redis_bus import RedisBus, handler_accepts_message_id
-from lecturelens.exports.anki_exporter import format_card_field_html
-from lecturelens.exports.pdf_exporter import create_pdf_from_markdown, latex_to_markup
-from lecturelens.knowledge.concept_graph import ConceptGraph, normalize_concept_name
 from lecturelens.schemas.events import TimelineEntry, TranscriptChunk
 from tests.test_structuring_agent import MockRouter, timeline_line
 
@@ -243,14 +240,14 @@ class TestNotesIdempotency(StructuringHardeningBase):
         self.assertEqual(self.section_count(), 1)
 
     async def test_crash_on_later_batches_does_not_duplicate_notes(self) -> None:
-        self.settings.max_slice_characters = 80
+        self.settings.max_slice_characters = 20
         self.write_entries(4)
         await self.crash_on_save(2)
         await self.make_agent().process_all_pending()
         self.assertEqual(self.section_count(), 4)
 
     async def test_batches_sharing_the_same_wall_second_are_all_written(self) -> None:
-        self.settings.max_slice_characters = 80
+        self.settings.max_slice_characters = 20
         self.write_entries(3, same_second=True)
         await self.make_agent().process_all_pending()
         self.assertEqual(self.section_count(), 3)
@@ -443,46 +440,7 @@ class TestScreenAgentHardening(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(tasks[0].cancelled())
 
 
-class TestBoardOcclusion(unittest.TestCase):
-    def make_agent(self, temp_dir: str) -> Any:
-        from tests.test_camera_agent import make_agent, FakeRouter
-        agent, _ = make_agent(temp_dir, FakeRouter())
-        return agent
 
-    def test_large_sudden_change_is_held_until_it_persists(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            agent = self.make_agent(temp_dir)
-            agent.settings.board_occlusion_patience = 3
-            base = np.full((90, 160), 220, dtype=np.uint8)
-            agent.last_published_thumbnail = base
-            agent.last_publish_time = 0.0
-            blocked = base.copy()
-            blocked[:, 20:140] = 30
-            self.assertFalse(agent.has_board_changed(blocked, 100.0))
-            self.assertFalse(agent.has_board_changed(blocked, 101.0))
-            self.assertTrue(agent.has_board_changed(blocked, 102.0))
-
-    def test_small_writing_change_is_accepted_immediately(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            agent = self.make_agent(temp_dir)
-            base = np.full((90, 160), 220, dtype=np.uint8)
-            agent.last_published_thumbnail = base
-            agent.last_publish_time = 0.0
-            written = base.copy()
-            written[10:16, 10:60] = 20
-            self.assertTrue(agent.has_board_changed(written, 100.0))
-
-    def test_occlusion_counter_resets_when_the_board_returns(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            agent = self.make_agent(temp_dir)
-            base = np.full((90, 160), 220, dtype=np.uint8)
-            agent.last_published_thumbnail = base
-            agent.last_publish_time = 0.0
-            blocked = base.copy()
-            blocked[:, 20:140] = 30
-            agent.has_board_changed(blocked, 100.0)
-            agent.has_board_changed(base.copy(), 101.0)
-            self.assertEqual(agent.occlusion_hold_count, 0)
 
 
 class TestFormatterHardening(unittest.TestCase):
@@ -524,63 +482,7 @@ class TestFormatterHardening(unittest.TestCase):
         self.assertNotIn("(Cont.)", cleaned)
 
 
-class TestAnkiMathHardening(unittest.TestCase):
-    def test_prices_are_left_alone(self) -> None:
-        for text in ("costs $5 and later $10 more", "between $5-$10 range", "It cost $5 total.", "$10$"):
-            self.assertNotIn("\\(", format_card_field_html(text), text)
 
-    def test_short_symbolic_math_is_converted(self) -> None:
-        for expression in ("$NP$", "$f(x, y)$", "$a, b$", "$P(A|B)$", "$2n$", "$x_i$", "$n^2$"):
-            self.assertIn("\\(", format_card_field_html(expression), expression)
-
-    def test_prose_between_dollars_is_not_math(self) -> None:
-        self.assertNotIn("\\(", format_card_field_html("pay $x for the very long service and $y"))
-
-
-class TestPdfHardening(unittest.TestCase):
-    def test_latex_is_converted_to_readable_markup(self) -> None:
-        markup = latex_to_markup(r"\frac{a}{b} + \sum_{i=0}^{n} x_i \leq \alpha^2")
-        self.assertIn("(a)/(b)", markup)
-        self.assertIn("<sub>i=0</sub>", markup)
-        self.assertIn("<super>n</super>", markup)
-        self.assertIn("&lt;=", markup)
-        self.assertIn("alpha", markup)
-        self.assertNotIn("\\", markup)
-
-    def test_markup_escapes_angle_brackets(self) -> None:
-        self.assertNotIn("<b>", latex_to_markup("a<b>c"))
-
-    def test_pdf_builds_for_awkward_content(self) -> None:
-        documents = {
-            "ragged table": "| A | B | C |\n|---|---|---|\n| 1 | 2 |\n| 1 |",
-            "long code": "```\nx = " + "1234567890" * 40 + "\n```",
-            "display math": "$$\n\\frac{a}{b} + \\sqrt{x}\n$$",
-            "wide table": "|" + "|".join(f"H{i}" for i in range(8)) + "|\n|" + "|".join("---" for _ in range(8)) + "|\n|" + "|".join("some words here" for _ in range(8)) + "|",
-        }
-        for label, markdown in documents.items():
-            with tempfile.TemporaryDirectory() as temp_dir:
-                target = Path(temp_dir) / "out.pdf"
-                create_pdf_from_markdown(markdown, target, "T")
-                self.assertGreater(target.stat().st_size, 500, label)
-
-
-class TestConceptNormalization(unittest.TestCase):
-    def test_variants_normalize_to_the_same_name(self) -> None:
-        names = ["Depth-First Search (DFS)", "depth first searches", "The depth first search"]
-        self.assertEqual(len({normalize_concept_name(name) for name in names}), 1)
-
-    def test_cross_session_lookup_is_tolerant_to_rephrasing(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            graph = ConceptGraph(Path(temp_dir) / "c.db")
-            graph.add_or_update_concept("Depth-First Search (DFS)", "s1", 1.0, "d", [])
-            found = graph.find_concept_in_other_sessions("depth first searches", "s2")
-            self.assertEqual([record["session_id"] for record in found], ["s1"])
-
-    def test_different_concepts_are_not_merged(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            graph = ConceptGraph(Path(temp_dir) / "c.db")
-            graph.add_or_update_concept("Depth-First Search", "s1", 1.0, "d", [])
-            self.assertEqual(graph.find_concept_in_other_sessions("Breadth-First Search", "s2"), [])
 
 
 class TestLiveSessionGuard(unittest.TestCase):

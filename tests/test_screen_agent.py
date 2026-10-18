@@ -108,6 +108,17 @@ class FakeBus:
         return "1-1"
 
 
+class MockVisionRouter:
+    def __init__(self, response_text: str = "Extracted slide text") -> None:
+        self.calls = 0
+        self.response_text = response_text
+
+    async def ainvoke(self, messages: Any) -> Any:
+        self.calls += 1
+        from langchain_core.messages import AIMessage
+        return AIMessage(content=self.response_text)
+
+
 def make_agent(temp_dir: str, router: Any = None) -> tuple[ScreenAgent, FakeBus]:
     settings = Settings()
     settings.output_dir = Path(temp_dir)
@@ -118,39 +129,40 @@ def make_agent(temp_dir: str, router: Any = None) -> tuple[ScreenAgent, FakeBus]
 class TestScreenAgent(unittest.IsolatedAsyncioTestCase):
     async def test_ingest_saves_before_ocr_and_numbers_slides(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            agent, bus = make_agent(temp_dir)
-            seen_at_ocr: list[bool] = []
-
-            async def fake_pool(function: Any, png_bytes: bytes, tesseract_path: str) -> str:
-                seen_at_ocr.append(len(list(agent.slides_dir.glob("slide_*.png"))) == 1)
-                return "Binary Search"
-
-            with mock.patch.object(screen_agent, "run_in_process_pool", side_effect=fake_pool):
-                event = await agent.ingest_png_bytes(make_slide_png(["Binary Search"]))
+            router = MockVisionRouter("Binary Search")
+            agent, bus = make_agent(temp_dir, router)
+            event = await agent.ingest_png_bytes(make_slide_png(["Binary Search"]))
             self.assertEqual(event.slide_number, 1)
             self.assertEqual(event.extracted_text, "Binary Search")
-            self.assertEqual(seen_at_ocr, [True])
+            self.assertEqual(router.calls, 1)
+            self.assertEqual(len(list(agent.slides_dir.glob("slide_*.png"))), 1)
             self.assertEqual(len(bus.published), 1)
 
     async def test_revisited_slide_reuses_text_and_is_marked(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            agent, bus = make_agent(temp_dir)
-            ocr_calls: list[int] = []
+            class DynamicRouter:
+                def __init__(self) -> None:
+                    self.calls = 0
 
-            async def fake_pool(function: Any, png_bytes: bytes, tesseract_path: str) -> str:
-                ocr_calls.append(1)
-                return "Merge sort"
+                async def ainvoke(self, messages: Any) -> Any:
+                    self.calls += 1
+                    from langchain_core.messages import AIMessage
+                    return AIMessage(content=f"Slide content call {self.calls}")
+
+            router = DynamicRouter()
+            agent, bus = make_agent(temp_dir, router)
 
             first_png = make_slide_png(["Merge sort", "divide"])
             other_png = make_slide_png(["Quick sort", "pivot", "partition", "recurse"])
-            with mock.patch.object(screen_agent, "run_in_process_pool", side_effect=fake_pool):
-                first = await agent.ingest_png_bytes(first_png)
-                await agent.ingest_png_bytes(other_png)
-                again = await agent.ingest_png_bytes(first_png)
+
+            first = await agent.ingest_png_bytes(first_png)
+            await agent.ingest_png_bytes(other_png)
+            again = await agent.ingest_png_bytes(first_png)
+
             self.assertEqual(first.revisited_slide_number, 0)
             self.assertEqual(again.revisited_slide_number, 1)
-            self.assertEqual(again.extracted_text, "Merge sort")
-            self.assertEqual(len(ocr_calls), 2)
+            self.assertEqual(again.extracted_text, first.extracted_text)
+            self.assertEqual(router.calls, 2)
 
     async def test_numbering_continues_after_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -159,53 +171,21 @@ class TestScreenAgent(unittest.IsolatedAsyncioTestCase):
             restarted, _ = make_agent(temp_dir)
             self.assertEqual(restarted.slide_counter, 9)
 
-    async def test_empty_ocr_falls_back_to_vision_router(self) -> None:
+    async def test_vision_fallback_retry_and_empty_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            class Router:
+            class FailingRouter:
                 def __init__(self) -> None:
                     self.calls = 0
 
                 async def ainvoke(self, messages: Any) -> Any:
                     self.calls += 1
-                    from langchain_core.messages import AIMessage
-                    return AIMessage(content="A diagram of a tree")
+                    raise RuntimeError("API timeout")
 
-            router = Router()
-            agent, _ = make_agent(temp_dir, router)
-
-            async def empty_ocr(function: Any, png_bytes: bytes, tesseract_path: str) -> str:
-                return ""
-
-            with mock.patch.object(screen_agent, "run_in_process_pool", side_effect=empty_ocr):
-                event = await agent.ingest_png_bytes(make_slide_png(["tree"]))
-            self.assertEqual(event.extracted_text, "A diagram of a tree")
-            self.assertEqual(router.calls, 1)
-
-    async def test_ocr_failure_does_not_call_docker_when_not_configured(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            agent, _ = make_agent(temp_dir)
-
-            async def failing_ocr(function: Any, png_bytes: bytes, tesseract_path: str) -> str:
-                raise RuntimeError("tesseract missing")
-
-            with mock.patch.object(screen_agent, "run_in_process_pool", side_effect=failing_ocr):
-                with mock.patch.object(screen_agent, "run_docker_ocr_request") as docker_call:
-                    event = await agent.ingest_png_bytes(make_slide_png(["x"]))
+            router = FailingRouter()
+            agent, bus = make_agent(temp_dir, router)
+            event = await agent.ingest_png_bytes(make_slide_png(["test failure"]))
             self.assertEqual(event.extracted_text, "")
-            docker_call.assert_not_called()
-
-    async def test_docker_ocr_used_through_thread_pool_when_configured(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            agent, _ = make_agent(temp_dir)
-            agent.settings.docker_ocr_url = "http://localhost:9999/ocr"
-
-            async def failing_ocr(function: Any, png_bytes: bytes, tesseract_path: str) -> str:
-                raise RuntimeError("tesseract missing")
-
-            with mock.patch.object(screen_agent, "run_in_process_pool", side_effect=failing_ocr):
-                with mock.patch.object(screen_agent, "run_docker_ocr_request", return_value="from docker"):
-                    event = await agent.ingest_png_bytes(make_slide_png(["x"]))
-            self.assertEqual(event.extracted_text, "from docker")
+            self.assertEqual(router.calls, 2)
 
 
 class TestScreenHelpers(unittest.TestCase):

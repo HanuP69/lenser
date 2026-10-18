@@ -85,12 +85,10 @@ class TestRedisBusReliability(unittest.IsolatedAsyncioTestCase):
         self.group = "test_group_reliability"
         if self.redis_available:
             await self.bus.client.delete(self.stream)
-            await self.bus.client.delete(self.stream + ":dead")
 
     async def asyncTearDown(self) -> None:
         if self.redis_available:
             await self.bus.client.delete(self.stream)
-            await self.bus.client.delete(self.stream + ":dead")
             await self.bus.close()
 
     async def run_consumer(self, handler, stop_flag: dict, consumer_name: str = "consumer_a") -> None:
@@ -114,7 +112,7 @@ class TestRedisBusReliability(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(received), 10)
         self.assertEqual(await self.bus.get_pending_count(self.stream, self.group), 0)
 
-    async def test_failing_message_goes_to_dead_letter_after_max_attempts(self) -> None:
+    async def test_failing_message_discarded_after_max_attempts(self) -> None:
         if not self.redis_available:
             self.skipTest("Redis not available on localhost:6379")
         self.bus.max_delivery_attempts = 3
@@ -129,15 +127,13 @@ class TestRedisBusReliability(unittest.IsolatedAsyncioTestCase):
 
         stop_flag = {"stop": False}
         consumer_task = asyncio.create_task(self.run_consumer(handler, stop_flag))
-        for _ in range(100):
+        for _ in range(50):
             await asyncio.sleep(0.05)
-            dead = await self.bus.client.xinfo_stream(self.stream + ":dead") if await self.bus.client.keys(self.stream + ":dead") else {}
-            if dead.get("length", 0) >= 1:
+            if "fine" in received and (await self.bus.get_pending_count(self.stream, self.group)) == 0:
                 break
         stop_flag["stop"] = True
         await asyncio.wait_for(consumer_task, timeout=10)
         self.assertEqual(received, ["fine"])
-        self.assertEqual((await self.bus.get_stream_info(self.stream + ":dead")).get("length", 0), 1)
         self.assertEqual(await self.bus.get_pending_count(self.stream, self.group), 0)
 
     async def test_restarted_consumer_reprocesses_its_unacknowledged_messages(self) -> None:
@@ -178,44 +174,15 @@ class TestRedisBusReliability(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(consumer_task, timeout=10)
         self.assertEqual(received, ["orphan"])
 
-    async def test_publish_resilient_buffers_then_flushes(self) -> None:
-        if not self.redis_available:
-            self.skipTest("Redis not available on localhost:6379")
-        original_publish = self.bus.publish
-        state = {"down": True}
+    async def test_publish_resilient_returns_none_on_connection_error(self) -> None:
+        bus = RedisBus("redis://localhost:6379")
 
         async def flaky_publish(stream_name, event):
-            if state["down"]:
-                raise redis_module.ConnectionError("down")
-            return await original_publish(stream_name, event)
-
-        self.bus.publish = flaky_publish
-        result = await self.bus.publish_resilient("lecturelens:test_buffer:stream", make_chunk("a"))
-        await self.bus.publish_resilient("lecturelens:test_buffer:stream", make_chunk("b"))
-        self.assertIsNone(result)
-        self.assertEqual(len(self.bus.outbox), 2)
-
-        state["down"] = False
-        if self.redis_available:
-            await self.bus.client.delete("lecturelens:test_buffer:stream")
-        await self.bus.publish_resilient("lecturelens:test_buffer:stream", make_chunk("c"))
-        self.assertEqual(len(self.bus.outbox), 0)
-        if self.redis_available:
-            info = await self.bus.get_stream_info("lecturelens:test_buffer:stream")
-            self.assertEqual(info.get("length", 0), 3)
-            await self.bus.client.delete("lecturelens:test_buffer:stream")
-
-    async def test_outbox_is_bounded(self) -> None:
-        bus = RedisBus("redis://localhost:6379", outbox_capacity=3)
-
-        async def always_fail(stream_name, event):
             raise redis_module.ConnectionError("down")
 
-        bus.publish = always_fail
-        for index in range(6):
-            await bus.publish_resilient("s", make_chunk(str(index)))
-        self.assertEqual(len(bus.outbox), 3)
-        self.assertEqual(bus.outbox[0][1].text, "3")
+        bus.publish = flaky_publish
+        result = await bus.publish_resilient("lecturelens:test_buffer:stream", make_chunk("a"))
+        self.assertIsNone(result)
         await bus.close()
 
     async def test_consume_survives_read_errors_with_backoff(self) -> None:

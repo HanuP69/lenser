@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from lecturelens.agents.audio_agent import AudioAgent
-from lecturelens.agents.camera_agent import CameraAgent
 from lecturelens.agents.screen_agent import ScreenAgent
 from lecturelens.config.settings import Settings
 from lecturelens.core.agent_runtime import execute_agent_main
@@ -59,7 +58,6 @@ class SessionRuntime:
     clock: SessionClock
     audio_agent: AudioAgent
     screen_agent: ScreenAgent
-    camera_agent: CameraAgent
     connection_count: int = 0
     last_active: float = field(default_factory=time.monotonic)
 
@@ -101,14 +99,55 @@ class GatewayServer:
         self,
         settings: Settings,
         redis_bus: RedisBus,
-        llm_router: Any = None
+        llm_router: Any = None,
+        storage: Any = None
     ) -> None:
         validate_gateway_binding(settings.gateway_host, settings.gateway_api_key)
         self.settings: Settings = settings
         self.redis_bus: RedisBus = redis_bus
         self.llm_router: Any = llm_router
+        self.storage: Any = storage
         self.sessions: dict[str, SessionRuntime] = {}
+        self.subscribers: dict[str, set[Any]] = {}
+        self.fanout_tasks: dict[str, asyncio.Task] = {}
         self.server: Any = None
+
+    async def broadcast_note_segment(self, session_id: str, note_data: dict[str, Any]) -> None:
+        subscribers = list(self.subscribers.get(session_id, set()))
+        if not subscribers:
+            return
+        payload = {"type": "note_segment", "payload": note_data}
+        dead_sockets: list[Any] = []
+        for ws in subscribers:
+            try:
+                await self.send_json(ws, payload)
+            except Exception:
+                dead_sockets.append(ws)
+        if dead_sockets and session_id in self.subscribers:
+            for dead in dead_sockets:
+                self.subscribers[session_id].discard(dead)
+
+    async def run_notes_fanout(self, session_id: str) -> None:
+        stream_name = f"lecturelens:{session_id}:stream:notes"
+        group_name = f"group:gateway_{session_id}"
+        await self.redis_bus.ensure_consumer_group(stream_name, group_name)
+
+        async def handler(data: dict[str, Any]) -> None:
+            await self.broadcast_note_segment(session_id, data)
+
+        try:
+            await self.redis_bus.consume(
+                stream_name=stream_name,
+                group_name=group_name,
+                consumer_name=f"gateway_fanout_{session_id}",
+                handler=handler,
+                batch_size=5,
+                block_ms=500
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.error("fanout loop error for %s: %s", session_id, error)
 
     def get_or_create_session(self, session_id: str) -> SessionRuntime:
         existing = self.sessions.get(session_id)
@@ -124,8 +163,7 @@ class GatewayServer:
             session_id=session_id,
             clock=clock,
             audio_agent=AudioAgent(self.settings, self.redis_bus, clock, session_id),
-            screen_agent=ScreenAgent(self.settings, self.redis_bus, clock, session_id, self.llm_router),
-            camera_agent=CameraAgent(self.settings, self.redis_bus, clock, session_id, self.llm_router)
+            screen_agent=ScreenAgent(self.settings, self.redis_bus, clock, session_id, self.llm_router)
         )
         self.sessions[session_id] = runtime
         return runtime
@@ -147,7 +185,6 @@ class GatewayServer:
             return
         runtime.audio_agent.stop()
         runtime.screen_agent.stop()
-        runtime.camera_agent.stop()
         logger.info("released idle gateway session %s", session_id)
 
     def authenticate(self, hello_message: dict[str, Any]) -> str:
@@ -174,10 +211,6 @@ class GatewayServer:
         if message_type == "screen":
             png_bytes = decode_base64_field(message, "png_b64")
             await runtime.screen_agent.ingest_png_bytes(png_bytes, capture_epoch)
-            return {"status": "acknowledged"}
-        if message_type == "camera":
-            jpeg_bytes = decode_base64_field(message, "jpeg_b64")
-            await runtime.camera_agent.ingest_jpeg_bytes(jpeg_bytes, capture_epoch)
             return {"status": "acknowledged"}
         if message_type == "event":
             source_type = message.get("source_type")
@@ -221,6 +254,26 @@ class GatewayServer:
             runtime.connection_count += 1
             await self.send_json(websocket, {"status": "authenticated", "session_id": session_id})
 
+            is_subscriber = (
+                hello_message.get("role") in ("subscriber", "student")
+                or hello_message.get("subscribe") is True
+            )
+            if is_subscriber:
+                if session_id not in self.subscribers:
+                    self.subscribers[session_id] = set()
+                self.subscribers[session_id].add(websocket)
+                if session_id not in self.fanout_tasks or self.fanout_tasks[session_id].done():
+                    self.fanout_tasks[session_id] = asyncio.create_task(self.run_notes_fanout(session_id))
+
+                last_seq = int(hello_message.get("last_sequence_number", 0))
+                if self.storage is not None and last_seq >= 0:
+                    try:
+                        missed = await self.storage.get_general_notes_since(session_id, last_seq)
+                        for note in missed:
+                            await self.send_json(websocket, {"type": "note_segment", "payload": note})
+                    except Exception as replay_err:
+                        logger.warning("postgres replay failed for %s: %s", session_id, replay_err)
+
             async for raw_frame in websocket:
                 if not limiter.allow():
                     await self.send_json(websocket, {"status": "error", "error": "rate limited"})
@@ -243,6 +296,8 @@ class GatewayServer:
         except Exception as error:
             logger.info("connection ended: %s", error)
         finally:
+            if session_id and session_id in self.subscribers:
+                self.subscribers[session_id].discard(websocket)
             if runtime is not None:
                 runtime.connection_count -= 1
                 runtime.last_active = time.monotonic()
@@ -268,6 +323,9 @@ class GatewayServer:
             await asyncio.sleep(1.0)
 
     async def stop(self) -> None:
+        for task in self.fanout_tasks.values():
+            if not task.done():
+                task.cancel()
         if self.server is not None:
             self.server.close()
             await self.server.wait_closed()

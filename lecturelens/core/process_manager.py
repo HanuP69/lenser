@@ -1,28 +1,28 @@
+import logging
 import os
 import subprocess
 import time
 from pathlib import Path
-from typing import IO, Optional
+from typing import Any, Optional
 
 from lecturelens.core.agent_runtime import set_flag
-from lecturelens.core.logging_setup import get_logger
 
-logger = get_logger("lecturelens.recovery")
+logger = logging.getLogger(__name__)
 
 
-class AgentMonitor:
+class AgentProcessManager:
     def __init__(
         self,
         base_backoff_seconds: float = 1.0,
-        max_backoff_seconds: float = 60.0,
-        max_consecutive_failures: int = 8,
+        max_backoff_seconds: float = 30.0,
+        max_consecutive_failures: int = 5,
         stable_runtime_seconds: float = 60.0
     ) -> None:
-        self.processes: dict[str, subprocess.Popen] = {}
+        self.processes: dict[str, subprocess.Popen[bytes]] = {}
         self.command_templates: dict[str, list[str]] = {}
         self.environments: dict[str, dict[str, str]] = {}
         self.log_file_paths: dict[str, Path] = {}
-        self.log_handles: dict[str, IO] = {}
+        self.log_handles: dict[str, Any] = {}
         self.base_backoff_seconds: float = base_backoff_seconds
         self.max_backoff_seconds: float = max_backoff_seconds
         self.max_consecutive_failures: int = max_consecutive_failures
@@ -224,3 +224,6 @@ class AgentMonitor:
         for agent_name in list(self.processes.keys()):
             self.close_log_handle(agent_name)
         return outcomes
+
+
+AgentMonitor = AgentProcessManager

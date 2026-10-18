@@ -99,46 +99,7 @@ def build_thumbnail_from_png(png_bytes: bytes, thumbnail_width: int) -> np.ndarr
     return build_gray_thumbnail(image, thumbnail_width)
 
 
-def resolve_tesseract_command(tesseract_path: str) -> Optional[str]:
-    if tesseract_path and Path(tesseract_path).exists():
-        return tesseract_path
-    discovered = shutil.which("tesseract")
-    return discovered
 
-
-def run_tesseract_ocr(image_bytes: bytes, tesseract_path: str) -> str:
-    import pytesseract
-    command = resolve_tesseract_command(tesseract_path)
-    if command is None:
-        raise RuntimeError("tesseract executable not found")
-    pytesseract.pytesseract.tesseract_cmd = command
-    image = Image.open(io.BytesIO(image_bytes))
-    return pytesseract.image_to_string(image, config=TESSERACT_CONFIG).strip()
-
-
-def run_docker_ocr_request(image_bytes: bytes, docker_url: str, timeout_seconds: float = 20.0) -> str:
-    boundary = uuid.uuid4().hex
-    body_parts = [
-        f"--{boundary}\r\n".encode("utf-8"),
-        b'Content-Disposition: form-data; name="file"; filename="slide.png"\r\n',
-        b"Content-Type: image/png\r\n\r\n",
-        image_bytes,
-        f"\r\n--{boundary}--\r\n".encode("utf-8"),
-    ]
-    request = urllib.request.Request(
-        docker_url,
-        data=b"".join(body_parts),
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        method="POST"
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            payload = response.read().decode("utf-8", errors="replace")
-    except (urllib.error.URLError, OSError) as error:
-        raise RuntimeError(f"docker OCR unreachable: {error}") from error
-    import json
-    parsed = json.loads(payload)
-    return str(parsed.get("text", "")).strip()
 
 
 def save_slide_image(image_bytes: bytes, output_dir: str, slide_number: int) -> str:
@@ -207,20 +168,7 @@ class ScreenAgent:
                 del self.slide_texts[removed_number]
 
     async def run_ocr(self, png_bytes: bytes) -> str:
-        try:
-            return await run_in_process_pool(
-                run_tesseract_ocr, png_bytes, self.settings.tesseract_path
-            )
-        except Exception as error:
-            logger.error("tesseract OCR failed: %s", error)
-        if self.settings.docker_ocr_url:
-            try:
-                return await run_in_thread_pool(
-                    run_docker_ocr_request, png_bytes, self.settings.docker_ocr_url
-                )
-            except Exception as error:
-                logger.error("docker OCR failed: %s", error)
-        return ""
+        return await self.run_vision_fallback(png_bytes)
 
     async def run_vision_fallback(self, png_bytes: bytes, max_retries: int = 2) -> str:
         if self.llm_router is None or self.control.stop_requested():
@@ -257,8 +205,6 @@ class ScreenAgent:
             extracted_text = self.slide_texts[revisited_number]
         elif not self.control.stop_requested():
             extracted_text = await self.run_ocr(png_bytes)
-            if len(extracted_text.strip()) == 0 and not self.control.stop_requested():
-                extracted_text = await self.run_vision_fallback(png_bytes)
         if len(extracted_text.strip()) > 0:
             self.remember_slide(slide_number, difference_hash, small_thumbnail, extracted_text)
 

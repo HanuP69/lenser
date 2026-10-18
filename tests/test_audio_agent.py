@@ -16,8 +16,7 @@ from lecturelens.agents.audio_agent import (
     PendingTranscription,
     SpeechSegmenter,
     convert_numpy_to_wav_bytes,
-    is_hallucinated_text,
-    mix_blocks
+    is_hallucinated_text
 )
 from lecturelens.config.settings import Settings
 from lecturelens.core.agent_runtime import set_flag
@@ -135,16 +134,6 @@ class TestAudioHelpers(unittest.TestCase):
         self.assertTrue(is_hallucinated_text("go go go go go go go go go"))
         self.assertFalse(is_hallucinated_text("Thank you all for coming to the lecture today."))
         self.assertFalse(is_hallucinated_text("Binary search runs in log n time."))
-
-    def test_mix_blocks(self) -> None:
-        first = np.array([0.6, 0.6], dtype=np.float32)
-        second = np.array([0.6, 0.6, 0.1], dtype=np.float32)
-        mixed = mix_blocks(first, second)
-        self.assertEqual(mixed.size, 3)
-        self.assertEqual(float(mixed[0]), 1.0)
-        self.assertAlmostEqual(float(mixed[2]), 0.1, places=5)
-        self.assertIs(mix_blocks(first, None), first)
-        self.assertIs(mix_blocks(None, second), second)
 
     def test_wav_conversion_round_trip(self) -> None:
         samples = np.linspace(-0.5, 0.5, 1600, dtype=np.float32)
