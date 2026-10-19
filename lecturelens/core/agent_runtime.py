@@ -11,6 +11,7 @@ from typing import Any, Awaitable, Callable, Optional
 from lecturelens.config.settings import Settings
 from lecturelens.core.clock import SessionClock
 from lecturelens.core.concurrency import configure_pools, shutdown_pools
+from lecturelens.core.event_loop import ensure_event_loop_policy, run_async
 from lecturelens.core.fileio import atomic_write_text
 from lecturelens.core.logging_setup import get_logger
 from lecturelens.core.redis_bus import RedisBus
@@ -193,12 +194,8 @@ async def run_standard_agent(build_agent: Callable[[RuntimeContext], Any]) -> No
 
 
 def execute_agent_main(main_function: Callable[[], Awaitable[None]]) -> None:
-    if sys.platform == "win32":
-        try:
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-        except Exception:
-            pass
+    ensure_event_loop_policy()
     try:
-        asyncio.run(main_function())
+        run_async(main_function())
     except KeyboardInterrupt:
         pass

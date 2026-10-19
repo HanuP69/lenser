@@ -8,11 +8,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-if sys.platform == "win32":
-    try:
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    except Exception:
-        pass
+from lecturelens.core.event_loop import ensure_event_loop_policy
+
+ensure_event_loop_policy()
 
 import typer
 from rich.console import Console, Group
@@ -869,6 +867,11 @@ def client(
         validate_start_options(audio_source, "local", "local")
     except ValueError as error:
         fail(str(error))
+    if audio_source == "system":
+        from lecturelens.agents.audio_agent import find_loopback_microphone
+        _, loopback_err = find_loopback_microphone()
+        if loopback_err:
+            fail(f"Cannot use '--audio-source system': {loopback_err}")
     if not is_valid_session_id(session):
         fail(f"Invalid session name: {session}")
     from lecturelens.client.remote_client import run_remote_client

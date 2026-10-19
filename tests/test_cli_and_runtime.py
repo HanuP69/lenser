@@ -318,6 +318,28 @@ class TestCliCommands(unittest.TestCase):
                 )
         self.assertFalse((self.output / "fresh2").exists())
 
+    def test_client_rejects_system_audio_without_loopback(self) -> None:
+        with mock.patch("lecturelens.agents.audio_agent.find_loopback_microphone", return_value=(None, "No loopback device")):
+            with self.assertRaises(typer.Exit):
+                cli_main.client(
+                    session="fresh3",
+                    server=None,
+                    api_key=None,
+                    audio_source="system",
+                    no_screen=False,
+                    audio_only=False,
+                    monitor_index=1
+                )
+
+    def test_event_loop_helper(self) -> None:
+        from lecturelens.core.event_loop import ensure_event_loop_policy, run_async
+        ensure_event_loop_policy()
+
+        async def sample_coro() -> int:
+            return 42
+
+        self.assertEqual(run_async(sample_coro()), 42)
+
 
 if __name__ == "__main__":
     unittest.main()
