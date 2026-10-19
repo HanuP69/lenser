@@ -262,23 +262,12 @@ def build_session_output_table(session_dir: Path) -> Any:
         table.add_row("concepts.db", "Knowledge Graph (SQLite)", count_str, "Saved")
         rows_added += 1
 
-    anki_path = session_dir / "flashcards.apkg"
-    if anki_path.exists():
-        size_str = format_file_size(anki_path.stat().st_size)
-        table.add_row("flashcards.apkg", "Anki Flashcards Deck", size_str, "Saved")
-        rows_added += 1
-
-    flashcards_json_path = session_dir / "flashcards.jsonl"
-    if flashcards_json_path.exists() and not anki_path.exists():
-        size_str = format_file_size(flashcards_json_path.stat().st_size)
-        card_count = count_file_lines(flashcards_json_path)
-        table.add_row("flashcards.jsonl", "Flashcards Dataset", f"{size_str} ({card_count} cards)", "Saved")
-        rows_added += 1
-
-    screen_dir = session_dir / "raw" / "screen"
-    screen_count, screen_bytes = count_images_in_directory(screen_dir)
-    if screen_count > 0:
-        table.add_row("raw/screen/", "Slide / Screen Keyframes", f"{screen_count} images ({format_file_size(screen_bytes)})", "Saved")
+    slides_dir = session_dir / "raw" / "slides"
+    if not slides_dir.exists():
+        slides_dir = session_dir / "raw" / "screen"
+    slides_count, slides_bytes = count_images_in_directory(slides_dir)
+    if slides_count > 0:
+        table.add_row("raw/slides/", "Slide / Screen Keyframes", f"{slides_count} images ({format_file_size(slides_bytes)})", "Saved")
         rows_added += 1
 
     meta_path = session_dir / "session_meta.json"
@@ -311,5 +300,5 @@ def display_session_output_summary(session_dir: Path, console: Any) -> None:
         f"  [white]* View Notes  :[/white] [dim]type \"{resolved_path}\\notes.md\"[/dim]\n"
         f"  [white]* Ask Lecture :[/white] [dim]lecturelens ask --session \"{session_id}\" \"Summarize the key points\"[/dim]\n"
         f"  [white]* View Graph  :[/white] [dim]lecturelens review --session \"{session_id}\"[/dim]\n"
-        f"  [white]* Export PDF  :[/white] [dim]lecturelens export --session \"{session_id}\" --format pdf[/dim]\n"
+        f"  [white]* Export Notes:[/white] [dim]lecturelens export --session \"{session_id}\" --format md[/dim]\n"
     )

@@ -56,17 +56,17 @@ providers:
 
 task_routing:
   screen_ocr:
-    - unorouter
     - gemma
+    - unorouter
     - openrouter
     - gemini
   structuring:
-    - unorouter
     - gemma
+    - unorouter
     - openrouter
     - gemini
   qa:
-    - unorouter
     - gemma
+    - unorouter
     - openrouter
     - gemini

@@ -104,19 +104,19 @@ def save_audio_chunk(audio_bytes: bytes, output_dir: str, chunk_index: int) -> s
     return str(file_path)
 
 
-def load_whisper_model(model_size: str, device: str) -> Any:
-    cache_key = f"{model_size}:{device}"
+def load_whisper_model(model_size: str, device: str, compute_type: Optional[str] = None) -> Any:
+    cache_key = f"{model_size}:{device}:{compute_type}"
     if cache_key not in _whisper_model_cache:
         from faster_whisper import WhisperModel
-        compute_type = "int8" if device == "cpu" else "float16"
+        resolved_compute = compute_type or ("int8" if device == "cpu" else "float16")
         _whisper_model_cache[cache_key] = WhisperModel(
-            model_size, device=device, compute_type=compute_type
+            model_size, device=device, compute_type=resolved_compute
         )
     return _whisper_model_cache[cache_key]
 
 
-def preload_whisper_model(model_size: str, device: str) -> bool:
-    load_whisper_model(model_size, device)
+def preload_whisper_model(model_size: str, device: str, compute_type: Optional[str] = None) -> bool:
+    load_whisper_model(model_size, device, compute_type)
     return True
 
 
@@ -127,9 +127,10 @@ def transcribe_audio_chunk(
     language: Optional[str] = None,
     beam_size: int = 3,
     min_avg_logprob: float = -1.0,
-    max_no_speech_prob: float = 0.6
+    max_no_speech_prob: float = 0.6,
+    compute_type: Optional[str] = None
 ) -> dict:
-    model = load_whisper_model(model_size, device)
+    model = load_whisper_model(model_size, device, compute_type)
     segments, info = model.transcribe(
         io.BytesIO(audio_bytes),
         beam_size=beam_size,
@@ -342,9 +343,101 @@ class MicBlockSource:
         self.start()
 
 
+class SystemBlockSource:
+    def __init__(self, sample_rate: int, block_seconds: float, max_queue_blocks: int = 600) -> None:
+        self.sample_rate: int = sample_rate
+        self.block_frames: int = max(1, int(sample_rate * block_seconds))
+        self.block_queue: queue.Queue = queue.Queue(maxsize=max_queue_blocks)
+        self.thread: Optional[threading.Thread] = None
+        self.is_running: bool = False
+        self.dropped_blocks: int = 0
+
+    def _record_loop(self) -> None:
+        try:
+            import soundcard
+            mic = None
+            try:
+                mic = soundcard.get_microphone(id=str(soundcard.default_speaker().id), include_loopback=True)
+            except Exception:
+                loopbacks = [m for m in soundcard.all_microphones(include_loopback=True) if getattr(m, "isloopback", False)]
+                if loopbacks:
+                    mic = loopbacks[0]
+            if mic is None:
+                logger.error("No loopback audio device found for system audio capture")
+                return
+            with mic.recorder(samplerate=self.sample_rate, channels=1) as recorder:
+                while self.is_running:
+                    data = recorder.record(numframes=self.block_frames)
+                    if data is not None and len(data) > 0:
+                        block = data[:, 0].astype(np.float32)
+                        try:
+                            self.block_queue.put_nowait(block)
+                        except queue.Full:
+                            self.dropped_blocks += 1
+        except Exception as error:
+            logger.error("System audio capture error: %s", error)
+
+    def start(self) -> None:
+        self.is_running = True
+        self.thread = threading.Thread(target=self._record_loop, daemon=True)
+        self.thread.start()
+
+    def read_block(self, timeout_seconds: float) -> Optional[np.ndarray]:
+        try:
+            return self.block_queue.get(timeout=timeout_seconds)
+        except queue.Empty:
+            return None
+
+    def stop(self) -> None:
+        self.is_running = False
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
+            self.thread = None
+
+    def restart(self) -> None:
+        self.stop()
+        self.start()
+
+
+class MixedBlockSource:
+    def __init__(self, sample_rate: int, block_seconds: float) -> None:
+        self.mic_source = MicBlockSource(sample_rate, block_seconds)
+        self.system_source = SystemBlockSource(sample_rate, block_seconds)
+
+    def start(self) -> None:
+        self.mic_source.start()
+        self.system_source.start()
+
+    def read_block(self, timeout_seconds: float) -> Optional[np.ndarray]:
+        mic_block = self.mic_source.read_block(timeout_seconds)
+        sys_block = self.system_source.read_block(0.01)
+        if mic_block is None and sys_block is None:
+            return None
+        if mic_block is None:
+            return sys_block
+        if sys_block is None:
+            return mic_block
+        min_len = min(len(mic_block), len(sys_block))
+        mixed = (mic_block[:min_len] * 0.5 + sys_block[:min_len] * 0.5).astype(np.float32)
+        return mixed
+
+    def stop(self) -> None:
+        self.mic_source.stop()
+        self.system_source.stop()
+
+    def restart(self) -> None:
+        self.mic_source.restart()
+        self.system_source.restart()
+
+
 def build_block_source(settings: Settings) -> Any:
     sample_rate = settings.mic_sample_rate
     block_seconds = settings.audio_block_seconds
+    audio_source = getattr(settings, "audio_source", "mic") or "mic"
+    if audio_source == "system":
+        return SystemBlockSource(sample_rate, block_seconds)
+    elif audio_source == "both":
+        return MixedBlockSource(sample_rate, block_seconds)
     return MicBlockSource(sample_rate, block_seconds)
 
 
@@ -488,7 +581,8 @@ class AudioAgent:
             self.locked_language,
             self.settings.whisper_beam_size,
             self.settings.whisper_min_avg_logprob,
-            self.settings.whisper_max_no_speech_prob
+            self.settings.whisper_max_no_speech_prob,
+            self.settings.whisper_compute_type
         )
         transcript_text = str(result.get("text", "")).strip()
         if is_hallucinated_text(transcript_text):

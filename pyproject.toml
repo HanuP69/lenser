@@ -29,16 +29,13 @@ full = [
     "faster-whisper>=1.0",
     "mss>=9.0",
     "Pillow>=10.0",
-    "pytesseract>=0.3",
     "langchain-core>=0.3",
     "langchain-ollama>=0.2",
     "langchain-openai>=0.2",
     "langchain-google-genai>=2.0",
     "langgraph>=0.2",
-    "genanki>=0.13",
     "chromadb>=0.5",
     "websockets>=12.0",
-    "reportlab>=4.0",
 ]
 client = [
     "sounddevice>=0.4",
@@ -49,9 +46,6 @@ client = [
     "websockets>=12.0",
 ]
 
-pdf = [
-    "reportlab>=4.0",
-]
 dev = [
     "pytest>=7.0",
 ]

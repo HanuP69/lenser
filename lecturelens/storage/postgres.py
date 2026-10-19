@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS concepts (
     session_id TEXT,
     timestamp_epoch DOUBLE PRECISION,
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(course_id, concept_name)
+    UNIQUE(course_id, session_id, concept_name)
 );
 
 CREATE TABLE IF NOT EXISTS embeddings (
@@ -107,23 +107,23 @@ class PostgresStorage:
 
     async def init_schema(self) -> None:
         conn = await self.get_connection()
-        async with conn.cursor() as cur:
-            try:
-                await cur.execute(CREATE_VECTOR_EXTENSION_SQL)
-                await conn.commit()
-            except Exception as vector_error:
-                await conn.rollback()
-                logger.info("pgvector extension not installed or available: %s", vector_error)
+        try:
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute(CREATE_VECTOR_EXTENSION_SQL)
+        except Exception as vector_error:
+            logger.info("pgvector extension not installed or available: %s", vector_error)
 
-            await cur.execute(CREATE_TABLES_SQL)
-            await conn.commit()
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(CREATE_TABLES_SQL)
 
-            try:
-                await cur.execute(ADD_VECTOR_COLUMN_SQL)
-                await conn.commit()
-            except Exception as vector_col_error:
-                await conn.rollback()
-                logger.debug("vector column skipped: %s", vector_col_error)
+        try:
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute(ADD_VECTOR_COLUMN_SQL)
+        except Exception as vector_col_error:
+            logger.debug("vector column skipped: %s", vector_col_error)
 
     async def insert_timeline_event(self, entry: TimelineEntry | dict[str, Any]) -> bool:
         if isinstance(entry, TimelineEntry):
@@ -131,7 +131,8 @@ class PostgresStorage:
             session_id = entry.session_id
             source_type = entry.source_type
             timestamp_epoch = entry.timestamp_epoch
-            elapsed_seconds = entry.elapsed_seconds
+            raw_elapsed = getattr(entry, "elapsed_seconds", None)
+            elapsed_seconds = float(raw_elapsed) if raw_elapsed is not None else 0.0
             correlation_id = entry.correlation_id
             content = entry.content
             metadata_val = json.dumps(entry.metadata) if entry.metadata is not None else None
@@ -141,7 +142,8 @@ class PostgresStorage:
             session_id = str(entry.get("session_id") or "")
             source_type = str(entry.get("source_type") or "")
             timestamp_epoch = float(entry.get("timestamp_epoch", 0.0))
-            elapsed_seconds = float(entry.get("elapsed_seconds", 0.0))
+            raw_elapsed = entry.get("elapsed_seconds")
+            elapsed_seconds = float(raw_elapsed) if raw_elapsed is not None else 0.0
             correlation_id = entry.get("correlation_id")
             content = str(entry.get("content", ""))
             meta_raw = entry.get("metadata")
@@ -156,17 +158,16 @@ class PostgresStorage:
         ON CONFLICT (event_id) DO NOTHING;
         """
         conn = await self.get_connection()
-        async with conn.cursor() as cur:
-            await cur.execute(
-                query,
-                (
-                    event_id, session_id, source_type, timestamp_epoch, elapsed_seconds,
-                    correlation_id, content, metadata_val, flags
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    query,
+                    (
+                        event_id, session_id, source_type, timestamp_epoch, elapsed_seconds,
+                        correlation_id, content, metadata_val, flags
+                    )
                 )
-            )
-            inserted = (cur.rowcount or 0) > 0
-            await conn.commit()
-            return inserted
+                return (cur.rowcount or 0) > 0
 
     async def insert_general_note(self, note: GeneralNoteSegment | dict[str, Any]) -> bool:
         if isinstance(note, GeneralNoteSegment):
@@ -211,18 +212,17 @@ class PostgresStorage:
             end_time = EXCLUDED.end_time;
         """
         conn = await self.get_connection()
-        async with conn.cursor() as cur:
-            await cur.execute(
-                query,
-                (
-                    session_id, lecture_id, sequence_number, heading, content,
-                    key_points_val, concept_tags, slide_refs_val, timestamp_epoch,
-                    start_time, end_time
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    query,
+                    (
+                        session_id, lecture_id, sequence_number, heading, content,
+                        key_points_val, concept_tags, slide_refs_val, timestamp_epoch,
+                        start_time, end_time
+                    )
                 )
-            )
-            inserted = (cur.rowcount or 0) > 0
-            await conn.commit()
-            return inserted
+                return (cur.rowcount or 0) > 0
 
     async def insert_concept(
         self,
@@ -238,23 +238,21 @@ class PostgresStorage:
         INSERT INTO concepts (
             course_id, concept_name, definition, related_concepts, session_id, timestamp_epoch
         ) VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (course_id, concept_name) DO UPDATE SET
+        ON CONFLICT (course_id, session_id, concept_name) DO UPDATE SET
             definition = COALESCE(NULLIF(EXCLUDED.definition, ''), concepts.definition),
             related_concepts = ARRAY(
                 SELECT DISTINCT unnest(COALESCE(concepts.related_concepts, '{}'::text[]) || COALESCE(EXCLUDED.related_concepts, '{}'::text[]))
             ),
-            session_id = EXCLUDED.session_id,
             timestamp_epoch = EXCLUDED.timestamp_epoch;
         """
         conn = await self.get_connection()
-        async with conn.cursor() as cur:
-            await cur.execute(
-                query,
-                (course_key, concept_name, definition, related_concepts, session_id, timestamp_epoch)
-            )
-            inserted = (cur.rowcount or 0) > 0
-            await conn.commit()
-            return inserted
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    query,
+                    (course_key, concept_name, definition, related_concepts, session_id, timestamp_epoch)
+                )
+                return (cur.rowcount or 0) > 0
 
     async def get_timeline_events(
         self,
@@ -313,21 +311,21 @@ class PostgresStorage:
         vector: Optional[list[float]] = None
     ) -> bool:
         conn = await self.get_connection()
-        async with conn.cursor() as cur:
-            if vector is not None:
-                query = """
-                INSERT INTO embeddings (session_id, source_type, source_id, chunk_text, embedding)
-                VALUES (%s, %s, %s, %s, %s::vector);
-                """
-                await cur.execute(query, (session_id, source_type, source_id, chunk_text, vector))
-            else:
-                query = """
-                INSERT INTO embeddings (session_id, source_type, source_id, chunk_text)
-                VALUES (%s, %s, %s, %s);
-                """
-                await cur.execute(query, (session_id, source_type, source_id, chunk_text))
-            await conn.commit()
-            return True
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                if vector is not None:
+                    query = """
+                    INSERT INTO embeddings (session_id, source_type, source_id, chunk_text, embedding)
+                    VALUES (%s, %s, %s, %s, %s::vector);
+                    """
+                    await cur.execute(query, (session_id, source_type, source_id, chunk_text, vector))
+                else:
+                    query = """
+                    INSERT INTO embeddings (session_id, source_type, source_id, chunk_text)
+                    VALUES (%s, %s, %s, %s);
+                    """
+                    await cur.execute(query, (session_id, source_type, source_id, chunk_text))
+                return True
 
     async def search_embeddings(
         self,

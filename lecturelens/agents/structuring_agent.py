@@ -451,6 +451,9 @@ class StructuringAgent:
                 line = file_handle.readline()
                 if not line:
                     break
+                if not line.endswith("\n"):
+                    file_handle.seek(line_start)
+                    break
                 line_end = file_handle.tell()
                 stripped = line.strip()
                 if len(stripped) == 0:
@@ -584,7 +587,8 @@ class StructuringAgent:
             content=section_text,
             key_points=key_points,
             concept_tags=concept_tags,
-            slide_references=slide_references
+            slide_references=slide_references,
+            definitions=result_state.get("definitions", [])
         )
 
         if self.redis_bus is not None:
@@ -593,21 +597,6 @@ class StructuringAgent:
                 await self.redis_bus.publish(stream_name, note_segment)
             except Exception as error:
                 logger.warning("failed to publish note segment to redis: %s", error)
-
-        elif self.storage is not None:
-            try:
-                await self.storage.insert_general_note(note_segment)
-                for tag in concept_tags:
-                    await self.storage.insert_concept(
-                        course_id=self.settings.course_name,
-                        concept_name=tag,
-                        definition=None,
-                        related_concepts=[t for t in concept_tags if t != tag],
-                        session_id=self.session_id,
-                        timestamp_epoch=first_timestamp
-                    )
-            except Exception as store_error:
-                logger.warning("failed to persist note to storage: %s", store_error)
 
         next_overlap = extract_overlap_entries(batch.entries, OVERLAP_WINDOW_SECONDS)
         self.current_overlap = next_overlap

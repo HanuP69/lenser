@@ -174,13 +174,23 @@ class RedisBus:
                     error
                 )
                 if failure_total >= self.max_delivery_attempts:
+                    dead_stream = f"{stream_name}:dead"
                     logger.error(
-                        "message %s on %s reached max attempts (%d), discarding: %s",
+                        "message %s on %s reached max attempts (%d), routing to %s: %s",
                         message_id,
                         stream_name,
                         self.max_delivery_attempts,
+                        dead_stream,
                         error
                     )
+                    try:
+                        dead_payload = dict(data)
+                        dead_payload["_original_id"] = str(message_id)
+                        dead_payload["_error"] = str(error)
+                        dead_payload["_failed_at"] = str(time.time())
+                        await self.client.xadd(dead_stream, dead_payload)
+                    except Exception as dead_err:
+                        logger.warning("failed to write to dead letter stream %s: %s", dead_stream, dead_err)
                     await self.client.xack(stream_name, group_name, message_id)
                     try:
                         await self.client.delete(redis_retry_key)

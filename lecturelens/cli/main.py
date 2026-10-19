@@ -30,6 +30,7 @@ from lecturelens.config.settings import Settings
 from lecturelens.core import session_meta
 from lecturelens.core.agent_runtime import (
     PAUSE_FLAG_NAME,
+    PERSISTER_STOP_FLAG_NAME,
     SESSION_FINISHED_FLAG_NAME,
     SHUTDOWN_REQUEST_FLAG_NAME,
     FINALIZE_FLAG_NAME,
@@ -129,13 +130,13 @@ def plan_agents(
     no_screen: bool = False,
     enable_persister: bool = False
 ) -> list[str]:
+    if mode == "server":
+        return ["sync_agent", "structuring_agent", "gateway", "persister"]
     planned = ["sync_agent", "structuring_agent", "audio_agent"]
     if not audio_only:
         if not no_screen:
             planned.append("screen_agent")
-    if mode == "server":
-        planned.append("gateway")
-    if enable_persister or mode == "server":
+    if enable_persister:
         planned.append("persister")
     return planned
 
@@ -215,8 +216,18 @@ async def collect_snapshot(
         queue_table.add_row(source_type, str(backlog))
     queue_table.add_row("structuring (bytes)", str(structuring_backlog_bytes(session_dir)))
 
+    active_llm_mode = settings.llm_mode
+    meta_path = session_dir / "session_meta.json"
+    if meta_path.exists():
+        try:
+            meta = session_meta.load_session_meta(session_dir)
+            if meta.get("llm_mode"):
+                active_llm_mode = meta["llm_mode"]
+        except Exception:
+            pass
+
     router_config = load_router_config(settings.router_config_path)
-    router_rows = await get_router_status(bus.client, router_config, "structuring", settings.llm_mode)
+    router_rows = await get_router_status(bus.client, router_config, "structuring", active_llm_mode)
 
     elapsed_seconds = 0.0
     clock_path = session_dir / "clock.json"
@@ -279,7 +290,7 @@ def run_shutdown(monitor: AgentMonitor, session_dir: Path, planned_agents: list[
         (capture_names, STOP_FLAG_NAME, 30.0),
         (["sync_agent"], SYNC_STOP_FLAG_NAME, 30.0),
         (["structuring_agent"], FINALIZE_FLAG_NAME, 120.0),
-        (["persister"], STOP_FLAG_NAME, 10.0)
+        (["persister"], PERSISTER_STOP_FLAG_NAME, 10.0)
     ]
     with console.status("[bold cyan]Stopping agents, flushing timeline, and generating final notes with LLM...[/bold cyan]", spinner="dots"):
         monitor.run_shutdown_sequence(session_dir, phases)
@@ -467,7 +478,7 @@ def status(session: Optional[str] = typer.Option(None, "--session")) -> None:
 
 @app.command()
 def export(
-    export_format: str = typer.Option("all", "--format", help="md, anki, pdf or all"),
+    export_format: str = typer.Option("md", "--format", help="Export format (md)"),
     session: Optional[str] = typer.Option(None, "--session"),
     output: Optional[Path] = typer.Option(None, "--output"),
 ) -> None:
@@ -482,19 +493,12 @@ def export(
     target_dir.mkdir(parents=True, exist_ok=True)
 
     notes_path = session_dir / "notes.md"
-    if export_format in ("md", "all"):
-        if notes_path.exists():
-            destination = target_dir / f"{session_id}_notes.md"
-            destination.write_bytes(notes_path.read_bytes())
-            console.print(f"Markdown: {destination}")
-        else:
-            console.print("[yellow]No notes.md yet.[/yellow]")
-
-    if export_format in ("anki", "all"):
-        console.print("[yellow]Anki export is handled via the student client.[/yellow]")
-
-    if export_format in ("pdf", "all"):
-        console.print("[yellow]PDF export is handled via the student client.[/yellow]")
+    if notes_path.exists():
+        destination = target_dir / f"{session_id}_notes.md"
+        destination.write_bytes(notes_path.read_bytes())
+        console.print(f"Markdown: {destination}")
+    else:
+        console.print("[yellow]No notes.md yet.[/yellow]")
 
 
 @app.command()
@@ -533,7 +537,7 @@ def reprocess(
                 "structuring", bus.client, load_router_config(settings.router_config_path),
                 settings.ollama_url, settings.llm_mode, settings.llm_timeout_seconds
             )
-            agent = StructuringAgent(settings=settings, session_id=session, llm_router=router)
+            agent = StructuringAgent(settings=settings, session_id=session, llm_router=router, redis_bus=bus)
             agent.reset_outputs()
             return await agent.process_all_pending()
         finally:
@@ -723,12 +727,41 @@ def student(
     graph_db = settings.output_dir / student_id / "student_graph.db"
     graph = StudentKnowledgeGraph(graph_db)
 
+    router = None
+    try:
+        from lecturelens.router.llm_router import build_router_for_task, load_router_config
+        config = load_router_config(settings.router_config_path)
+        redis_client = None
+        if check_redis(settings):
+            bus = RedisBus(settings.redis_url)
+            redis_client = bus.client
+        router = build_router_for_task(
+            "structuring",
+            redis_client,
+            config,
+            settings.ollama_url,
+            settings.llm_mode,
+            settings.llm_timeout_seconds
+        )
+    except Exception:
+        try:
+            from langchain_ollama import ChatOllama
+            router = ChatOllama(
+                base_url=settings.ollama_url,
+                model=settings.local_model,
+                num_ctx=8192,
+                temperature=0.2
+            )
+        except Exception:
+            router = None
+
     client = StudentClient(
         server_url=resolved_server,
         session_id=session,
         profile=profile,
         output_dir=settings.output_dir / student_id,
         api_key=api_key,
+        llm_router=router,
         student_graph=graph
     )
 

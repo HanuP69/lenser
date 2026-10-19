@@ -5,7 +5,7 @@ Numbers refer to the bug list from the code review.
 ## Critical
 1. Importance flags: whole-word regexes, so "example", "latest", "finally", "unimportant" no longer match. (`core/importance.py`)
 2. Failed structuring batches are retried: the offset only advances after a batch succeeds. (`structuring_agent.py`)
-3. Structuring progress is a byte offset stored in `context.json`; flashcards live in `flashcards.jsonl`, so restarts neither duplicate notes nor drop cards.
+3. Structuring progress is a byte offset stored in `context.json`, so restarts neither duplicate notes nor drop progress.
 4. Only complete lines (ending in a newline) are consumed; a half-written line waits for the next pass.
 5. Real `stop` command and graceful shutdown: capture agents, then sync (drains Redis and flushes), then a final structuring pass. Ctrl+C in `start` does the same. (`cli/main.py`, `core/agent_runtime.py`)
 6. Sync holds entries by arrival time (`sync_merge_window_seconds`, default 30 s), orders each batch by event time, and structuring sorts its slice. (`sync_agent.py`)
@@ -22,9 +22,9 @@ Numbers refer to the bug list from the code review.
 15. Publishing is buffered in a bounded outbox while Redis is down and flushed when it returns.
 16. Logging everywhere; errors are no longer silently swallowed.
 17. Restart backoff with a failure cap; log handles are closed before reopening.
-18. Anki deck id is a CRC32 of the deck name; card text is HTML-escaped; stable note guids.
+18. Concept extraction with definitions stored into PostgreSQL durable storage.
 19. Screen gate: downscaled grayscale, changed-pixel fraction, settle detection, minimum interval; diffing runs off the event loop; default monitor is 1 (primary).
-20. OCR fallbacks run in pools/threads; Docker OCR is opt-in via `docker_ocr_url`.
+20. OCR vision fallbacks run in pools/threads.
 21. Image messages use the `{"url": ...}` form.
 22. Fallback only on provider failures; cloud providers are opt-in (`--llm-mode hybrid|cloud`) and skipped without API keys; per-call timeout; `num_ctx` set for Ollama.
 23. Whisper: VAD filter, no-speech/logprob filtering, hallucination phrase filter; language locking is opt-in (`whisper_lock_language`).
@@ -36,15 +36,15 @@ Numbers refer to the bug list from the code review.
 
 ## Medium
 29. `reprocess` resets outputs first and works in size-bounded batches.
-30. Flags are attributed to the specific lines that carry them; definition and exam lines steer extraction and flashcards.
+30. Flags are attributed to the specific lines that carry them; definition and exam lines steer extraction.
 31. QA: batched embeddings, incremental indexing with content-hash ids, stale notes removed, routed through the LLM router, sources returned.
-32. CLI: latest session is the default, validation of options, real dashboard (agents, queues, router status, latest transcript, entry count), `--course`, `session_meta.json`, PDF export.
+32. CLI: latest session is the default, validation of options, real dashboard (agents, queues, router status, latest transcript, entry count), `--course`, `session_meta.json`, markdown export.
 33. Unused settings are now used (`llm_mode`, thread pool size) or removed.
-34. See 18.
+34. Durable Postgres storage persister runs in independent shutdown phase with its own flag.
 35. Sync writes before removing entries from its buffer and flushes everything on shutdown.
 36. All agents read the session from `--session`.
 37. Rate limiter creates its key with a TTL before incrementing; breaker checked before the limiter.
-38. Dependencies corrected (`zeroconf` removed, `httpx`, `typing-extensions`, `reportlab` added).
+38. Dependencies corrected (`zeroconf` removed, `httpx`, `typing-extensions`, `psycopg` added).
 39. Models: `gemini-2.0-flash` was shut down by Google, replaced with `gemini-3.5-flash`; the OpenRouter entry now uses `openrouter/free`. Check both against your accounts.
 40. Test suite covering process-pool recovery, offsets, partial lines, shutdown ordering, gateway security, and markdown formatting resilience (see README for the current count).
 
@@ -73,11 +73,11 @@ Second review round. Everything below was reproduced before it was fixed and has
 10. `(Cont.)` / `(Continued)` markers are removed from every line, not only from lines that became headings.
 11. Heading recovery only promotes standalone lines (preceded by a blank line).
 12. Gateway: idle sessions are evicted (oldest first) instead of exhausting `gateway_max_sessions` forever; client capture timestamps no longer overwrite the shared session clock (they are range-checked and used per event). The remote client now sends them.
-13. Anki: prices such as `$5-$10` are left alone; short symbolic math (`$NP$`, `$f(x, y)$`, `$P(A|B)$`, `$2n$`) is converted.
-14. PDF: long code lines wrap instead of running off the page; inline and display LaTeX are converted to readable markup (fractions, sub/superscripts, Greek, relations).
+13. Concept definitions extracted by structuring are persisted with uniqueness per course and session.
+14. System and mixed audio recording supported with loopback soundcard backend.
 15. Concept graph: names are normalized and fuzzy-matched, so cross-lecture links survive rephrasing.
 16. `stop --timeout` defaults to 300 s (the worst-case shutdown is 180 s).
-17. Wizard: a key that failed its health check is no longer written to `.env`; model names come from `config/defaults.py` and settings (`local_model`, `embedding_model`) instead of being repeated in five files.
+17. Configuration: model names come from `config/defaults.py` and settings (`local_model`, `embedding_model`) with router `.env` propagation.
 
 ## Benchmarks and docs
 18. `benchmark_reproducible.py` warns loudly when it falls back to synthetic data, skips ASR cleanly when `faster-whisper` is missing, includes the thumbnail cost in the gate comparison, no longer assumes a 600 s session, and prints correct ms values.

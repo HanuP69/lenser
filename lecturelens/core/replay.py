@@ -46,7 +46,8 @@ class ReplayEngine:
         self,
         target_session_id: Optional[str] = None,
         on_entry: Optional[Callable[[TimelineEntry], Any]] = None,
-        publish_to_timeline_stream: bool = True
+        publish_to_timeline_stream: bool = True,
+        publish_to_source_streams: bool = False
     ) -> int:
         entries = self.load_entries()
         if not entries:
@@ -73,9 +74,13 @@ class ReplayEngine:
                 if asyncio.iscoroutine(result):
                     await result
 
-            if self.redis_bus is not None and publish_to_timeline_stream:
-                stream_name = f"lecturelens:{session_id}:stream:timeline"
-                await self.redis_bus.publish_resilient(stream_name, replayed_entry)
+            if self.redis_bus is not None:
+                if publish_to_timeline_stream:
+                    stream_name = f"lecturelens:{session_id}:stream:timeline"
+                    await self.redis_bus.publish_resilient(stream_name, replayed_entry)
+                if publish_to_source_streams and replayed_entry.source_type in ("transcript", "slide"):
+                    source_stream = f"lecturelens:{session_id}:stream:{replayed_entry.source_type}"
+                    await self.redis_bus.publish_resilient(source_stream, replayed_entry)
 
             replayed_count += 1
 

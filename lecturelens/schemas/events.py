@@ -114,6 +114,7 @@ class GeneralNoteSegment(BaseModel):
     key_points: list[str] = Field(default_factory=list)
     concept_tags: list[str] = Field(default_factory=list)
     slide_references: list[int] = Field(default_factory=list)
+    definitions: list[dict[str, str]] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -121,7 +122,7 @@ class GeneralNoteSegment(BaseModel):
         if not isinstance(data, dict):
             return data
         copied = dict(data)
-        for field in ("key_points", "concept_tags", "slide_references"):
+        for field in ("key_points", "concept_tags", "slide_references", "definitions"):
             val = copied.get(field)
             if isinstance(val, str):
                 trimmed = val.strip()
@@ -146,7 +147,8 @@ class GeneralNoteSegment(BaseModel):
             "content": self.content,
             "key_points": json.dumps(self.key_points),
             "concept_tags": json.dumps(self.concept_tags),
-            "slide_references": json.dumps(self.slide_references)
+            "slide_references": json.dumps(self.slide_references),
+            "definitions": json.dumps(self.definitions)
         }
         return result
 
@@ -155,6 +157,7 @@ class GeneralNoteSegment(BaseModel):
         key_points_raw = data.get("key_points", "[]")
         concept_tags_raw = data.get("concept_tags", "[]")
         slides_raw = data.get("slide_references", "[]")
+        definitions_raw = data.get("definitions", "[]")
         return cls(
             session_id=data["session_id"],
             lecture_id=data.get("lecture_id") or None,
@@ -166,7 +169,8 @@ class GeneralNoteSegment(BaseModel):
             content=data["content"],
             key_points=json.loads(key_points_raw) if key_points_raw else [],
             concept_tags=json.loads(concept_tags_raw) if concept_tags_raw else [],
-            slide_references=json.loads(slides_raw) if slides_raw else []
+            slide_references=json.loads(slides_raw) if slides_raw else [],
+            definitions=json.loads(definitions_raw) if definitions_raw else []
         )
 
 
@@ -266,6 +270,7 @@ class TimelineEntry(BaseModel):
     timestamp_epoch: float
     source_type: str
     content: str
+    elapsed_seconds: Optional[float] = Field(default=None)
     correlation_id: Optional[str] = Field(default=None)
     importance_flags: list[str] = Field(default_factory=list)
     metadata: dict = Field(default_factory=dict)
@@ -286,6 +291,7 @@ class TimelineEntry(BaseModel):
             "timestamp_epoch": str(self.timestamp_epoch),
             "source_type": self.source_type,
             "content": self.content,
+            "elapsed_seconds": "" if self.elapsed_seconds is None else str(self.elapsed_seconds),
             "correlation_id": "" if self.correlation_id is None else self.correlation_id,
             "importance_flags": ",".join(self.importance_flags),
             "metadata": json.dumps(self.metadata)
@@ -300,6 +306,9 @@ class TimelineEntry(BaseModel):
         parsed["timestamp_epoch"] = float(data["timestamp_epoch"])
         parsed["source_type"] = data["source_type"]
         parsed["content"] = data["content"]
+
+        elapsed_val = data.get("elapsed_seconds", "")
+        parsed["elapsed_seconds"] = float(elapsed_val) if elapsed_val else None
 
         correlation_value = data.get("correlation_id", "")
         parsed["correlation_id"] = None if correlation_value == "" else correlation_value

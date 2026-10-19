@@ -26,7 +26,9 @@ class TestHelpers(unittest.TestCase):
             helpers.validate_start_options("mic", "local", "cluster")
         with self.assertRaises(ValueError):
             helpers.validate_export_format("docx")
-        self.assertEqual(helpers.validate_export_format("pdf"), "pdf")
+        with self.assertRaises(ValueError):
+            helpers.validate_export_format("pdf")
+        self.assertEqual(helpers.validate_export_format("md"), "md")
 
     def test_format_elapsed(self) -> None:
         self.assertEqual(helpers.format_elapsed(3725.9), "01:02:05")

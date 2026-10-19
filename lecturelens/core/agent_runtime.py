@@ -20,6 +20,7 @@ logger = get_logger("lecturelens.runtime")
 STOP_FLAG_NAME = "stop.flag"
 SYNC_STOP_FLAG_NAME = "stop_sync.flag"
 FINALIZE_FLAG_NAME = "finalize.flag"
+PERSISTER_STOP_FLAG_NAME = "stop_persister.flag"
 PAUSE_FLAG_NAME = "pause.flag"
 SHUTDOWN_REQUEST_FLAG_NAME = "shutdown_request.flag"
 SESSION_FINISHED_FLAG_NAME = "session_finished.flag"

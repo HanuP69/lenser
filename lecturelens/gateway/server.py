@@ -6,18 +6,18 @@ import json
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from lecturelens.agents.audio_agent import AudioAgent
 from lecturelens.agents.screen_agent import ScreenAgent
 from lecturelens.config.settings import Settings
-from lecturelens.core.agent_runtime import execute_agent_main
+from lecturelens.core.agent_runtime import AgentControl, execute_agent_main, parse_runtime_arguments
 from lecturelens.core.clock import SessionClock
 from lecturelens.core.concurrency import configure_pools, shutdown_pools
 from lecturelens.core.logging_setup import get_logger
 from lecturelens.core.redis_bus import RedisBus
 from lecturelens.core.validation import is_valid_session_id
-from lecturelens.schemas.events import SlideCaptured, TranscriptChunk
+from lecturelens.schemas.events import GeneralNoteSegment, SlideCaptured, TranscriptChunk
 
 logger = get_logger("lecturelens.gateway")
 
@@ -342,6 +342,16 @@ class GatewayServer:
                             await client_queue.put({"type": "note_segment", "payload": note})
                     except Exception as replay_err:
                         logger.warning("postgres replay failed for %s: %s", session_id, replay_err)
+                elif self.storage is None and last_seq >= 0:
+                    try:
+                        missed = await self._replay_notes_from_redis(session_id, last_seq)
+                        for note in missed:
+                            note_seq = int(note.get("sequence_number", 0))
+                            if note_seq > highest_seq:
+                                highest_seq = note_seq
+                            await client_queue.put({"type": "note_segment", "payload": note})
+                    except Exception as replay_err:
+                        logger.warning("redis replay failed for %s: %s", session_id, replay_err)
 
                 for live_note in pending_live:
                     note_seq = int(live_note.get("sequence_number", 0))
@@ -384,6 +394,10 @@ class GatewayServer:
                             req_last_seq = int(message.get("last_sequence_number", 0))
                             if self.storage is not None and client_queue is not None:
                                 missed = await self.storage.get_general_notes_since(session_id, req_last_seq)
+                                for note in missed:
+                                    await client_queue.put({"type": "note_segment", "payload": note})
+                            elif self.storage is None and client_queue is not None:
+                                missed = await self._replay_notes_from_redis(session_id, req_last_seq)
                                 for note in missed:
                                     await client_queue.put({"type": "note_segment", "payload": note})
                             await self.send_json(websocket, {"status": "acknowledged"})
@@ -441,9 +455,29 @@ class GatewayServer:
         )
         logger.info("gateway listening on %s:%d", bind_host, bind_port)
 
-    async def serve_forever(self) -> None:
+    async def _replay_notes_from_redis(self, session_id: str, after_seq: int = 0) -> list[dict[str, Any]]:
+        stream_name = f"lecturelens:{session_id}:stream:notes"
+        try:
+            raw_entries = await self.redis_bus.client.xrange(stream_name, "-", "+")
+        except Exception as err:
+            logger.warning("xrange on %s failed: %s", stream_name, err)
+            return []
+        notes: list[dict[str, Any]] = []
+        for _, data in raw_entries:
+            try:
+                segment = GeneralNoteSegment.from_redis_dict(data)
+                if segment.sequence_number > after_seq:
+                    notes.append(segment.model_dump())
+            except Exception:
+                pass
+        notes.sort(key=lambda x: int(x.get("sequence_number", 0)))
+        return notes
+
+    async def serve_forever(self, should_stop: Optional[Callable[[], bool]] = None) -> None:
         while True:
-            await asyncio.sleep(1.0)
+            if should_stop is not None and should_stop():
+                break
+            await asyncio.sleep(0.5)
 
     async def stop(self) -> None:
         for task in self.fanout_tasks.values():
@@ -453,6 +487,13 @@ class GatewayServer:
             for wtask in session_writers.values():
                 if not wtask.done():
                     wtask.cancel()
+        for session_id in list(self.fanout_tasks.keys()):
+            stream_name = f"lecturelens:{session_id}:stream:notes"
+            group_name = f"group:gateway_{session_id}_{self.instance_id}"
+            try:
+                await self.redis_bus.client.xgroup_destroy(stream_name, group_name)
+            except Exception:
+                pass
         if self.server is not None:
             self.server.close()
             await self.server.wait_closed()
@@ -462,6 +503,12 @@ class GatewayServer:
 async def main() -> None:
     settings = Settings()
     configure_pools(settings.thread_pool_max_workers, settings.process_pool_max_workers)
+    namespace = parse_runtime_arguments()
+    session_id = namespace.session or settings.session_name or "default_session"
+    session_dir = settings.get_session_output_dir(session_id)
+    control = AgentControl(session_dir, "gateway")
+    control.write_heartbeat("live")
+    heartbeat_task = asyncio.create_task(control.heartbeat_loop())
     redis_bus = RedisBus(settings.redis_url)
     router = None
     try:
@@ -487,13 +534,16 @@ async def main() -> None:
     gateway = GatewayServer(settings, redis_bus, router, storage=storage)
     try:
         await gateway.start()
-        await gateway.serve_forever()
+        await gateway.serve_forever(should_stop=control.stop_requested)
     finally:
+        control.write_heartbeat("stopping")
+        heartbeat_task.cancel()
         await gateway.stop()
         if storage is not None:
             await storage.close()
         await redis_bus.close()
         shutdown_pools()
+        control.write_heartbeat("stopped")
 
 
 if __name__ == "__main__":

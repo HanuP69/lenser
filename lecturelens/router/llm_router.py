@@ -35,7 +35,30 @@ def is_provider_failure(error: BaseException) -> bool:
     return True
 
 
+def load_dotenv_into_environ() -> None:
+    for candidate in (Path.cwd() / ".env", Path(__file__).resolve().parent.parent.parent / ".env"):
+        if candidate.exists():
+            try:
+                with open(candidate, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip("'\"")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+                break
+            except Exception:
+                pass
+
+
+load_dotenv_into_environ()
+
+
 def load_router_config(config_path: Path) -> dict[str, Any]:
+    load_dotenv_into_environ()
     resolved_path = config_path
     if not resolved_path.exists():
         project_root_path = Path(__file__).resolve().parent.parent.parent / "router.yaml"
@@ -118,8 +141,12 @@ def create_base_chat_model(
     if provider_type == "google_genai":
         env_var_name = provider_config.get("api_key_env", "GOOGLE_API_KEY")
         api_key = os.environ.get(env_var_name, "")
+        if len(api_key) == 0 and env_var_name in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
+            api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
         if len(api_key) == 0:
             api_key = os.environ.get(f"LECTURELENS_{env_var_name}", "")
+        if len(api_key) == 0 and env_var_name in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
+            api_key = os.environ.get("LECTURELENS_GOOGLE_API_KEY") or os.environ.get("LECTURELENS_GEMINI_API_KEY", "")
         if len(api_key) == 0:
             logger.info("provider %s skipped: %s not set", provider_name, env_var_name)
             return None

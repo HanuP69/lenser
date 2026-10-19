@@ -3,7 +3,12 @@ import logging
 from typing import Any, Callable, Optional
 
 from lecturelens.config.settings import Settings
-from lecturelens.core.agent_runtime import AgentControl, execute_agent_main, parse_runtime_arguments
+from lecturelens.core.agent_runtime import (
+    PERSISTER_STOP_FLAG_NAME,
+    AgentControl,
+    execute_agent_main,
+    parse_runtime_arguments
+)
 from lecturelens.core.redis_bus import RedisBus
 from lecturelens.schemas.events import GeneralNoteSegment, TimelineEntry
 from lecturelens.storage.postgres import PostgresStorage
@@ -34,9 +39,12 @@ class PostgresPersister:
         stream_name: str
     ) -> None:
         try:
-            entry = TimelineEntry.from_jsonl_dict(message_data)
+            entry = TimelineEntry.from_redis_dict(message_data)
         except Exception:
-            entry = TimelineEntry(**message_data)
+            try:
+                entry = TimelineEntry.from_jsonl_dict(message_data)
+            except Exception:
+                entry = TimelineEntry(**message_data)
         await self.storage.insert_timeline_event(entry)
         await self.redis_bus.acknowledge(stream_name, self.group_name, message_id)
 
@@ -47,18 +55,30 @@ class PostgresPersister:
         stream_name: str
     ) -> None:
         try:
-            note = GeneralNoteSegment(**message_data)
-        except Exception as error:
-            logger.error("invalid general note payload: %s", error)
-            await self.redis_bus.acknowledge(stream_name, self.group_name, message_id)
-            return
+            note = GeneralNoteSegment.from_redis_dict(message_data)
+        except Exception:
+            try:
+                note = GeneralNoteSegment(**message_data)
+            except Exception as error:
+                logger.error("invalid general note payload: %s", error)
+                await self.redis_bus.acknowledge(stream_name, self.group_name, message_id)
+                return
 
         await self.storage.insert_general_note(note)
+        definitions_map: dict[str, str] = {}
+        for d in getattr(note, "definitions", []):
+            if isinstance(d, dict):
+                term = str(d.get("term", "")).strip()
+                def_text = str(d.get("definition", "")).strip()
+                if term and def_text:
+                    definitions_map[term.lower()] = def_text
+
         for tag in note.concept_tags:
+            def_text = definitions_map.get(tag.lower())
             await self.storage.insert_concept(
                 course_id=self.settings.course_name,
                 concept_name=tag,
-                definition=None,
+                definition=def_text,
                 related_concepts=[t for t in note.concept_tags if t != tag],
                 session_id=note.session_id,
                 timestamp_epoch=note.timestamp_epoch
@@ -136,7 +156,7 @@ async def main() -> None:
     storage = PostgresStorage(settings.postgres_url)
     await storage.init_schema()
     persister = PostgresPersister(settings, redis_bus, storage)
-    control = AgentControl(session_dir, "persister")
+    control = AgentControl(session_dir, "persister", stop_flag_name=PERSISTER_STOP_FLAG_NAME)
     control.write_heartbeat("live")
     heartbeat_task = asyncio.create_task(control.heartbeat_loop())
     try:

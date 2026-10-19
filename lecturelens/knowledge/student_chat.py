@@ -22,7 +22,7 @@ GUIDELINES:
 2. Cite specific timestamps in square brackets, e.g. [01:23] or [01:02:05], wherever referencing what was taught.
 3. Be aware of the student's known misconceptions and address them if relevant.
 4. If the student's question or statement reveals a fundamental misunderstanding or false assumption, gently clarify it and output an annotation at the very end in this exact format:
-   [MISCONCEPTION: {{"concept": "concept_name", "error": "what the student mistakenly thought", "correction": "correct explanation"}}]
+   [MISCONCEPTION: {"concept": "concept_name", "error": "what the student mistakenly thought", "correction": "correct explanation"}]
 5. Keep explanations direct, technically rigorous, and encouraging.
 """
 
@@ -55,8 +55,16 @@ class StudentChatAgent:
 
         if timeline_events:
             lines.append("\nLECTURE TIMELINE MOMENTS:")
+            first_epoch = float(timeline_events[0].get("timestamp_epoch", 0.0)) if timeline_events else 0.0
             for event in timeline_events[-max_events:]:
-                elapsed = float(event.get("elapsed_seconds", 0.0))
+                raw_elapsed = event.get("elapsed_seconds")
+                if raw_elapsed is None and isinstance(event.get("metadata"), dict):
+                    raw_elapsed = event["metadata"].get("start_seconds")
+                if raw_elapsed is None:
+                    cur_epoch = float(event.get("timestamp_epoch", 0.0))
+                    if cur_epoch >= first_epoch > 0:
+                        raw_elapsed = cur_epoch - first_epoch
+                elapsed = float(raw_elapsed or 0.0)
                 mins = int(elapsed // 60)
                 secs = int(elapsed % 60)
                 stamp = f"[{mins:02d}:{secs:02d}]"
