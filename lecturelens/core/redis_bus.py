@@ -149,6 +149,7 @@ class RedisBus:
         pass_message_id = handler_accepts_message_id(handler)
         for message_id, message_data in messages:
             failure_key = f"{stream_name}|{message_id}"
+            redis_retry_key = f"lecturelens:retry:{stream_name}:{group_name}:{message_id}"
             try:
                 if pass_message_id:
                     await handler(message_data, message_id)
@@ -158,6 +159,12 @@ class RedisBus:
                 raise
             except Exception as error:
                 failure_total = self.failure_counts.get(failure_key, 0) + 1
+                try:
+                    redis_count = await self.client.incr(redis_retry_key)
+                    await self.client.expire(redis_retry_key, 86400)
+                    failure_total = max(failure_total, redis_count)
+                except Exception:
+                    pass
                 self.failure_counts[failure_key] = failure_total
                 logger.error(
                     "handler failed for %s on %s (attempt %d): %s",
@@ -175,15 +182,29 @@ class RedisBus:
                         error
                     )
                     await self.client.xack(stream_name, group_name, message_id)
-                    del self.failure_counts[failure_key]
+                    try:
+                        await self.client.delete(redis_retry_key)
+                    except Exception:
+                        pass
+                    if failure_key in self.failure_counts:
+                        del self.failure_counts[failure_key]
                 continue
             if auto_ack:
                 await self.client.xack(stream_name, group_name, message_id)
+                try:
+                    await self.client.delete(redis_retry_key)
+                except Exception:
+                    pass
             if failure_key in self.failure_counts:
                 del self.failure_counts[failure_key]
 
     async def acknowledge(self, stream_name: str, group_name: str, message_id: str) -> None:
         await self.client.xack(stream_name, group_name, message_id)
+        redis_retry_key = f"lecturelens:retry:{stream_name}:{group_name}:{message_id}"
+        try:
+            await self.client.delete(redis_retry_key)
+        except Exception:
+            pass
 
     async def consume(
         self,

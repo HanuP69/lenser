@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import time
 from typing import Any, Optional
 
 from lecturelens.knowledge.student_graph import StudentKnowledgeGraph
@@ -98,8 +99,23 @@ class StudentChatAgent:
                 error = str(data.get("error", ""))
                 correction = str(data.get("correction", ""))
                 self.student_graph.record_misconception(concept, error, correction)
+                self.student_graph.record_evidence(
+                    concept_name=concept,
+                    lecture_id="live_session",
+                    timestamp_epoch=time.time(),
+                    evidence_type="student_chat_misconception",
+                    excerpt=f"Q: {question} | Error: {error}"
+                )
             except Exception as parse_error:
                 logger.warning("could not parse misconception tag: %s", parse_error)
+        elif self.student_graph is not None:
+            self.student_graph.record_evidence(
+                concept_name="general",
+                lecture_id="live_session",
+                timestamp_epoch=time.time(),
+                evidence_type="student_chat_inquiry",
+                excerpt=question[:200]
+            )
 
         clean_answer = MISCONCEPTION_TAG_PATTERN.sub("", raw_answer).strip()
         return clean_answer, citations

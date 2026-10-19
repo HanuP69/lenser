@@ -64,6 +64,15 @@ class TestPersonalizationEngine(unittest.IsolatedAsyncioTestCase):
         result = await engine.rewrite_segment(segment)
         self.assertEqual(result, segment.content)
 
+    async def test_english_profile_with_concise_detail_rewrites(self) -> None:
+        profile = StudentProfile(preferred_language="English", detail_level="concise")
+        router = MockLLMRouter("Binary search halves search space in O(log n) time. [00:01:00] binary search complexity")
+        engine = PersonalizationEngine(profile, router)
+        segment = self.make_sample_segment()
+        result = await engine.rewrite_segment(segment)
+        self.assertIn("halves search space", result)
+        self.assertEqual(len(router.invoked_prompts), 1)
+
 
 class TestStudentClient(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
@@ -117,6 +126,66 @@ class TestStudentClient(unittest.IsolatedAsyncioTestCase):
         result = await client.on_note_segment_received(segment)
         self.assertEqual(result, "")
         self.assertEqual(client.last_sequence_number, 5)
+
+    async def test_client_buffers_gap_and_drains_when_missing_segment_arrives(self) -> None:
+        profile = StudentProfile(student_id="student_gap", preferred_language="English")
+        client = StudentClient("ws://localhost:8765", "lec_gap", profile, self.output_dir)
+        client.last_sequence_number = 1
+
+        seg3 = GeneralNoteSegment(
+            session_id="lec_gap",
+            sequence_number=3,
+            timestamp_epoch=1700000020.0,
+            start_time="00:00:20",
+            end_time="00:00:30",
+            heading="Section 3",
+            content="Third section content.",
+            key_points=[],
+            concept_tags=[]
+        )
+        seg2 = GeneralNoteSegment(
+            session_id="lec_gap",
+            sequence_number=2,
+            timestamp_epoch=1700000010.0,
+            start_time="00:00:10",
+            end_time="00:00:20",
+            heading="Section 2",
+            content="Second section content.",
+            key_points=[],
+            concept_tags=[]
+        )
+
+        res3 = await client.on_note_segment_received(seg3)
+        self.assertEqual(res3, "")
+        self.assertEqual(client.last_sequence_number, 1)
+        self.assertIn(3, client.pending_segments)
+
+        res2 = await client.on_note_segment_received(seg2)
+        self.assertEqual(client.last_sequence_number, 3)
+        self.assertEqual(len(client.pending_segments), 0)
+        written_text = client.notes_file.read_text(encoding="utf-8")
+        self.assertIn("Second section content.", written_text)
+        self.assertIn("Third section content.", written_text)
+
+    async def test_client_persists_sequence_number_across_instances(self) -> None:
+        profile = StudentProfile(student_id="student_persist", preferred_language="English")
+        client1 = StudentClient("ws://localhost:8765", "lec_p", profile, self.output_dir)
+        seg1 = GeneralNoteSegment(
+            session_id="lec_p",
+            sequence_number=1,
+            timestamp_epoch=1700000010.0,
+            start_time="00:00:10",
+            end_time="00:00:20",
+            heading="Section 1",
+            content="Content 1",
+            key_points=[],
+            concept_tags=[]
+        )
+        await client1.on_note_segment_received(seg1)
+        self.assertEqual(client1.last_sequence_number, 1)
+
+        client2 = StudentClient("ws://localhost:8765", "lec_p", profile, self.output_dir)
+        self.assertEqual(client2.last_sequence_number, 1)
 
 
 if __name__ == "__main__":

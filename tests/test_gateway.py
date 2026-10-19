@@ -28,6 +28,12 @@ class FakeBus:
         self.published.append((stream_name, event))
         return "1-1"
 
+    async def ensure_consumer_group(self, stream_name: str, group_name: str) -> None:
+        pass
+
+    async def consume(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
 
 class FakeWebSocket:
     def __init__(self, frames: list[str]) -> None:
@@ -312,6 +318,110 @@ class TestGatewayMessages(GatewayTestBase):
         self.assertEqual(len(socket_b.sent), 1)
         self.assertEqual(socket_a.sent[0]["payload"]["sequence_number"], 5)
         self.assertEqual(socket_b.sent[0]["payload"]["sequence_number"], 5)
+
+
+    async def test_reconnect_race_buffers_live_notes_and_delivers_in_order(self) -> None:
+        class DelayNotesStorage:
+            def __init__(self, gateway_ref: Any) -> None:
+                self.gateway_ref = gateway_ref
+
+            async def get_general_notes_since(self, session_id: str, after_seq: int) -> list[dict]:
+                await self.gateway_ref.broadcast_note_segment(
+                    session_id, {"sequence_number": 4, "content": "Live Note 4"}
+                )
+                await asyncio.sleep(0.02)
+                return [
+                    {"sequence_number": 2, "heading": "Part 2", "content": "Text 2"},
+                    {"sequence_number": 3, "heading": "Part 3", "content": "Text 3"}
+                ]
+
+        self.gateway.storage = DelayNotesStorage(self.gateway)
+        sub_hello = json.dumps({
+            "type": "hello",
+            "api_key": "secret",
+            "session_id": "room1",
+            "role": "subscriber",
+            "last_sequence_number": 1
+        })
+        socket = FakeWebSocket([sub_hello])
+        await self.gateway.handle_connection(socket)
+
+        note_payloads = [msg["payload"] for msg in socket.sent if msg.get("type") == "note_segment"]
+        self.assertEqual(len(note_payloads), 3)
+        self.assertEqual(note_payloads[0]["sequence_number"], 2)
+        self.assertEqual(note_payloads[1]["sequence_number"], 3)
+        self.assertEqual(note_payloads[2]["sequence_number"], 4)
+
+    async def test_subscribers_are_read_only_and_cannot_push_capture_events(self) -> None:
+        class DummyStorage:
+            async def get_general_notes_since(self, session_id: str, after_seq: int) -> list[dict]:
+                return []
+
+        self.gateway.storage = DummyStorage()
+        sub_hello = json.dumps({
+            "type": "hello",
+            "api_key": "secret",
+            "session_id": "room1",
+            "role": "subscriber"
+        })
+        push_audio = json.dumps({"type": "audio", "wav_b64": base64.b64encode(b"dummy").decode()})
+        socket = FakeWebSocket([sub_hello, push_audio])
+        await self.gateway.handle_connection(socket)
+
+        replies = socket.sent
+        self.assertTrue(any(r.get("error") == "subscribers are read-only" for r in replies))
+
+    async def test_subscriber_rejected_if_session_does_not_exist(self) -> None:
+        self.gateway.storage = None
+        sub_hello = json.dumps({
+            "type": "hello",
+            "api_key": "secret",
+            "session_id": "nonexistent_room_999",
+            "role": "subscriber"
+        })
+        socket = FakeWebSocket([sub_hello])
+        await self.gateway.handle_connection(socket)
+
+        self.assertEqual(socket.sent[0]["status"], "unauthorized")
+        self.assertEqual(socket.sent[0]["error"], "session does not exist")
+        self.assertNotIn("nonexistent_room_999", self.gateway.sessions)
+
+    def test_two_gateway_fanout_distinct_groups(self) -> None:
+        gw1 = GatewayServer(self.settings, self.bus, instance_id="gw_alpha")
+        gw2 = GatewayServer(self.settings, self.bus, instance_id="gw_beta")
+        self.assertNotEqual(gw1.instance_id, gw2.instance_id)
+
+        group1 = f"group:gateway_room1_{gw1.instance_id}"
+        group2 = f"group:gateway_room1_{gw2.instance_id}"
+        self.assertNotEqual(group1, group2)
+
+    async def test_datetime_serialization_in_replay(self) -> None:
+        from datetime import datetime, timezone
+        now_dt = datetime.now(timezone.utc)
+
+        class DateTimeStorage:
+            async def get_general_notes_since(self, session_id: str, after_seq: int) -> list[dict]:
+                return [{
+                    "sequence_number": 2,
+                    "heading": "Part 2",
+                    "content": "Text 2",
+                    "created_at": now_dt
+                }]
+
+        self.gateway.storage = DateTimeStorage()
+        sub_hello = json.dumps({
+            "type": "hello",
+            "api_key": "secret",
+            "session_id": "room1",
+            "role": "subscriber",
+            "last_sequence_number": 1
+        })
+        socket = FakeWebSocket([sub_hello])
+        await self.gateway.handle_connection(socket)
+
+        note_payloads = [msg["payload"] for msg in socket.sent if msg.get("type") == "note_segment"]
+        self.assertEqual(len(note_payloads), 1)
+        self.assertEqual(note_payloads[0]["sequence_number"], 2)
 
 
 class TestRateLimiter(unittest.TestCase):

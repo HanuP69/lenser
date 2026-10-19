@@ -136,7 +136,8 @@ def plan_agents(
     mode: str,
     audio_only: bool,
     no_camera: bool = False,
-    no_screen: bool = False
+    no_screen: bool = False,
+    enable_persister: bool = False
 ) -> list[str]:
     planned = ["sync_agent", "structuring_agent", "audio_agent"]
     if not audio_only:
@@ -144,12 +145,16 @@ def plan_agents(
             planned.append("screen_agent")
     if mode == "server":
         planned.append("gateway")
+    if enable_persister or mode == "server":
+        planned.append("persister")
     return planned
 
 
 def module_for_agent(agent_name: str) -> str:
     if agent_name == "gateway":
         return "lecturelens.gateway.server"
+    if agent_name == "persister":
+        return "lecturelens.storage.persister"
     return f"lecturelens.agents.{agent_name}"
 
 
@@ -283,7 +288,8 @@ def run_shutdown(monitor: AgentMonitor, session_dir: Path, planned_agents: list[
     phases: list[tuple[list[str], str, Optional[float]]] = [
         (capture_names, STOP_FLAG_NAME, 30.0),
         (["sync_agent"], SYNC_STOP_FLAG_NAME, 30.0),
-        (["structuring_agent"], FINALIZE_FLAG_NAME, 120.0)
+        (["structuring_agent"], FINALIZE_FLAG_NAME, 120.0),
+        (["persister"], STOP_FLAG_NAME, 10.0)
     ]
     with console.status("[bold cyan]Stopping agents, flushing timeline, and generating final notes with LLM...[/bold cyan]", spinner="dots"):
         monitor.run_shutdown_sequence(session_dir, phases)
@@ -590,14 +596,26 @@ def ask(
                 )
             except Exception as error:
                 console.print(f"[yellow]Router unavailable, using Ollama directly: {error}[/yellow]")
+            storage = None
+            if settings.postgres_url:
+                try:
+                    from lecturelens.storage.postgres import PostgresStorage
+                    storage = PostgresStorage(settings.postgres_url)
+                except Exception:
+                    storage = None
             engine = QAEngine(
                 session_dir,
                 settings.ollama_url,
                 router,
                 embedding_model=settings.embedding_model,
-                fallback_model=settings.local_model
+                fallback_model=settings.local_model,
+                storage=storage
             )
-            return await engine.ask_with_sources(question)
+            try:
+                return await engine.ask_with_sources(question)
+            finally:
+                if storage is not None:
+                    await storage.close()
         finally:
             await bus.close()
 
@@ -616,9 +634,113 @@ def ask(
 def review(
     course: Optional[str] = typer.Option(None, "--course"),
     session: Optional[str] = typer.Option(None, "--session"),
+    student_id: Optional[str] = typer.Option(None, "--student-id"),
 ) -> None:
     settings = Settings()
-    console.print("Concept review is available through Postgres storage and the student client graph.")
+    if student_id and isinstance(student_id, str):
+        from lecturelens.knowledge.student_graph import StudentKnowledgeGraph
+        graph_db = settings.output_dir / student_id / "student_graph.db"
+        if graph_db.exists():
+            graph = StudentKnowledgeGraph(graph_db)
+            summary = graph.get_student_summary()
+            console.print(f"[bold]Student {student_id} Mastery Summary[/bold]")
+            console.print(f"Concepts tracked: {summary['concepts_tracked']}, Misconceptions: {summary['total_misconceptions']}")
+            for c in summary["concepts"][:10]:
+                decayed = c.get("decayed_mastery", c["mastery_level"])
+                console.print(f"  - {c['concept_name']}: mastery {c['mastery_level']:.2f} (decayed: {decayed:.2f})")
+            return
+    if settings.postgres_url:
+        from lecturelens.storage.postgres import PostgresStorage
+
+        course_val = course if isinstance(course, str) else None
+        session_val = session if isinstance(session, str) else None
+
+        async def fetch():
+            storage = PostgresStorage(settings.postgres_url)
+            try:
+                if course_val:
+                    return await storage.get_concepts_for_course(course_val)
+                elif session_val:
+                    return await storage.get_all_concepts_for_session(session_val)
+                return []
+            finally:
+                await storage.close()
+
+        try:
+            concepts = asyncio.run(fetch())
+            if concepts:
+                console.print(f"[bold]Concepts ({len(concepts)})[/bold]")
+                for c in concepts:
+                    console.print(f"  - {c['concept_name']}: {c.get('definition') or 'No definition'} (Related: {', '.join(c.get('related_concepts') or [])})")
+                return
+        except Exception as err:
+            console.print(f"[yellow]Could not query Postgres concepts: {err}[/yellow]")
+    console.print("No review records found.")
+
+
+@app.command()
+def student(
+    server: str = typer.Option("ws://127.0.0.1:8765", "--server", help="WebSocket URL of lecture gateway"),
+    session: str = typer.Option(..., "--session", help="Session ID to subscribe to"),
+    student_id: str = typer.Option("student_1", "--student-id", help="Unique student ID"),
+    language: str = typer.Option("English", "--language", help="Target language/style (e.g. English, Hindi, Hinglish)"),
+    detail: str = typer.Option("comprehensive", "--detail", help="Detail level (comprehensive, concise, beginner)"),
+    api_key: Optional[str] = typer.Option(None, "--api-key", envvar="LECTURELENS_GATEWAY_API_KEY"),
+) -> None:
+    settings = Settings()
+    from lecturelens.client.student_client import StudentClient, StudentProfile
+    from lecturelens.knowledge.student_graph import StudentKnowledgeGraph
+
+    profile = StudentProfile(
+        student_id=student_id,
+        preferred_language=language,
+        detail_level=detail
+    )
+    graph_db = settings.output_dir / student_id / "student_graph.db"
+    graph = StudentKnowledgeGraph(graph_db)
+
+    client = StudentClient(
+        server_url=server,
+        session_id=session,
+        profile=profile,
+        output_dir=settings.output_dir / student_id,
+        api_key=api_key
+    )
+
+    console.print(f"[green]Connecting student client '{student_id}' to {server} (session: {session}, language: {language})...[/green]")
+    try:
+        asyncio.run(client.run())
+    except KeyboardInterrupt:
+        console.print("[yellow]Student client stopped.[/yellow]")
+
+
+@app.command()
+def persister(
+    session: Optional[str] = typer.Option(None, "--session", help="Session ID to persist"),
+) -> None:
+    settings = Settings()
+    if not settings.postgres_url:
+        fail("LECTURELENS_POSTGRES_URL is not configured.")
+    session_id = resolve_session(settings, session)
+    from lecturelens.storage.persister import PostgresPersister
+    from lecturelens.storage.postgres import PostgresStorage
+
+    async def run() -> None:
+        redis_bus = RedisBus(settings.redis_url)
+        storage = PostgresStorage(settings.postgres_url)
+        await storage.init_schema()
+        persister_worker = PostgresPersister(settings, redis_bus, storage)
+        console.print(f"[green]Persister listening on streams for session {session_id}...[/green]")
+        try:
+            await persister_worker.run_for_session(session_id)
+        finally:
+            await storage.close()
+            await redis_bus.close()
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        console.print("[yellow]Persister stopped.[/yellow]")
 
 
 @app.command()

@@ -4,6 +4,7 @@ import binascii
 import hmac
 import json
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -100,36 +101,57 @@ class GatewayServer:
         settings: Settings,
         redis_bus: RedisBus,
         llm_router: Any = None,
-        storage: Any = None
+        storage: Any = None,
+        instance_id: Optional[str] = None
     ) -> None:
         validate_gateway_binding(settings.gateway_host, settings.gateway_api_key)
         self.settings: Settings = settings
         self.redis_bus: RedisBus = redis_bus
         self.llm_router: Any = llm_router
         self.storage: Any = storage
+        self.instance_id: str = instance_id or uuid.uuid4().hex[:8]
         self.sessions: dict[str, SessionRuntime] = {}
-        self.subscribers: dict[str, set[Any]] = {}
+        self.subscribers: dict[str, Any] = {}
+        self.catching_up: dict[str, dict[Any, list[dict[str, Any]]]] = {}
+        self.subscriber_writers: dict[str, dict[Any, asyncio.Task]] = {}
         self.fanout_tasks: dict[str, asyncio.Task] = {}
         self.server: Any = None
 
     async def broadcast_note_segment(self, session_id: str, note_data: dict[str, Any]) -> None:
-        subscribers = list(self.subscribers.get(session_id, set()))
-        if not subscribers:
+        if session_id in self.catching_up:
+            for pending_list in list(self.catching_up[session_id].values()):
+                pending_list.append(note_data)
+
+        subs = self.subscribers.get(session_id)
+        if not subs:
             return
+
         payload = {"type": "note_segment", "payload": note_data}
-        dead_sockets: list[Any] = []
-        for ws in subscribers:
-            try:
-                await self.send_json(ws, payload)
-            except Exception:
-                dead_sockets.append(ws)
-        if dead_sockets and session_id in self.subscribers:
+        if isinstance(subs, dict):
+            dead_sockets: list[Any] = []
+            for ws, q in list(subs.items()):
+                try:
+                    q.put_nowait(payload)
+                except asyncio.QueueFull:
+                    logger.warning("subscriber queue full for %s, dropping slow frame", session_id)
+                except Exception:
+                    dead_sockets.append(ws)
             for dead in dead_sockets:
-                self.subscribers[session_id].discard(dead)
+                subs.pop(dead, None)
+        elif isinstance(subs, (set, list)):
+            dead_sockets = []
+            for ws in list(subs):
+                try:
+                    await self.send_json(ws, payload)
+                except Exception:
+                    dead_sockets.append(ws)
+            if dead_sockets and session_id in self.subscribers:
+                for dead in dead_sockets:
+                    self.subscribers[session_id].discard(dead)
 
     async def run_notes_fanout(self, session_id: str) -> None:
         stream_name = f"lecturelens:{session_id}:stream:notes"
-        group_name = f"group:gateway_{session_id}"
+        group_name = f"group:gateway_{session_id}_{self.instance_id}"
         await self.redis_bus.ensure_consumer_group(stream_name, group_name)
 
         async def handler(data: dict[str, Any]) -> None:
@@ -139,7 +161,7 @@ class GatewayServer:
             await self.redis_bus.consume(
                 stream_name=stream_name,
                 group_name=group_name,
-                consumer_name=f"gateway_fanout_{session_id}",
+                consumer_name=f"gateway_{self.instance_id}_{session_id}",
                 handler=handler,
                 batch_size=5,
                 block_ms=500
@@ -232,13 +254,44 @@ class GatewayServer:
             return {"status": "acknowledged"}
         raise ValueError("unknown message type")
 
+    async def check_session_exists(self, session_id: str) -> bool:
+        if session_id in self.sessions:
+            return True
+        session_dir = self.settings.get_session_output_dir(session_id)
+        if session_dir.exists():
+            return True
+        if self.storage is not None:
+            if hasattr(self.storage, "session_exists"):
+                try:
+                    if await self.storage.session_exists(session_id):
+                        return True
+                except Exception:
+                    pass
+            elif hasattr(self.storage, "get_general_notes_since"):
+                return True
+        return False
+
+    async def _subscriber_writer(self, websocket: Any, queue: asyncio.Queue) -> None:
+        try:
+            while True:
+                payload = await queue.get()
+                if payload is None:
+                    break
+                await self.send_json(websocket, payload)
+                queue.task_done()
+        except Exception:
+            pass
+
     async def send_json(self, websocket: Any, payload: dict[str, Any]) -> None:
-        await websocket.send(json.dumps(payload))
+        await websocket.send(json.dumps(payload, default=str))
 
     async def handle_connection(self, websocket: Any) -> None:
         runtime: Optional[SessionRuntime] = None
         limiter = MessageRateLimiter(self.settings.gateway_messages_per_second)
         session_id: Optional[str] = None
+        writer_task: Optional[asyncio.Task] = None
+        client_queue: Optional[asyncio.Queue] = None
+        is_subscriber = False
         try:
             first_frame = await asyncio.wait_for(websocket.recv(), timeout=10.0)
             try:
@@ -246,33 +299,70 @@ class GatewayServer:
                 if not isinstance(hello_message, dict):
                     raise PermissionError("malformed hello")
                 session_id = self.authenticate(hello_message)
-                runtime = self.get_or_create_session(session_id)
+                is_subscriber = (
+                    hello_message.get("role") in ("subscriber", "student")
+                    or hello_message.get("subscribe") is True
+                )
+                if is_subscriber:
+                    session_found = await self.check_session_exists(session_id)
+                    if not session_found:
+                        await self.send_json(websocket, {"status": "unauthorized", "error": "session does not exist"})
+                        await websocket.close()
+                        return
+                else:
+                    runtime = self.get_or_create_session(session_id)
+                    runtime.connection_count += 1
             except (ValueError, PermissionError) as error:
                 await self.send_json(websocket, {"status": "unauthorized", "error": str(error)})
                 await websocket.close()
                 return
-            runtime.connection_count += 1
+
             await self.send_json(websocket, {"status": "authenticated", "session_id": session_id})
 
-            is_subscriber = (
-                hello_message.get("role") in ("subscriber", "student")
-                or hello_message.get("subscribe") is True
-            )
             if is_subscriber:
-                if session_id not in self.subscribers:
-                    self.subscribers[session_id] = set()
-                self.subscribers[session_id].add(websocket)
+                client_queue = asyncio.Queue(maxsize=200)
+                writer_task = asyncio.create_task(self._subscriber_writer(websocket, client_queue))
+
+                if session_id not in self.catching_up:
+                    self.catching_up[session_id] = {}
+                pending_live: list[dict[str, Any]] = []
+                self.catching_up[session_id][websocket] = pending_live
+
                 if session_id not in self.fanout_tasks or self.fanout_tasks[session_id].done():
                     self.fanout_tasks[session_id] = asyncio.create_task(self.run_notes_fanout(session_id))
 
                 last_seq = int(hello_message.get("last_sequence_number", 0))
+                highest_seq = last_seq
                 if self.storage is not None and last_seq >= 0:
                     try:
                         missed = await self.storage.get_general_notes_since(session_id, last_seq)
                         for note in missed:
-                            await self.send_json(websocket, {"type": "note_segment", "payload": note})
+                            note_seq = int(note.get("sequence_number", 0))
+                            if note_seq > highest_seq:
+                                highest_seq = note_seq
+                            await client_queue.put({"type": "note_segment", "payload": note})
                     except Exception as replay_err:
                         logger.warning("postgres replay failed for %s: %s", session_id, replay_err)
+
+                for live_note in pending_live:
+                    note_seq = int(live_note.get("sequence_number", 0))
+                    if note_seq > highest_seq:
+                        highest_seq = note_seq
+                        await client_queue.put({"type": "note_segment", "payload": live_note})
+
+                if session_id in self.catching_up and websocket in self.catching_up[session_id]:
+                    del self.catching_up[session_id][websocket]
+
+                if session_id not in self.subscribers:
+                    self.subscribers[session_id] = {}
+                if isinstance(self.subscribers[session_id], dict):
+                    self.subscribers[session_id][websocket] = client_queue
+                elif isinstance(self.subscribers[session_id], set):
+                    self.subscribers[session_id].add(websocket)
+
+                if session_id not in self.subscriber_writers:
+                    self.subscriber_writers[session_id] = {}
+                self.subscriber_writers[session_id][websocket] = writer_task
 
             async for raw_frame in websocket:
                 if not limiter.allow():
@@ -282,6 +372,26 @@ class GatewayServer:
                     message = json.loads(raw_frame)
                     if not isinstance(message, dict):
                         raise ValueError("message must be an object")
+
+                    if is_subscriber:
+                        msg_type = message.get("type")
+                        if msg_type in ("audio", "screen", "event"):
+                            await self.send_json(websocket, {"status": "error", "error": "subscribers are read-only"})
+                            continue
+                        if msg_type == "ping":
+                            await self.send_json(websocket, {"type": "pong"})
+                            continue
+                        if msg_type == "request_replay":
+                            req_last_seq = int(message.get("last_sequence_number", 0))
+                            if self.storage is not None and client_queue is not None:
+                                missed = await self.storage.get_general_notes_since(session_id, req_last_seq)
+                                for note in missed:
+                                    await client_queue.put({"type": "note_segment", "payload": note})
+                            await self.send_json(websocket, {"status": "acknowledged"})
+                            continue
+                        await self.send_json(websocket, {"status": "error", "error": "unsupported subscriber message"})
+                        continue
+
                     reply = await self.handle_message(runtime, message)
                 except (ValueError, KeyError) as error:
                     reply = {"status": "error", "error": str(error)}
@@ -296,8 +406,22 @@ class GatewayServer:
         except Exception as error:
             logger.info("connection ended: %s", error)
         finally:
+            if session_id and session_id in self.catching_up and websocket in self.catching_up[session_id]:
+                del self.catching_up[session_id][websocket]
             if session_id and session_id in self.subscribers:
-                self.subscribers[session_id].discard(websocket)
+                if isinstance(self.subscribers[session_id], dict):
+                    self.subscribers[session_id].pop(websocket, None)
+                elif isinstance(self.subscribers[session_id], set):
+                    self.subscribers[session_id].discard(websocket)
+            if session_id and session_id in self.subscriber_writers:
+                self.subscriber_writers[session_id].pop(websocket, None)
+            if client_queue is not None:
+                try:
+                    await asyncio.wait_for(client_queue.join(), timeout=0.5)
+                except Exception:
+                    pass
+            if writer_task is not None and not writer_task.done():
+                writer_task.cancel()
             if runtime is not None:
                 runtime.connection_count -= 1
                 runtime.last_active = time.monotonic()
@@ -326,6 +450,10 @@ class GatewayServer:
         for task in self.fanout_tasks.values():
             if not task.done():
                 task.cancel()
+        for session_writers in self.subscriber_writers.values():
+            for wtask in session_writers.values():
+                if not wtask.done():
+                    wtask.cancel()
         if self.server is not None:
             self.server.close()
             await self.server.wait_closed()
@@ -346,12 +474,25 @@ async def main() -> None:
         )
     except Exception as error:
         logger.warning("gateway vision router unavailable: %s", error)
-    gateway = GatewayServer(settings, redis_bus, router)
+
+    storage = None
+    if settings.postgres_url:
+        try:
+            from lecturelens.storage.postgres import PostgresStorage
+            storage = PostgresStorage(settings.postgres_url)
+            await storage.init_schema()
+        except Exception as error:
+            logger.warning("gateway postgres storage initialization failed: %s", error)
+            storage = None
+
+    gateway = GatewayServer(settings, redis_bus, router, storage=storage)
     try:
         await gateway.start()
         await gateway.serve_forever()
     finally:
         await gateway.stop()
+        if storage is not None:
+            await storage.close()
         await redis_bus.close()
         shutdown_pools()
 

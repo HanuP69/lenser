@@ -239,8 +239,10 @@ class PostgresStorage:
             course_id, concept_name, definition, related_concepts, session_id, timestamp_epoch
         ) VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT (course_id, concept_name) DO UPDATE SET
-            definition = EXCLUDED.definition,
-            related_concepts = EXCLUDED.related_concepts,
+            definition = COALESCE(NULLIF(EXCLUDED.definition, ''), concepts.definition),
+            related_concepts = ARRAY(
+                SELECT DISTINCT unnest(COALESCE(concepts.related_concepts, '{}'::text[]) || COALESCE(EXCLUDED.related_concepts, '{}'::text[]))
+            ),
             session_id = EXCLUDED.session_id,
             timestamp_epoch = EXCLUDED.timestamp_epoch;
         """
@@ -278,9 +280,9 @@ class PostgresStorage:
         after_sequence_number: int = 0
     ) -> list[dict[str, Any]]:
         query = """
-        SELECT id, session_id, lecture_id, sequence_number, heading, content,
+        SELECT session_id, lecture_id, sequence_number, heading, content,
                key_points, concept_tags, slide_references, timestamp_epoch,
-               start_time, end_time, created_at
+               start_time, end_time
         FROM general_notes
         WHERE session_id = %s AND sequence_number > %s
         ORDER BY sequence_number ASC;
@@ -289,6 +291,66 @@ class PostgresStorage:
         async with conn.cursor() as cur:
             await cur.execute(query, (session_id, after_sequence_number))
             return await cur.fetchall()
+
+    async def session_exists(self, session_id: str) -> bool:
+        query = """
+        SELECT 1 FROM timeline_events WHERE session_id = %s
+        UNION ALL
+        SELECT 1 FROM general_notes WHERE session_id = %s
+        LIMIT 1;
+        """
+        conn = await self.get_connection()
+        async with conn.cursor() as cur:
+            await cur.execute(query, (session_id, session_id))
+            return (await cur.fetchone()) is not None
+
+    async def insert_embedding(
+        self,
+        session_id: str,
+        source_type: str,
+        source_id: str,
+        chunk_text: str,
+        vector: Optional[list[float]] = None
+    ) -> bool:
+        conn = await self.get_connection()
+        async with conn.cursor() as cur:
+            if vector is not None:
+                query = """
+                INSERT INTO embeddings (session_id, source_type, source_id, chunk_text, embedding)
+                VALUES (%s, %s, %s, %s, %s::vector);
+                """
+                await cur.execute(query, (session_id, source_type, source_id, chunk_text, vector))
+            else:
+                query = """
+                INSERT INTO embeddings (session_id, source_type, source_id, chunk_text)
+                VALUES (%s, %s, %s, %s);
+                """
+                await cur.execute(query, (session_id, source_type, source_id, chunk_text))
+            await conn.commit()
+            return True
+
+    async def search_embeddings(
+        self,
+        session_id: str,
+        query_vector: list[float],
+        top_k: int = 5
+    ) -> list[dict[str, Any]]:
+        query = """
+        SELECT chunk_text, source_id, source_type, (embedding <=> %s::vector) AS distance
+        FROM embeddings
+        WHERE session_id = %s AND embedding IS NOT NULL
+        ORDER BY distance ASC
+        LIMIT %s;
+        """
+        conn = await self.get_connection()
+        async with conn.cursor() as cur:
+            try:
+                await cur.execute(query, (query_vector, session_id, top_k))
+                return await cur.fetchall()
+            except Exception as err:
+                await conn.rollback()
+                logger.warning("vector search unavailable in postgres: %s", err)
+                return []
 
     async def get_concepts_for_course(self, course_id: str) -> list[dict[str, Any]]:
         query = """

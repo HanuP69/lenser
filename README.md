@@ -223,12 +223,12 @@ Each student maintains an isolated, private SQLite database (`student_graph.db`)
 
 ---
 
-## Automated Test Suite (256 Tests)
+## Automated Test Suite (269 Tests)
 
-LectureLens maintains an automated test suite of **256 unit and integration tests** verifying concurrency, resilience, audio processing, screen capture, Postgres persistence, gateway fan-out, client personalization, and knowledge graphs:
+LectureLens maintains an automated test suite of **269 unit and integration tests** verifying concurrency, resilience, audio processing, screen capture, Postgres persistence, gateway fan-out, client personalization, and knowledge graphs:
 
 ```
-================= 255 passed, 1 skipped in 28.07s =================
+================= 266 passed, 3 skipped in 27.38s =================
 ```
 
 ### Module Breakdown:
@@ -236,22 +236,22 @@ LectureLens maintains an automated test suite of **256 unit and integration test
 | Test Module | Test Count | Scope & Behaviors Verified |
 | :--- | :--- | :--- |
 | `test_hardening.py` | **45 tests** | Regression coverage: replay-without-spin, duplicate protection, active-slide correlation, notes idempotency and marker, JSON recovery, adaptive VAD scenarios, vision retry, capture timestamps. |
-| `test_cli_and_runtime.py` | **29 tests** | CLI commands (`start`, `stop`, `pause`, `resume`, `status`, `export`, `replay`), process flag coordination, option validations. |
-| `test_gateway.py` | **24 tests** | WebSocket gateway server, API key validation, base64 payload decoding, subscriber fan-out, Postgres sequence-number replay. |
-| `test_audio_agent.py` | **16 tests** | RMS VAD energy gating, speech segmentation, audio mixing, faster-whisper chunking. |
+| `test_cli_and_runtime.py` | **30 tests** | CLI commands (`start`, `stop`, `pause`, `resume`, `status`, `export`, `replay`, `student`, `persister`, `review`), process flag coordination, option validations. |
+| `test_gateway.py` | **29 tests** | WebSocket gateway server, API key validation, role separation, bounded subscriber queues, reconnect race buffering, two-gateway fan-out groups, datetime serialization. |
 | `test_importance.py` | **17 tests** | Verbal cue classification across English, Hindi, and Hinglish ("definition", "exam_relevant", "dhyaan do"). |
+| `test_audio_agent.py` | **16 tests** | RMS VAD energy gating, speech segmentation, audio mixing, faster-whisper chunking. |
 | `test_sync_agent.py` | **16 tests** | Redis Streams consumption, sliding merge window, cross-modal correlation IDs, chronological timeline serialization. |
-| `test_screen_agent.py` | **12 tests** | MSS screenshot grabbing, perceptual dHash hashing, Hamming distance slide cache, vision-LLM OCR fallback. |
 | `test_markdown_formatter.py` | **14 tests** | Code block indentation preservation, equation heading protection, unicode math preservation, display math block normalization. |
 | `test_llm_router.py` | **13 tests** | Multimodal task routing, OpenAI-compatible provider, Google GenAI, Ollama, circuit breaker rate-limiting, retries. |
+| `test_postgres_persister.py` | **12 tests** | Idempotent timeline events, general note sequence numbers, concept tag extraction and merge with `COALESCE`, crash recovery, pgvector support. |
+| `test_screen_agent.py` | **12 tests** | MSS screenshot grabbing, perceptual dHash hashing, Hamming distance slide cache, vision-LLM OCR fallback. |
 | `test_structuring_agent.py` | **11 tests** | LangGraph pipeline, rolling window, 20s context overlap, byte-offset tracking, robust JSON extraction, crash rollback. |
 | `test_clock_and_files.py` | **11 tests** | SessionClock persistence, elapsed duration calculation, accumulated_seconds tracking, atomic file writes. |
-| `test_redis_bus.py` | **8 tests** | Redis Streams resilient publishing, consumer group acknowledgements, delivery retry discarding. |
-| `test_postgres_persister.py` | **7 tests** | Idempotent timeline events, general note sequence numbers, concept tag extraction, crash recovery. |
-| `test_qa_engine.py` | **6 tests** | Vector indexing, semantic search, RAG-grounded question answering with source citations. |
+| `test_redis_bus.py` | **8 tests** | Redis Streams resilient publishing, consumer group acknowledgements, delivery retry discarding with Redis persistence. |
+| `test_student_client.py` | **8 tests** | Thin client subscription, Hinglish/Hindi personalization engine, concise English rewrite, gap buffering & draining, sequence persistence across instances. |
+| `test_qa_engine.py` | **6 tests** | Vector indexing, pgvector integration with Chroma fallback, semantic search, RAG-grounded question answering with source citations. |
 | `test_schemas.py` | **5 tests** | Pydantic event schemas: `TranscriptChunk`, `SlideCaptured`, `TimelineEntry`, `GeneralNoteSegment`, `FlagMoment`. |
-| `test_student_chat_and_graph.py` | **5 tests** | Student knowledge graph, mastery tracking, misconception recording, timestamp citations in tutor chat. |
-| `test_student_client.py` | **5 tests** | Thin client subscription, Hinglish/Hindi personalization engine, validation fallback, sequence deduplication. |
+| `test_student_chat_and_graph.py` | **5 tests** | Student knowledge graph, concept normalization, mastery decay, misconception recording with confidence, timestamp citations in tutor chat. |
 | `test_concurrency.py` | **4 tests** | Thread pool and process pool executor allocation, worker limits, safe shutdown. |
 | `test_replay.py` | **3 tests** | ReplayEngine timeline playback, speed scaling (instant to real-time), Redis stream publishing. |
 | `test_circuit_breaker.py` | **3 tests** | Redis fixed-window rate limiter, failure count tracking and TTL cooldown. |
@@ -272,11 +272,18 @@ Launches server capture and structuring agents.
 # Start server capturing microphone audio and display slides
 lecturelens start --session "cs101_01" --course "cs101" --audio-source mic
 
-# Start in server mode with gateway enabled
+# Start in server mode with gateway and persister enabled
 lecturelens start --mode server --session "cs101_01" --course "cs101"
 ```
 
-### 2. `lecturelens replay`
+### 2. `lecturelens student`
+Subscribes to live lecture notes from the gateway and personalizes them locally:
+```bash
+# Connect student client with Hinglish personalization
+lecturelens student --server "ws://127.0.0.1:8765" --session "cs101_01" --student-id "student_1" --language "Hinglish" --detail "concise"
+```
+
+### 3. `lecturelens replay`
 Replays a recorded lecture timeline onto Redis streams at selectable speeds for reproducible testing without live hardware:
 ```bash
 # Replay session at 5x speed
@@ -286,25 +293,41 @@ lecturelens replay --session "cs101_01" --speed 5.0
 lecturelens replay --session "cs101_01" --speed 0
 ```
 
-### 3. `lecturelens stop`
+### 4. `lecturelens persister`
+Runs the durable Postgres persister for a lecture session:
+```bash
+lecturelens persister --session "cs101_01"
+```
+
+### 5. `lecturelens review`
+Inspects student mastery scores with time decay or reviews course concepts in Postgres:
+```bash
+# Review personal mastery and misconceptions for a student
+lecturelens review --student-id "student_1"
+
+# Review course concepts in Postgres
+lecturelens review --course "cs101"
+```
+
+### 6. `lecturelens stop`
 Triggers the multi-phase graceful shutdown:
 ```bash
 lecturelens stop --session "cs101_01"
 ```
 
-### 4. `lecturelens status`
+### 7. `lecturelens status`
 Inspects real-time agent health, heartbeat timestamps, and Redis stream queue backlogs:
 ```bash
 lecturelens status --session "cs101_01"
 ```
 
-### 5. `lecturelens export`
+### 8. `lecturelens export`
 Exports clean structured Markdown lecture notes:
 ```bash
 lecturelens export --session "cs101_01" --format md --output ./exports
 ```
 
-### 6. `lecturelens ask`
+### 9. `lecturelens ask`
 Interactive question-answering over indexed lecture knowledge with source citations:
 ```bash
 lecturelens ask --session "cs101_01" "How does binary search achieve O(log n) time complexity?"

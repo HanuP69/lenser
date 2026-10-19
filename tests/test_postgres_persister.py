@@ -198,6 +198,26 @@ class TestPostgresStorageSyntax(unittest.TestCase):
         self.assertIn("idx_general_notes_session_seq", CREATE_TABLES_SQL)
         self.assertIn("idx_concepts_course", CREATE_TABLES_SQL)
 
+    def test_psycopg_is_importable(self) -> None:
+        import psycopg
+        self.assertIsNotNone(psycopg)
+
+    def test_get_general_notes_query_omits_unserializable_datetime_columns(self) -> None:
+        import inspect
+        from lecturelens.storage.postgres import PostgresStorage
+        source = inspect.getsource(PostgresStorage.get_general_notes_since)
+        self.assertNotIn("created_at", source)
+        self.assertIn("sequence_number", source)
+        self.assertIn("heading", source)
+        self.assertIn("content", source)
+
+    def test_insert_concept_query_merges_definitions_and_related_tags(self) -> None:
+        import inspect
+        from lecturelens.storage.postgres import PostgresStorage
+        source = inspect.getsource(PostgresStorage.insert_concept)
+        self.assertIn("COALESCE", source)
+        self.assertIn("unnest", source)
+
 
 @unittest.skipUnless(LIVE_PG_AVAILABLE, "Live Postgres not configured via POSTGRES_TEST_URL")
 class TestPostgresLiveIntegration(unittest.IsolatedAsyncioTestCase):
@@ -228,6 +248,54 @@ class TestPostgresLiveIntegration(unittest.IsolatedAsyncioTestCase):
         events = await self.storage.get_timeline_events(session_id)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["event_id"], "live_evt_1")
+
+    async def test_round_trip_general_notes_and_json_serialization(self) -> None:
+        import json
+        session_id = "test_live_notes_sess"
+        note = GeneralNoteSegment(
+            session_id=session_id,
+            sequence_number=1,
+            timestamp_epoch=1700000000.0,
+            start_time="00:00:10",
+            end_time="00:00:30",
+            heading="Section 1",
+            content="Live Postgres Note Content",
+            key_points=["Point A", "Point B"],
+            concept_tags=["tag1", "tag2"]
+        )
+        inserted = await self.storage.insert_general_note(note)
+        self.assertTrue(inserted)
+
+        notes = await self.storage.get_general_notes_since(session_id, after_sequence_number=0)
+        self.assertEqual(len(notes), 1)
+        serialized = json.dumps({"type": "note_segment", "payload": notes[0]})
+        self.assertIn("Live Postgres Note Content", serialized)
+
+    async def test_concept_merge_in_live_postgres(self) -> None:
+        session_id = "test_live_concept_sess"
+        course_id = "test_course_live"
+        await self.storage.insert_concept(
+            course_id=course_id,
+            concept_name="binary_search",
+            definition="Search algorithm on sorted array",
+            related_concepts=["array", "sorting"],
+            session_id=session_id,
+            timestamp_epoch=1700000000.0
+        )
+        await self.storage.insert_concept(
+            course_id=course_id,
+            concept_name="binary_search",
+            definition=None,
+            related_concepts=["divide_and_conquer"],
+            session_id=session_id,
+            timestamp_epoch=1700000050.0
+        )
+        concepts = await self.storage.get_concepts_for_course(course_id)
+        matching = [c for c in concepts if c["concept_name"] == "binary_search"]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["definition"], "Search algorithm on sorted array")
+        self.assertIn("sorting", matching[0]["related_concepts"])
+        self.assertIn("divide_and_conquer", matching[0]["related_concepts"])
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ import logging
 from typing import Any, Callable, Optional
 
 from lecturelens.config.settings import Settings
+from lecturelens.core.agent_runtime import AgentControl, execute_agent_main
 from lecturelens.core.redis_bus import RedisBus
 from lecturelens.schemas.events import GeneralNoteSegment, TimelineEntry
 from lecturelens.storage.postgres import PostgresStorage
@@ -121,3 +122,29 @@ class PostgresPersister:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(timeline_task, notes_task, return_exceptions=True)
+
+
+async def main() -> None:
+    settings = Settings()
+    if not settings.postgres_url:
+        logger.warning("postgres_url not configured, persister exiting")
+        return
+    session_id = settings.session_name
+    redis_bus = RedisBus(settings.redis_url)
+    storage = PostgresStorage(settings.postgres_url)
+    await storage.init_schema()
+    persister = PostgresPersister(settings, redis_bus, storage)
+    control = AgentControl("persister", session_id, settings.output_dir)
+    try:
+        await persister.run_for_session(
+            session_id=session_id,
+            should_stop=control.should_stop
+        )
+    finally:
+        await storage.close()
+        await redis_bus.close()
+
+
+if __name__ == "__main__":
+    execute_agent_main(main)
+

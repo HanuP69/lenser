@@ -49,7 +49,8 @@ class QAEngine:
         top_k: int = 5,
         llm_timeout_seconds: float = 180.0,
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
-        fallback_model: str = DEFAULT_LOCAL_MODEL
+        fallback_model: str = DEFAULT_LOCAL_MODEL,
+        storage: Any = None
     ) -> None:
         self.embedding_model: str = embedding_model
         self.fallback_model: str = fallback_model
@@ -58,6 +59,7 @@ class QAEngine:
         self.llm_router: Any = llm_router
         self.top_k: int = top_k
         self.llm_timeout_seconds: float = llm_timeout_seconds
+        self.storage: Any = storage
         self.timeline_path: Path = self.session_dir / "timeline.jsonl"
         self.notes_path: Path = self.session_dir / "notes.md"
         self.chroma_client: Any = chromadb.PersistentClient(path=str(self.session_dir / "chroma_db"))
@@ -196,6 +198,18 @@ class QAEngine:
             for chunk in new_chunks:
                 texts.append(chunk.text)
             vectors = await self.generate_embeddings(texts)
+            if self.storage is not None and hasattr(self.storage, "insert_embedding"):
+                for chunk, vector in zip(new_chunks, vectors):
+                    try:
+                        await self.storage.insert_embedding(
+                            session_id=self.session_dir.name,
+                            source_type=chunk.source,
+                            source_id=chunk.chunk_id,
+                            chunk_text=chunk.text,
+                            vector=vector
+                        )
+                    except Exception as err:
+                        logger.debug("persisting embedding to postgres failed: %s", err)
             ids: list[str] = []
             metadatas: list[dict[str, str]] = []
             for chunk in new_chunks:
@@ -208,9 +222,20 @@ class QAEngine:
 
     async def retrieve(self, question: str) -> list[tuple[str, str]]:
         total = int(self.collection.count())
+        question_vectors = await self.generate_embeddings([question])
+        if self.storage is not None and hasattr(self.storage, "search_embeddings"):
+            try:
+                pg_results = await self.storage.search_embeddings(
+                    session_id=self.session_dir.name,
+                    query_vector=question_vectors[0],
+                    top_k=self.top_k
+                )
+                if pg_results:
+                    return [(row["chunk_text"], str(row.get("source_id", "pgvector"))) for row in pg_results]
+            except Exception as err:
+                logger.debug("pgvector search fallback to chroma: %s", err)
         if total == 0:
             return []
-        question_vectors = await self.generate_embeddings([question])
         result = self.collection.query(
             query_embeddings=[question_vectors[0]],
             n_results=min(self.top_k, total)

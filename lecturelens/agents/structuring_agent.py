@@ -594,7 +594,7 @@ class StructuringAgent:
             except Exception as error:
                 logger.warning("failed to publish note segment to redis: %s", error)
 
-        if self.storage is not None:
+        elif self.storage is not None:
             try:
                 await self.storage.insert_general_note(note_segment)
                 for tag in concept_tags:
