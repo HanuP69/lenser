@@ -170,8 +170,9 @@ def get_free_disk_bytes(directory: Path) -> int:
     return int(shutil.disk_usage(str(probe)).free)
 
 
-def format_low_disk_warning(free_bytes: int, threshold_bytes: int = LOW_DISK_BYTES) -> Optional[str]:
-    if free_bytes >= threshold_bytes:
+def format_low_disk_warning(free_bytes: int, threshold_bytes: Optional[int] = None) -> Optional[str]:
+    limit = threshold_bytes if threshold_bytes is not None else LOW_DISK_BYTES
+    if free_bytes >= limit:
         return None
     free_gigabytes = free_bytes / float(1024 ** 3)
     return (
@@ -278,12 +279,6 @@ def build_session_output_table(session_dir: Path) -> Any:
     screen_count, screen_bytes = count_images_in_directory(screen_dir)
     if screen_count > 0:
         table.add_row("raw/screen/", "Slide / Screen Keyframes", f"{screen_count} images ({format_file_size(screen_bytes)})", "Saved")
-        rows_added += 1
-
-    board_dir = session_dir / "raw" / "board"
-    board_count, board_bytes = count_images_in_directory(board_dir)
-    if board_count > 0:
-        table.add_row("raw/board/", "Whiteboard Keyframes", f"{board_count} images ({format_file_size(board_bytes)})", "Saved")
         rows_added += 1
 
     meta_path = session_dir / "session_meta.json"

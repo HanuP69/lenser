@@ -208,14 +208,15 @@ class TestCliCommands(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_plan_agents(self) -> None:
-        full = cli_main.plan_agents("local", False, True, False)
+        full = cli_main.plan_agents("local", False, False)
         self.assertEqual(sorted(full), ["audio_agent", "screen_agent", "structuring_agent", "sync_agent"])
-        self.assertNotIn("screen_agent", cli_main.plan_agents("local", False, True, True))
+        self.assertNotIn("screen_agent", cli_main.plan_agents("local", False, True))
         self.assertEqual(
-            sorted(cli_main.plan_agents("local", True, True, False)),
+            sorted(cli_main.plan_agents("local", True, False)),
             ["audio_agent", "structuring_agent", "sync_agent"]
         )
-        self.assertIn("gateway", cli_main.plan_agents("server", True, True, False))
+        self.assertIn("gateway", cli_main.plan_agents("server", True, False))
+        self.assertIn("persister", cli_main.plan_agents("local", False, False, enable_persister=True))
 
     def test_environment_passes_absolute_paths_and_course(self) -> None:
         settings = Settings()
@@ -287,19 +288,19 @@ class TestCliCommands(unittest.TestCase):
     def test_start_refuses_existing_session_without_resume(self) -> None:
         with self.assertRaises(typer.Exit):
             cli_main.start(
-                mode="local", audio_source="mic", no_camera=False, no_screen=False, audio_only=False,
+                mode="local", audio_source="mic", no_screen=False, audio_only=False,
                 session="lec1", course=None, monitor_index=1, llm_mode="local", resume=False
             )
 
     def test_start_rejects_bad_options_before_touching_anything(self) -> None:
         with self.assertRaises(typer.Exit):
             cli_main.start(
-                mode="local", audio_source="loudspeaker", no_camera=False, no_screen=False, audio_only=False,
+                mode="local", audio_source="loudspeaker", no_screen=False, audio_only=False,
                 session="fresh", course=None, monitor_index=1, llm_mode="local", resume=False
             )
         with self.assertRaises(typer.Exit):
             cli_main.start(
-                mode="local", audio_source="mic", no_camera=False, no_screen=False, audio_only=False,
+                mode="local", audio_source="mic", no_screen=False, audio_only=False,
                 session="../x", course=None, monitor_index=1, llm_mode="local", resume=False
             )
         self.assertFalse((self.output / "fresh").exists())
@@ -308,7 +309,7 @@ class TestCliCommands(unittest.TestCase):
         with mock.patch.object(cli_main, "check_redis", return_value=False):
             with self.assertRaises(typer.Exit):
                 cli_main.start(
-                    mode="local", audio_source="mic", no_camera=False, no_screen=False, audio_only=False,
+                    mode="local", audio_source="mic", no_screen=False, audio_only=False,
                     session="fresh2", course=None, monitor_index=1, llm_mode="local", resume=False
                 )
         self.assertFalse((self.output / "fresh2").exists())

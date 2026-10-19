@@ -94,7 +94,6 @@ async def run_remote_client(
     session_id: str,
     use_audio: bool,
     use_screen: bool,
-    use_camera: bool = False,
     stop_event: Optional[asyncio.Event] = None
 ) -> None:
     if stop_event is None:

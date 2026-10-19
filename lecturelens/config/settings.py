@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     local_model: str = Field(default=DEFAULT_LOCAL_MODEL)
     embedding_model: str = Field(default=DEFAULT_EMBEDDING_MODEL)
 
-    tesseract_path: str = Field(default="C:\\Program Files\\Tesseract-OCR\\tesseract.exe")
+    tesseract_path: Optional[str] = Field(default=None)
     docker_ocr_url: Optional[str] = Field(default=None)
 
     output_dir: Path = Field(default=Path("./output"))
@@ -30,9 +30,6 @@ class Settings(BaseSettings):
 
     audio_source: str = Field(default="mic")
     audio_only: bool = Field(default=False)
-    active_agents: list[str] = Field(
-        default=["audio", "screen", "camera", "sync", "structuring"]
-    )
 
     session_name: Optional[str] = Field(default=None)
     course_name: Optional[str] = Field(default=None)
@@ -53,6 +50,7 @@ class Settings(BaseSettings):
     whisper_beam_size: int = Field(default=3)
     whisper_min_avg_logprob: float = Field(default=-1.0)
     whisper_max_no_speech_prob: float = Field(default=0.6)
+    whisper_compute_type: Optional[str] = Field(default=None)
 
     screenshot_interval_seconds: float = Field(default=1.0)
     slide_diff_threshold: float = Field(default=0.004)
@@ -63,17 +61,14 @@ class Settings(BaseSettings):
     slide_revisit_hamming_distance: int = Field(default=3)
     monitor_index: int = Field(default=1)
 
-    camera_device_index: int = Field(default=0)
-    camera_poll_interval_seconds: float = Field(default=0.5)
-    camera_warmup_frames: int = Field(default=5)
-    motion_threshold: float = Field(default=0.02)
-    blur_variance_threshold: float = Field(default=100.0)
-    motion_stillness_required_frames: int = Field(default=5)
-    board_change_threshold: float = Field(default=0.01)
-    board_min_interval_seconds: float = Field(default=10.0)
-    board_min_area_ratio: float = Field(default=0.2)
-    board_occlusion_fraction: float = Field(default=0.35)
-    board_occlusion_patience: int = Field(default=3)
+    low_disk_bytes: int = Field(default=2 * 1024 * 1024 * 1024)
+    sync_fingerprint_history_limit: int = Field(default=5000)
+    stream_max_length: int = Field(default=200000)
+    reclaim_idle_ms: int = Field(default=30000)
+    retry_key_ttl_seconds: int = Field(default=86400)
+    structuring_max_batches_per_run: int = Field(default=1000)
+    qa_embed_batch_size: int = Field(default=32)
+    postgres_query_limit: int = Field(default=1000)
 
     structuring_interval_seconds: int = Field(default=120)
     max_slice_characters: int = Field(default=12000)
@@ -116,19 +111,23 @@ class Settings(BaseSettings):
             stem = sanitize_file_stem(course_name)
         return self.output_dir / "_courses" / f"{stem}.db"
 
+    def get_tesseract_binary(self) -> Optional[str]:
+        if self.tesseract_path:
+            return self.tesseract_path
+        import shutil
+        return shutil.which("tesseract")
+
     def create_session_directories(self, session_id: str) -> Path:
         session_dir = self.get_session_output_dir(session_id)
 
         raw_audio_dir = session_dir / "raw" / "audio"
         raw_slides_dir = session_dir / "raw" / "slides"
-        raw_board_dir = session_dir / "raw" / "board"
         control_dir = session_dir / "control"
         heartbeat_dir = session_dir / "heartbeats"
         logs_dir = session_dir / "logs"
 
         raw_audio_dir.mkdir(parents=True, exist_ok=True)
         raw_slides_dir.mkdir(parents=True, exist_ok=True)
-        raw_board_dir.mkdir(parents=True, exist_ok=True)
         control_dir.mkdir(parents=True, exist_ok=True)
         heartbeat_dir.mkdir(parents=True, exist_ok=True)
         logs_dir.mkdir(parents=True, exist_ok=True)

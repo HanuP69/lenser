@@ -14,7 +14,6 @@ from lecturelens.core.agent_runtime import SYNC_STOP_FLAG_NAME, set_flag
 from lecturelens.core.clock import SessionClock
 from lecturelens.core.redis_bus import RedisBus
 from lecturelens.schemas.events import (
-    BoardCaptured,
     SlideCaptured,
     TimelineEntry,
     TranscriptChunk
@@ -100,14 +99,6 @@ class TestCorrelation(SyncTestBase):
         self.assertIsNone(transcript.correlation_id)
         self.assertIsNotNone(slide.correlation_id)
 
-    def test_slide_and_board_close_together_share_an_id(self) -> None:
-        slide = entry(10.0, "slide")
-        board = entry(12.0, "board")
-        transcript = entry(11.0, "transcript")
-        self.agent.assign_correlation_ids([slide, transcript, board])
-        self.assertEqual(slide.correlation_id, board.correlation_id)
-        self.assertEqual(transcript.correlation_id, slide.correlation_id)
-
     def test_consecutive_slides_get_different_ids(self) -> None:
         first = entry(10.0, "slide")
         second = entry(12.0, "slide")
@@ -141,7 +132,7 @@ class TestFlushing(SyncTestBase):
         self.assertEqual(self.read_timeline(), [])
 
     async def test_late_arriving_older_event_is_ordered_with_its_batch(self) -> None:
-        await self.agent.add_entry(entry(10.0, "board"))
+        await self.agent.add_entry(entry(10.0, "transcript"))
         await self.agent.add_entry(entry(5.0, "transcript"))
         await self.agent.add_entry(entry(7.0, "slide"))
         written = await self.agent.flush_ready_entries(force=True)
@@ -227,7 +218,7 @@ class TestSyncEndToEnd(SyncTestBase):
         except Exception:
             self.skipTest("Redis not available")
         session = "sync_restart_session"
-        for suffix in ("transcript", "slide", "board"):
+        for suffix in ("transcript", "slide"):
             await self.bus.client.delete(f"lecturelens:{session}:stream:{suffix}")
         await self.bus.publish(
             f"lecturelens:{session}:stream:transcript",
@@ -243,7 +234,7 @@ class TestSyncEndToEnd(SyncTestBase):
             (agent.control.session_dir / "control" / SYNC_STOP_FLAG_NAME).unlink()
         lines = (self.settings.output_dir / session / "timeline.jsonl").read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(lines), 1)
-        for suffix in ("transcript", "slide", "board"):
+        for suffix in ("transcript", "slide"):
             await self.bus.client.delete(f"lecturelens:{session}:stream:{suffix}")
 
 

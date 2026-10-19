@@ -108,6 +108,22 @@ class TestQAEngine(unittest.IsolatedAsyncioTestCase):
         answer = await engine.ask("anything")
         self.assertIn("No indexed lecture content", answer)
 
+    async def test_empty_session_retrieve_does_not_call_embeddings(self) -> None:
+        empty_dir = Path(self.temp_dir.name) / "empty_retrieve"
+        empty_dir.mkdir()
+        engine = QAEngine(empty_dir, "http://localhost:11434", self.router)
+        called = False
+
+        async def fail_embeddings(texts: list[str]) -> list[list[float]]:
+            nonlocal called
+            called = True
+            raise AssertionError("generate_embeddings should not be called when empty")
+
+        engine.generate_embeddings = fail_embeddings
+        results = await engine.retrieve("anything")
+        self.assertEqual(results, [])
+        self.assertFalse(called)
+
 
 if __name__ == "__main__":
     unittest.main()

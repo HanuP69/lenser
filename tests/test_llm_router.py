@@ -248,5 +248,16 @@ class TestMessages(unittest.TestCase):
         self.assertEqual(response_to_text(message), "one\ntwo")
 
 
+    def test_router_yaml_loads_screen_ocr_task(self) -> None:
+        from pathlib import Path
+        import yaml
+        config_path = Path("router.yaml")
+        if config_path.exists():
+            with open(config_path, "r", encoding="utf-8") as file_handle:
+                data = yaml.safe_load(file_handle)
+            self.assertIn("screen_ocr", data.get("task_routing", {}))
+            self.assertNotIn("board_ocr", data.get("task_routing", {}))
+
+
 if __name__ == "__main__":
     unittest.main()

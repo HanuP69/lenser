@@ -43,33 +43,10 @@ def load_router_config(config_path: Path) -> dict[str, Any]:
             resolved_path = project_root_path
 
     if not resolved_path.exists():
-        return {
-            "providers": {
-                "gemma": {
-                    "type": "ollama",
-                    "cloud": False,
-                    "model": DEFAULT_LOCAL_MODEL,
-                    "num_ctx": 8192,
-                    "rate_limit": {"max_rpm": 120, "window_seconds": 60},
-                    "circuit_breaker": {"failure_threshold": 3, "cooldown_seconds": 30}
-                },
-                "unorouter": {
-                    "type": "openai_compatible",
-                    "cloud": True,
-                    "base_url": "https://api.unorouter.com/v1",
-                    "model": "gemma-4-26b:free",
-                    "api_key_env": "UNOROUTER_API_KEY",
-                    "timeout_seconds": 120,
-                    "rate_limit": {"max_rpm": 20, "window_seconds": 60},
-                    "circuit_breaker": {"failure_threshold": 3, "cooldown_seconds": 60}
-                }
-            },
-            "task_routing": {
-                "board_ocr": ["unorouter", "gemma"],
-                "structuring": ["unorouter", "gemma"],
-                "qa": ["unorouter", "gemma"]
-            }
-        }
+        raise FileNotFoundError(
+            f"Router configuration file not found at {resolved_path}. "
+            "Please ensure router.yaml exists in the project root."
+        )
 
     with open(resolved_path, "r", encoding="utf-8") as file_handle:
         data = yaml.safe_load(file_handle)
@@ -96,8 +73,9 @@ def provider_allowed_for_mode(provider_config: dict[str, Any], llm_mode: str) ->
 def create_base_chat_model(
     provider_name: str,
     provider_config: dict[str, Any],
-    ollama_url: str = "http://localhost:11434"
+    ollama_url: Optional[str] = None
 ) -> Optional[BaseChatModel]:
+    resolved_ollama_url = ollama_url or os.environ.get("LECTURELENS_OLLAMA_URL", "http://localhost:11434")
     provider_type = provider_config.get("type", "")
     model_name = provider_config.get("model", "")
 
@@ -109,7 +87,7 @@ def create_base_chat_model(
             return None
         model_name = os.environ.get("LECTURELENS_OLLAMA_MODEL") or provider_config.get("model", "")
         return ChatOllama(
-            base_url=ollama_url,
+            base_url=resolved_ollama_url,
             model=model_name,
             num_ctx=int(provider_config.get("num_ctx", 8192)),
             temperature=float(provider_config.get("temperature", 0.2))
@@ -217,10 +195,11 @@ def build_router_for_task(
     task_type: str,
     redis_client: redis.Redis,
     router_config: dict[str, Any],
-    ollama_url: str = "http://localhost:11434",
+    ollama_url: Optional[str] = None,
     llm_mode: str = "local",
     timeout_seconds: Optional[float] = None
 ) -> Any:
+    resolved_ollama_url = ollama_url or os.environ.get("LECTURELENS_OLLAMA_URL", "http://localhost:11434")
     providers_config = router_config.get("providers", {})
     task_routing = router_config.get("task_routing", {})
     provider_chain_names = list(task_routing.get(task_type, []))
@@ -244,7 +223,7 @@ def build_router_for_task(
         base_model = create_base_chat_model(
             provider_name=provider_name,
             provider_config=current_provider_config,
-            ollama_url=ollama_url
+            ollama_url=resolved_ollama_url
         )
         if base_model is None:
             continue

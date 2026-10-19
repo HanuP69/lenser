@@ -125,13 +125,15 @@ class StudentClient:
         profile: StudentProfile,
         output_dir: Path,
         api_key: Optional[str] = None,
-        llm_router: Any = None
+        llm_router: Any = None,
+        student_graph: Optional[Any] = None
     ) -> None:
         self.server_url = server_url
         self.session_id = session_id
         self.profile = profile
         self.output_dir = output_dir
         self.api_key = api_key
+        self.student_graph = student_graph
         self.rewriter = PersonalizationEngine(profile, llm_router)
         self.state_file = output_dir / f"{session_id}_{profile.student_id}_state.json"
         self.last_sequence_number = self.load_persisted_sequence()
@@ -163,6 +165,13 @@ class StudentClient:
         self.received_segments.append(segment)
         self.last_sequence_number = segment.sequence_number
         self.save_persisted_sequence()
+
+        if self.student_graph is not None:
+            for tag in segment.concept_tags:
+                try:
+                    self.student_graph.record_concept(tag)
+                except Exception as graph_err:
+                    logger.debug("failed to record concept in student graph: %s", graph_err)
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         with open(self.notes_file, "a", encoding="utf-8") as handle:

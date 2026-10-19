@@ -44,7 +44,7 @@ class QAEngine:
     def __init__(
         self,
         session_dir: Path,
-        ollama_url: str = "http://localhost:11434",
+        ollama_url: Optional[str] = None,
         llm_router: Any = None,
         top_k: int = 5,
         llm_timeout_seconds: float = 180.0,
@@ -55,7 +55,8 @@ class QAEngine:
         self.embedding_model: str = embedding_model
         self.fallback_model: str = fallback_model
         self.session_dir: Path = Path(session_dir)
-        self.ollama_url: str = ollama_url.rstrip("/")
+        resolved_url = ollama_url or os.environ.get("LECTURELENS_OLLAMA_URL", "http://localhost:11434")
+        self.ollama_url: str = resolved_url.rstrip("/")
         self.llm_router: Any = llm_router
         self.top_k: int = top_k
         self.llm_timeout_seconds: float = llm_timeout_seconds
@@ -222,8 +223,11 @@ class QAEngine:
 
     async def retrieve(self, question: str) -> list[tuple[str, str]]:
         total = int(self.collection.count())
+        has_pg = self.storage is not None and hasattr(self.storage, "search_embeddings")
+        if total == 0 and not has_pg:
+            return []
         question_vectors = await self.generate_embeddings([question])
-        if self.storage is not None and hasattr(self.storage, "search_embeddings"):
+        if has_pg:
             try:
                 pg_results = await self.storage.search_embeddings(
                     session_id=self.session_dir.name,

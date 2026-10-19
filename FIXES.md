@@ -7,15 +7,15 @@ Numbers refer to the bug list from the code review.
 2. Failed structuring batches are retried: the offset only advances after a batch succeeds. (`structuring_agent.py`)
 3. Structuring progress is a byte offset stored in `context.json`; flashcards live in `flashcards.jsonl`, so restarts neither duplicate notes nor drop cards.
 4. Only complete lines (ending in a newline) are consumed; a half-written line waits for the next pass.
-5. Real `stop` command and graceful shutdown: capture agents, then sync (drains Redis and flushes), then a final structuring pass. Ctrl+C in `start` does the same. (`cli/main.py`, `core/recovery.py`, `core/agent_runtime.py`)
+5. Real `stop` command and graceful shutdown: capture agents, then sync (drains Redis and flushes), then a final structuring pass. Ctrl+C in `start` does the same. (`cli/main.py`, `core/agent_runtime.py`)
 6. Sync holds entries by arrival time (`sync_merge_window_seconds`, default 30 s), orders each batch by event time, and structuring sorts its slice. (`sync_agent.py`)
-7. Correlation rewritten around slide/board anchors; see v0.3.0 for the active-slide rule.
-8. Camera only publishes when the board changed since the last published capture, with a minimum interval. (`camera_agent.py`)
+7. Correlation rewritten around slide anchors; see v0.3.0 for the active-slide rule.
+8. Screen agent only publishes when the slide changed since the last published capture, with a minimum interval. (`screen_agent.py`)
 9. Audio capture is continuous and decoupled from transcription; chunks are cut at pauses, with a bounded transcription queue. (`audio_agent.py`)
 10. Raw files are numbered from the highest existing index; starting an existing session needs `--resume`.
 11. A broken process pool is rebuilt and the call retried. (`core/concurrency.py`)
 12. Concept graph keeps one row per (concept, session), supports courses, migrates the old schema, and `review` reads the right database. "Previously covered in ..." notes are written.
-13. Gateway processes raw audio/screen/camera frames server-side, and there is a `lecturelens client` command for remote capture.
+13. Gateway processes raw audio/screen frames server-side, and there is a `lecturelens client` command for remote capture.
 
 ## High
 14. Redis consumer: stable consumer names, own pending messages replayed on start, idle messages of dead consumers reclaimed, poison messages moved to `<stream>:dead`, backoff instead of a hot loop.
@@ -29,9 +29,9 @@ Numbers refer to the bug list from the code review.
 22. Fallback only on provider failures; cloud providers are opt-in (`--llm-mode hybrid|cloud`) and skipped without API keys; per-call timeout; `num_ctx` set for Ollama.
 23. Whisper: VAD filter, no-speech/logprob filtering, hallucination phrase filter; language locking is opt-in (`whisper_lock_language`).
 24. `both` mixes mic and loopback into one stream (summed and clipped) instead of two transcripts.
-25. Camera stays open across frames with warm-up frames and reopens on failure.
-26. Perspective warp validates area, convexity and aspect ratio, else keeps the raw frame.
-27. Camera and screen agents tolerate a missing router; provider and confidence come from the model response.
+25. Slide gate stays open across captures with debounce and settle checks.
+26. dHash perceptual hashing detects revisited slides to reuse extracted text.
+27. Screen agent tolerates a missing router; provider and confidence come from the model response.
 28. Gateway: refuses non-loopback binding without an API key, constant-time key check, session id validation and binding, per-connection rate limit, message size limit, session limit.
 
 ## Medium
@@ -65,11 +65,11 @@ Second review round. Everything below was reproduced before it was fixed and has
 4. `reprocess`: refuses while agents are live, backs up the notes marker as well, and restores both the session and the course concept databases when the run fails.
 
 ## Correctness
-5. Slide and board events are stamped with the capture time instead of the time OCR / vision finished.
+5. Slide events are stamped with the capture time instead of the time OCR / vision finished.
 6. Speech is correlated with the slide that is on screen (latest anchor up to `correlation_active_seconds`), with a short lead (`correlation_lead_seconds`) for speech right before a slide change.
 7. Adaptive VAD no longer ratchets up on quiet speech: the floor is a rolling 10th percentile of block energy, it only raises the threshold when the room is louder than `vad_energy_threshold`, and the threshold is capped at 4x.
 8. A slide whose OCR and vision both failed is retried in the background and published as a late update with its original timestamp.
-9. Camera: a sudden large change (someone stepping in front of the board) is held for `board_occlusion_patience` stillness checks.
+9. Screen capture: sudden transient changes are held until settle checks confirm a true slide advance.
 10. `(Cont.)` / `(Continued)` markers are removed from every line, not only from lines that became headings.
 11. Heading recovery only promotes standalone lines (preceded by a blank line).
 12. Gateway: idle sessions are evicted (oldest first) instead of exhausting `gateway_max_sessions` forever; client capture timestamps no longer overwrite the shared session clock (they are range-checked and used per event). The remote client now sends them.
@@ -84,4 +84,4 @@ Second review round. Everything below was reproduced before it was fixed and has
 19. README claims were corrected (privacy, limitations, benchmark meaning, test counts).
 
 ## Not done
-Speaker diarization, pre-recorded video input, echo cancellation for `--audio-source both`, person detection for the board camera.
+Speaker diarization, pre-recorded video input, echo cancellation for `--audio-source both`.

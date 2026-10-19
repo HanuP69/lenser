@@ -188,5 +188,36 @@ class TestStudentClient(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client2.last_sequence_number, 1)
 
 
+    async def test_client_updates_student_graph_concepts(self) -> None:
+        from lecturelens.knowledge.student_graph import StudentKnowledgeGraph
+        profile = StudentProfile(student_id="student_graph_test", preferred_language="English")
+        graph_db = self.output_dir / "test_graph.db"
+        graph = StudentKnowledgeGraph(graph_db)
+        client = StudentClient(
+            server_url="ws://localhost:8765",
+            session_id="lec_g",
+            profile=profile,
+            output_dir=self.output_dir,
+            student_graph=graph
+        )
+        segment = GeneralNoteSegment(
+            session_id="lec_g",
+            sequence_number=1,
+            timestamp_epoch=1700000000.0,
+            start_time="00:00:10",
+            end_time="00:00:30",
+            heading="Graph Theory",
+            content="Nodes and edges form a graph.",
+            key_points=[],
+            concept_tags=["graph_theory", "nodes"]
+        )
+        await client.on_note_segment_received(segment)
+        summary = graph.get_student_summary()
+        self.assertEqual(summary["concepts_tracked"], 2)
+        names = [c["concept_name"] for c in summary["concepts"]]
+        self.assertIn("graph_theory", names)
+        self.assertIn("nodes", names)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -104,9 +104,7 @@ def build_agent_environment(
     audio_source: str,
     monitor_index: int,
     llm_mode: str,
-    course: Optional[str],
-    primary_provider: Optional[str] = None,
-    model_name: Optional[str] = None
+    course: Optional[str]
 ) -> dict[str, str]:
     environment = os.environ.copy()
     environment["LECTURELENS_SESSION_NAME"] = session_id
@@ -118,24 +116,16 @@ def build_agent_environment(
     environment["PYTHONUNBUFFERED"] = "1"
     if course:
         environment["LECTURELENS_COURSE_NAME"] = course
-    if primary_provider:
-        environment["LECTURELENS_PRIMARY_PROVIDER"] = primary_provider
-    if model_name:
-        if primary_provider in ("gemma", "ollama"):
-            environment["LECTURELENS_OLLAMA_MODEL"] = model_name
-        elif primary_provider == "unorouter":
-            environment["LECTURELENS_UNOROUTER_MODEL"] = model_name
-    unorouter_key = os.environ.get("UNOROUTER_API_KEY") or os.environ.get("LECTURELENS_UNOROUTER_API_KEY")
-    if unorouter_key:
-        environment["UNOROUTER_API_KEY"] = unorouter_key
-        environment["LECTURELENS_UNOROUTER_API_KEY"] = unorouter_key
+    if settings.postgres_url:
+        environment["LECTURELENS_POSTGRES_URL"] = settings.postgres_url
+    if "UNOROUTER_API_KEY" in os.environ and "LECTURELENS_UNOROUTER_API_KEY" not in environment:
+        environment["LECTURELENS_UNOROUTER_API_KEY"] = os.environ["UNOROUTER_API_KEY"]
     return environment
 
 
 def plan_agents(
     mode: str,
     audio_only: bool,
-    no_camera: bool = False,
     no_screen: bool = False,
     enable_persister: bool = False
 ) -> list[str]:
@@ -160,7 +150,7 @@ def module_for_agent(agent_name: str) -> str:
 
 async def render_stream_backlogs(bus: RedisBus, session_id: str) -> dict[str, int]:
     backlogs: dict[str, int] = {}
-    for source_type in ("transcript", "slide", "board"):
+    for source_type in ("transcript", "slide"):
         stream_name = f"lecturelens:{session_id}:stream:{source_type}"
         backlogs[source_type] = await bus.get_group_backlog(stream_name, "group:kuudere")
     return backlogs
@@ -314,19 +304,16 @@ def run_shutdown(monitor: AgentMonitor, session_dir: Path, planned_agents: list[
 def start(
     mode: str = typer.Option("local", help="local or server"),
     audio_source: str = typer.Option("mic", "--audio-source", help="mic, system or both"),
-    no_camera: bool = typer.Option(False, "--no-camera"),
     no_screen: bool = typer.Option(False, "--no-screen"),
     audio_only: bool = typer.Option(False, "--audio-only"),
+    persist: bool = typer.Option(False, "--persist", help="Enable durable Postgres persister in local mode"),
     session: Optional[str] = typer.Option(None, "--session"),
     course: Optional[str] = typer.Option(None, "--course"),
     monitor_index: int = typer.Option(1, "--monitor"),
     llm_mode: str = typer.Option("local", "--llm-mode", help="local, hybrid or cloud"),
     resume: bool = typer.Option(False, "--resume", help="continue an existing session"),
-    interactive: Optional[bool] = typer.Option(None, "--interactive/--non-interactive", "-i", help="Run interactive setup wizard"),
 ) -> None:
     settings = Settings()
-    primary_provider: Optional[str] = None
-    model_name: Optional[str] = None
 
     try:
         validate_start_options(audio_source, llm_mode, mode)
@@ -351,12 +338,8 @@ def start(
             "Capture continues; structuring will retry when it returns.[/yellow]"
         )
 
-    unorouter_key = os.environ.get("UNOROUTER_API_KEY") or os.environ.get("LECTURELENS_UNOROUTER_API_KEY")
-    if primary_provider == "unorouter" and not unorouter_key:
-        fail("UnoRouter is selected as primary provider, but UNOROUTER_API_KEY is not set.")
-
     settings.create_session_directories(session_id)
-    disk_warning = format_low_disk_warning(get_free_disk_bytes(settings.output_dir))
+    disk_warning = format_low_disk_warning(get_free_disk_bytes(settings.output_dir), settings.low_disk_bytes)
     if disk_warning is not None:
         console.print(f"[yellow]{disk_warning}[/yellow]")
     clear_all_flags(session_dir)
@@ -364,7 +347,7 @@ def start(
     clock = SessionClock(elapsed_offset_seconds=offset_seconds)
     clock.save_to_file(session_dir / "clock.json")
 
-    planned_agents = plan_agents(mode, audio_only, no_camera, no_screen)
+    planned_agents = plan_agents(mode, audio_only, no_screen, enable_persister=persist)
     session_meta.begin_run(
         session_dir,
         session_id,
@@ -375,15 +358,14 @@ def start(
             "monitor_index": monitor_index,
             "llm_mode": llm_mode,
             "audio_only": audio_only,
-            "no_camera": no_camera,
-            "no_screen": no_screen
+            "no_screen": no_screen,
+            "persist": persist
         },
         planned_agents
     )
 
     environment = build_agent_environment(
-        settings, session_id, audio_source, monitor_index, llm_mode, course,
-        primary_provider=primary_provider, model_name=model_name
+        settings, session_id, audio_source, monitor_index, llm_mode, course
     )
     monitor = AgentMonitor()
     for agent_name in planned_agents:
@@ -721,7 +703,7 @@ def review(
 
 @app.command()
 def student(
-    server: str = typer.Option("ws://127.0.0.1:8765", "--server", help="WebSocket URL of lecture gateway"),
+    server: Optional[str] = typer.Option(None, "--server", help="WebSocket URL of lecture gateway"),
     session: str = typer.Option(..., "--session", help="Session ID to subscribe to"),
     student_id: str = typer.Option("student_1", "--student-id", help="Unique student ID"),
     language: str = typer.Option("English", "--language", help="Target language/style (e.g. English, Hindi, Hinglish)"),
@@ -729,6 +711,7 @@ def student(
     api_key: Optional[str] = typer.Option(None, "--api-key", envvar="LECTURELENS_GATEWAY_API_KEY"),
 ) -> None:
     settings = Settings()
+    resolved_server = server or f"ws://{settings.gateway_host}:{settings.gateway_port}"
     from lecturelens.client.student_client import StudentClient, StudentProfile
     from lecturelens.knowledge.student_graph import StudentKnowledgeGraph
 
@@ -741,14 +724,15 @@ def student(
     graph = StudentKnowledgeGraph(graph_db)
 
     client = StudentClient(
-        server_url=server,
+        server_url=resolved_server,
         session_id=session,
         profile=profile,
         output_dir=settings.output_dir / student_id,
-        api_key=api_key
+        api_key=api_key,
+        student_graph=graph
     )
 
-    console.print(f"[green]Connecting student client '{student_id}' to {server} (session: {session}, language: {language})...[/green]")
+    console.print(f"[green]Connecting student client '{student_id}' to {resolved_server} (session: {session}, language: {language})...[/green]")
     try:
         asyncio.run(client.run())
     except KeyboardInterrupt:
@@ -786,11 +770,10 @@ def persister(
 
 @app.command()
 def client(
-    server: str = typer.Option(..., "--server", help="ws://host:8765"),
     session: str = typer.Option(..., "--session"),
+    server: Optional[str] = typer.Option(None, "--server", help="WebSocket URL of lecture gateway"),
     api_key: Optional[str] = typer.Option(None, "--api-key", envvar="LECTURELENS_GATEWAY_API_KEY"),
     audio_source: str = typer.Option("mic", "--audio-source"),
-    no_camera: bool = typer.Option(False, "--no-camera"),
     no_screen: bool = typer.Option(False, "--no-screen"),
     audio_only: bool = typer.Option(False, "--audio-only"),
     monitor_index: int = typer.Option(1, "--monitor"),
@@ -806,12 +789,13 @@ def client(
     settings = Settings()
     settings.audio_source = audio_source
     settings.monitor_index = monitor_index
+    resolved_server = server or f"ws://{settings.gateway_host}:{settings.gateway_port}"
 
     async def run() -> None:
         stop_event = asyncio.Event()
         await run_remote_client(
-            settings, server, api_key, session,
-            True, (not audio_only and not no_screen), (not audio_only and not no_camera),
+            settings, resolved_server, api_key, session,
+            True, (not audio_only and not no_screen),
             stop_event
         )
 

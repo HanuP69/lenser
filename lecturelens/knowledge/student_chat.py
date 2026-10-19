@@ -4,6 +4,7 @@ import re
 import time
 from typing import Any, Optional
 
+from lecturelens.config.defaults import DEFAULT_LOCAL_MODEL
 from lecturelens.knowledge.student_graph import StudentKnowledgeGraph
 from lecturelens.router.messages import HumanMessage, response_to_text
 
@@ -98,7 +99,7 @@ class StudentChatAgent:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 resp = await client.post(
                     f"{self.ollama_url}/api/generate",
-                    json={"model": self.model_name or "gemma2:2b", "prompt": prompt, "stream": False}
+                    json={"model": self.model_name or DEFAULT_LOCAL_MODEL, "prompt": prompt, "stream": False}
                 )
                 resp.raise_for_status()
                 raw_answer = str(resp.json().get("response", "")).strip()

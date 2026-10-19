@@ -42,7 +42,7 @@ class TestPipeline(unittest.IsolatedAsyncioTestCase):
         except Exception:
             self.skipTest("Redis not available")
         session = "pipeline_session"
-        for suffix in ("transcript", "slide", "board", "notes"):
+        for suffix in ("transcript", "slide", "notes"):
             await bus.client.delete(f"lecturelens:{session}:stream:{suffix}")
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -88,7 +88,7 @@ class TestPipeline(unittest.IsolatedAsyncioTestCase):
             prompt = router.summary_prompts[0]
             self.assertIn("[TRANSCRIPT][definition] A tree is defined as a connected acyclic graph. | [SLIDE] Trees: connected, acyclic", prompt)
 
-        for suffix in ("transcript", "slide", "board", "notes"):
+        for suffix in ("transcript", "slide", "notes"):
             await bus.client.delete(f"lecturelens:{session}:stream:{suffix}")
         await bus.close()
 

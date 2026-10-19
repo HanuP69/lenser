@@ -102,5 +102,35 @@ class TestValidationAndMeta(unittest.TestCase):
             self.assertGreaterEqual(get_previous_duration_seconds(session_dir), first_total)
 
 
+from lecturelens.config.settings import Settings
+
+
+class TestSettingsConfiguration(unittest.TestCase):
+    def test_settings_has_clean_schema_without_camera_or_board(self) -> None:
+        camera_fields = [f for f in Settings.model_fields.keys() if "camera" in f or "board" in f or "motion" in f]
+        self.assertEqual(camera_fields, [])
+        self.assertFalse(hasattr(Settings, "active_agents"))
+
+    def test_settings_has_expected_tunables(self) -> None:
+        settings = Settings()
+        self.assertEqual(settings.low_disk_bytes, 2 * 1024 * 1024 * 1024)
+        self.assertEqual(settings.sync_fingerprint_history_limit, 5000)
+        self.assertEqual(settings.stream_max_length, 200000)
+        self.assertEqual(settings.reclaim_idle_ms, 30000)
+        self.assertEqual(settings.retry_key_ttl_seconds, 86400)
+        self.assertEqual(settings.structuring_max_batches_per_run, 1000)
+        self.assertEqual(settings.qa_embed_batch_size, 32)
+        self.assertEqual(settings.postgres_query_limit, 1000)
+
+    def test_create_session_directories_does_not_create_board_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.output_dir = Path(temp_dir)
+            session_dir = settings.create_session_directories("clean_session")
+            self.assertTrue((session_dir / "raw" / "audio").exists())
+            self.assertTrue((session_dir / "raw" / "slides").exists())
+            self.assertFalse((session_dir / "raw" / "board").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

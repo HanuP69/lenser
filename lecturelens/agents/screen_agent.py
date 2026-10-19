@@ -337,7 +337,7 @@ async def main() -> None:
             from lecturelens.router.llm_router import build_router_for_task, load_router_config
             router_config = load_router_config(context.settings.router_config_path)
             router = build_router_for_task(
-                "board_ocr",
+                "screen_ocr",
                 context.redis_bus.client,
                 router_config,
                 context.settings.ollama_url,

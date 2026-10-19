@@ -17,18 +17,17 @@ from lecturelens.core.concurrency import configure_pools, shutdown_pools
 from lecturelens.core.logging_setup import get_logger
 from lecturelens.core.redis_bus import RedisBus
 from lecturelens.core.validation import is_valid_session_id
-from lecturelens.schemas.events import BoardCaptured, SlideCaptured, TranscriptChunk
+from lecturelens.schemas.events import SlideCaptured, TranscriptChunk
 
 logger = get_logger("lecturelens.gateway")
 
 LOOPBACK_HOSTS: tuple[str, ...] = ("127.0.0.1", "localhost", "::1")
 CAPTURE_PAST_TOLERANCE_SECONDS: float = 600.0
 CAPTURE_FUTURE_TOLERANCE_SECONDS: float = 5.0
-EVENT_SOURCE_TYPES: tuple[str, ...] = ("transcript", "slide", "board")
+EVENT_SOURCE_TYPES: tuple[str, ...] = ("transcript", "slide")
 EVENT_CLASSES: dict[str, Any] = {
     "transcript": TranscriptChunk,
-    "slide": SlideCaptured,
-    "board": BoardCaptured
+    "slide": SlideCaptured
 }
 
 
@@ -469,7 +468,7 @@ async def main() -> None:
         from lecturelens.router.llm_router import build_router_for_task, load_router_config
         router_config = load_router_config(settings.router_config_path)
         router = build_router_for_task(
-            "board_ocr", redis_bus.client, router_config,
+            "screen_ocr", redis_bus.client, router_config,
             settings.ollama_url, settings.llm_mode, settings.llm_timeout_seconds
         )
     except Exception as error:

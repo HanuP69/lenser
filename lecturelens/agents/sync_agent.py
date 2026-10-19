@@ -22,7 +22,6 @@ from lecturelens.core.fileio import append_text_durably
 from lecturelens.core.logging_setup import get_logger
 from lecturelens.core.redis_bus import RedisBus
 from lecturelens.schemas.events import (
-    BoardCaptured,
     SlideCaptured,
     TimelineEntry,
     TranscriptChunk
@@ -30,7 +29,7 @@ from lecturelens.schemas.events import (
 
 logger = get_logger("lecturelens.sync_agent")
 
-ANCHOR_SOURCE_TYPES: tuple[str, ...] = ("slide", "board")
+ANCHOR_SOURCE_TYPES: tuple[str, ...] = ("slide",)
 FINGERPRINT_HISTORY_LIMIT: int = 5000
 
 
@@ -148,29 +147,11 @@ class SyncAgent:
             metadata=metadata
         )
 
-    def board_to_entry(self, event: BoardCaptured) -> TimelineEntry:
-        metadata = {
-            "confidence": event.confidence,
-            "provider_used": event.provider_used,
-            "image_file_path": event.image_file_path
-        }
-        return TimelineEntry(
-            session_id=event.session_id,
-            timestamp_epoch=event.timestamp_epoch,
-            source_type="board",
-            content=event.raw_ocr_text,
-            correlation_id=None,
-            importance_flags=[],
-            metadata=metadata
-        )
-
     def convert_message(self, source_type: str, message_data: dict[str, str]) -> TimelineEntry:
         if source_type == "transcript":
             return self.transcript_to_entry(TranscriptChunk.from_redis_dict(message_data))
         if source_type == "slide":
             return self.slide_to_entry(SlideCaptured.from_redis_dict(message_data))
-        if source_type == "board":
-            return self.board_to_entry(BoardCaptured.from_redis_dict(message_data))
         raise ValueError(f"unknown source type {source_type}")
 
     async def add_entry(

@@ -55,7 +55,7 @@ providers:
       cooldown_seconds: 60
 
 task_routing:
-  board_ocr:
+  screen_ocr:
     - unorouter
     - gemma
     - openrouter

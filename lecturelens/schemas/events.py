@@ -102,39 +102,6 @@ class SlideCaptured(BaseModel):
         return cls(**parsed)
 
 
-class BoardCaptured(BaseModel):
-    session_id: str
-    event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    timestamp_epoch: float
-    image_file_path: str
-    raw_ocr_text: str
-    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    provider_used: str = Field(default="unknown")
-
-    def to_redis_dict(self) -> dict[str, str]:
-        data = self.model_dump()
-        result = {}
-        for key in data:
-            value = data[key]
-            if value is None:
-                result[key] = ""
-            else:
-                result[key] = str(value)
-        return result
-
-    @classmethod
-    def from_redis_dict(cls, data: dict[str, str]) -> "BoardCaptured":
-        parsed = {}
-        parsed["session_id"] = data["session_id"]
-        parsed["event_id"] = data.get("event_id", "") or str(uuid.uuid4())
-        parsed["timestamp_epoch"] = float(data["timestamp_epoch"])
-        parsed["image_file_path"] = data["image_file_path"]
-        parsed["raw_ocr_text"] = data["raw_ocr_text"]
-        parsed["confidence"] = float(data.get("confidence", "0.0") or "0.0")
-        parsed["provider_used"] = data.get("provider_used", "unknown")
-        return cls(**parsed)
-
-
 class GeneralNoteSegment(BaseModel):
     session_id: str
     lecture_id: Optional[str] = Field(default=None)

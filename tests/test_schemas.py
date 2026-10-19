@@ -2,7 +2,6 @@ import unittest
 from lecturelens.schemas.events import (
     TranscriptChunk,
     SlideCaptured,
-    BoardCaptured,
     TimelineEntry,
     GeneralNoteSegment
 )
@@ -49,20 +48,6 @@ class TestSchemas(unittest.TestCase):
         deserialized = SlideCaptured.from_redis_dict(redis_dict)
         self.assertEqual(deserialized.slide_number, 1)
         self.assertEqual(deserialized.extracted_text, "Binary Search O(log n)")
-
-    def test_board_captured_serialization(self) -> None:
-        board = BoardCaptured(
-            session_id="test_session_3",
-            timestamp_epoch=1700000020.0,
-            image_file_path="output/raw/board/board_0001.jpg",
-            raw_ocr_text="T(n) = 2T(n/2) + O(n)",
-            confidence=0.88,
-            provider_used="gemma4"
-        )
-        redis_dict = board.to_redis_dict()
-        deserialized = BoardCaptured.from_redis_dict(redis_dict)
-        self.assertEqual(deserialized.raw_ocr_text, "T(n) = 2T(n/2) + O(n)")
-        self.assertEqual(deserialized.provider_used, "gemma4")
 
     def test_timeline_entry_serialization(self) -> None:
         entry = TimelineEntry(
