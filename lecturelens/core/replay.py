@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from lecturelens.core.redis_bus import RedisBus
-from lecturelens.schemas.events import TimelineEntry
+from lecturelens.schemas.events import SlideCaptured, TimelineEntry, TranscriptChunk
 
 logger = logging.getLogger(__name__)
 
@@ -78,9 +78,38 @@ class ReplayEngine:
                 if publish_to_timeline_stream:
                     stream_name = f"lecturelens:{session_id}:stream:timeline"
                     await self.redis_bus.publish_resilient(stream_name, replayed_entry)
-                if publish_to_source_streams and replayed_entry.source_type in ("transcript", "slide"):
-                    source_stream = f"lecturelens:{session_id}:stream:{replayed_entry.source_type}"
-                    await self.redis_bus.publish_resilient(source_stream, replayed_entry)
+                if publish_to_source_streams:
+                    if replayed_entry.source_type == "transcript":
+                        meta = replayed_entry.metadata or {}
+                        chunk = TranscriptChunk(
+                            session_id=session_id,
+                            chunk_index=int(meta.get("chunk_index", 0) or 0),
+                            timestamp_epoch=replayed_entry.timestamp_epoch,
+                            start_seconds=float(meta.get("start_seconds", replayed_entry.elapsed_seconds or 0.0) or 0.0),
+                            end_seconds=float(meta.get("end_seconds", replayed_entry.elapsed_seconds or 0.0) or 0.0),
+                            text=replayed_entry.content,
+                            language=str(meta.get("language", "en") or "en"),
+                            confidence=float(meta.get("confidence", 1.0) or 1.0),
+                            importance_flags=list(replayed_entry.importance_flags or []),
+                            audio_source=str(meta.get("audio_source", "mic") or "mic"),
+                            raw_audio_path=str(meta.get("raw_audio_path", "") or "")
+                        )
+                        source_stream = f"lecturelens:{session_id}:stream:transcript"
+                        await self.redis_bus.publish_resilient(source_stream, chunk)
+                    elif replayed_entry.source_type == "slide":
+                        meta = replayed_entry.metadata or {}
+                        slide = SlideCaptured(
+                            session_id=session_id,
+                            slide_number=int(meta.get("slide_number", 1) or 1),
+                            timestamp_epoch=replayed_entry.timestamp_epoch,
+                            image_file_path=str(meta.get("image_file_path", "") or ""),
+                            extracted_text=replayed_entry.content,
+                            monitor_index=int(meta.get("monitor_index", 0) or 0),
+                            revisited_slide_number=int(meta.get("revisited_slide_number", 0) or 0),
+                            ocr_latency_ms=float(meta.get("ocr_latency_ms", 0.0) or 0.0)
+                        )
+                        source_stream = f"lecturelens:{session_id}:stream:slide"
+                        await self.redis_bus.publish_resilient(source_stream, slide)
 
             replayed_count += 1
 

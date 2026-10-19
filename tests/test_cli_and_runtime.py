@@ -218,6 +218,8 @@ class TestCliCommands(unittest.TestCase):
             ["audio_agent", "structuring_agent", "sync_agent"]
         )
         self.assertIn("gateway", cli_main.plan_agents("server", True, False))
+        self.assertNotIn("persister", cli_main.plan_agents("server", True, False))
+        self.assertIn("persister", cli_main.plan_agents("server", True, False, enable_persister=True))
         self.assertIn("persister", cli_main.plan_agents("local", False, False, enable_persister=True))
 
     def test_environment_passes_absolute_paths_and_course(self) -> None:

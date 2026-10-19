@@ -462,15 +462,16 @@ class GatewayServer:
         except Exception as err:
             logger.warning("xrange on %s failed: %s", stream_name, err)
             return []
-        notes: list[dict[str, Any]] = []
+        by_seq: dict[int, dict[str, Any]] = {}
         for _, data in raw_entries:
             try:
                 segment = GeneralNoteSegment.from_redis_dict(data)
-                if segment.sequence_number > after_seq:
-                    notes.append(segment.model_dump())
+                seq = segment.sequence_number
+                if seq > after_seq:
+                    by_seq[seq] = segment.model_dump()
             except Exception:
                 pass
-        notes.sort(key=lambda x: int(x.get("sequence_number", 0)))
+        notes = [by_seq[k] for k in sorted(by_seq.keys())]
         return notes
 
     async def serve_forever(self, should_stop: Optional[Callable[[], bool]] = None) -> None:

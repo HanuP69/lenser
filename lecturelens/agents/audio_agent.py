@@ -354,17 +354,40 @@ class SystemBlockSource:
 
     def _record_loop(self) -> None:
         try:
+            import sys
             import soundcard
             mic = None
-            try:
-                mic = soundcard.get_microphone(id=str(soundcard.default_speaker().id), include_loopback=True)
-            except Exception:
-                loopbacks = [m for m in soundcard.all_microphones(include_loopback=True) if getattr(m, "isloopback", False)]
+            if sys.platform == "darwin":
+                loopbacks = [
+                    m for m in soundcard.all_microphones(include_loopback=True)
+                    if getattr(m, "isloopback", False)
+                    or "blackhole" in str(getattr(m, "name", "")).lower()
+                    or "soundflower" in str(getattr(m, "name", "")).lower()
+                ]
                 if loopbacks:
                     mic = loopbacks[0]
+                else:
+                    logger.warning("System audio capture on macOS requires a virtual loopback device (e.g. BlackHole). Recording silence.")
+            else:
+                try:
+                    mic = soundcard.get_microphone(id=str(soundcard.default_speaker().id), include_loopback=True)
+                except Exception:
+                    loopbacks = [m for m in soundcard.all_microphones(include_loopback=True) if getattr(m, "isloopback", False)]
+                    if loopbacks:
+                        mic = loopbacks[0]
+
             if mic is None:
                 logger.error("No loopback audio device found for system audio capture")
+                frame_interval = float(self.block_frames) / float(self.sample_rate)
+                while self.is_running:
+                    time.sleep(frame_interval)
+                    silent_block = np.zeros(self.block_frames, dtype=np.float32)
+                    try:
+                        self.block_queue.put_nowait(silent_block)
+                    except queue.Full:
+                        self.dropped_blocks += 1
                 return
+
             with mic.recorder(samplerate=self.sample_rate, channels=1) as recorder:
                 while self.is_running:
                     data = recorder.record(numframes=self.block_frames)
@@ -410,15 +433,21 @@ class MixedBlockSource:
 
     def read_block(self, timeout_seconds: float) -> Optional[np.ndarray]:
         mic_block = self.mic_source.read_block(timeout_seconds)
-        sys_block = self.system_source.read_block(0.01)
-        if mic_block is None and sys_block is None:
-            return None
         if mic_block is None:
-            return sys_block
+            return None
+
+        while self.system_source.block_queue.qsize() > 5:
+            try:
+                self.system_source.block_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        sys_block = self.system_source.read_block(0.05)
         if sys_block is None:
             return mic_block
+
         min_len = min(len(mic_block), len(sys_block))
-        mixed = (mic_block[:min_len] * 0.5 + sys_block[:min_len] * 0.5).astype(np.float32)
+        mixed = np.clip(mic_block[:min_len] + sys_block[:min_len], -1.0, 1.0).astype(np.float32)
         return mixed
 
     def stop(self) -> None:
@@ -471,7 +500,8 @@ class AudioAgent:
             await run_in_process_pool(
                 preload_whisper_model,
                 self.settings.whisper_model_size,
-                self.settings.whisper_device
+                self.settings.whisper_device,
+                self.settings.whisper_compute_type
             )
         except Exception as error:
             logger.error("whisper preload failed: %s", error)

@@ -22,9 +22,6 @@ class Settings(BaseSettings):
     local_model: str = Field(default=DEFAULT_LOCAL_MODEL)
     embedding_model: str = Field(default=DEFAULT_EMBEDDING_MODEL)
 
-    tesseract_path: Optional[str] = Field(default=None)
-    docker_ocr_url: Optional[str] = Field(default=None)
-
     output_dir: Path = Field(default=Path("./output"))
     router_config_path: Path = Field(default=Path("./router.yaml"))
 
@@ -110,12 +107,6 @@ class Settings(BaseSettings):
         if course_name is not None and len(course_name.strip()) > 0:
             stem = sanitize_file_stem(course_name)
         return self.output_dir / "_courses" / f"{stem}.db"
-
-    def get_tesseract_binary(self) -> Optional[str]:
-        if self.tesseract_path:
-            return self.tesseract_path
-        import shutil
-        return shutil.which("tesseract")
 
     def create_session_directories(self, session_id: str) -> Path:
         session_dir = self.get_session_output_dir(session_id)

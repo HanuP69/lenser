@@ -99,6 +99,27 @@ def check_ollama(settings: Settings, max_retries: int = 3, retry_delay_seconds: 
     return False
 
 
+def check_postgres(settings: Settings) -> bool:
+    if not settings.postgres_url:
+        return False
+    async def ping() -> bool:
+        from lecturelens.storage.postgres import PostgresStorage
+        storage = PostgresStorage(settings.postgres_url)
+        try:
+            conn = await storage.get_connection()
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT 1;")
+                return True
+        except Exception:
+            return False
+        finally:
+            await storage.close()
+    try:
+        return asyncio.run(ping())
+    except Exception:
+        return False
+
+
 def build_agent_environment(
     settings: Settings,
     session_id: str,
@@ -131,7 +152,10 @@ def plan_agents(
     enable_persister: bool = False
 ) -> list[str]:
     if mode == "server":
-        return ["sync_agent", "structuring_agent", "gateway", "persister"]
+        planned = ["sync_agent", "structuring_agent", "gateway"]
+        if enable_persister:
+            planned.append("persister")
+        return planned
     planned = ["sync_agent", "structuring_agent", "audio_agent"]
     if not audio_only:
         if not no_screen:
@@ -223,6 +247,12 @@ async def collect_snapshot(
             meta = session_meta.load_session_meta(session_dir)
             if meta.get("llm_mode"):
                 active_llm_mode = meta["llm_mode"]
+            elif meta.get("runs") and isinstance(meta["runs"], list) and len(meta["runs"]) > 0:
+                last_run = meta["runs"][-1]
+                if isinstance(last_run, dict):
+                    config = last_run.get("configuration") or {}
+                    if config.get("llm_mode"):
+                        active_llm_mode = config["llm_mode"]
         except Exception:
             pass
 
@@ -358,7 +388,15 @@ def start(
     clock = SessionClock(elapsed_offset_seconds=offset_seconds)
     clock.save_to_file(session_dir / "clock.json")
 
-    planned_agents = plan_agents(mode, audio_only, no_screen, enable_persister=persist)
+    should_persist = persist
+    if should_persist and not check_postgres(settings):
+        console.print(
+            f"[yellow]Postgres is not reachable at {settings.postgres_url}. "
+            "Persister disabled; session will run without Postgres storage.[/yellow]"
+        )
+        should_persist = False
+
+    planned_agents = plan_agents(mode, audio_only, no_screen, enable_persister=should_persist)
     session_meta.begin_run(
         session_dir,
         session_id,
@@ -531,17 +569,22 @@ def reprocess(
         from lecturelens.agents.structuring_agent import StructuringAgent
         from lecturelens.router.llm_router import build_router_for_task, load_router_config
 
-        bus = RedisBus(settings.redis_url)
+        bus = None
+        redis_client = None
+        if check_redis(settings):
+            bus = RedisBus(settings.redis_url)
+            redis_client = bus.client
         try:
             router = build_router_for_task(
-                "structuring", bus.client, load_router_config(settings.router_config_path),
+                "structuring", redis_client, load_router_config(settings.router_config_path),
                 settings.ollama_url, settings.llm_mode, settings.llm_timeout_seconds
             )
-            agent = StructuringAgent(settings=settings, session_id=session, llm_router=router, redis_bus=bus)
+            agent = StructuringAgent(settings=settings, session_id=session, llm_router=router, redis_bus=None)
             agent.reset_outputs()
             return await agent.process_all_pending()
         finally:
-            await bus.close()
+            if bus is not None:
+                await bus.close()
 
     try:
         batches = asyncio.run(run())

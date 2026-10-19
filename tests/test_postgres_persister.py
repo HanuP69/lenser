@@ -298,12 +298,22 @@ class TestPostgresLiveIntegration(unittest.IsolatedAsyncioTestCase):
             session_id=session_id,
             timestamp_epoch=1700000050.0
         )
+        session_id_2 = f"test_session_2_{uuid.uuid4().hex[:6]}"
+        await self.storage.insert_concept(
+            course_id=course_id,
+            concept_name="binary_search",
+            definition=None,
+            related_concepts=["logarithmic_time"],
+            session_id=session_id_2,
+            timestamp_epoch=1700000100.0
+        )
         concepts = await self.storage.get_concepts_for_course(course_id)
         matching = [c for c in concepts if c["concept_name"] == "binary_search"]
         self.assertEqual(len(matching), 1)
         self.assertEqual(matching[0]["definition"], "Search algorithm on sorted array")
         self.assertIn("sorting", matching[0]["related_concepts"])
         self.assertIn("divide_and_conquer", matching[0]["related_concepts"])
+        self.assertIn("logarithmic_time", matching[0]["related_concepts"])
 
 
 if __name__ == "__main__":

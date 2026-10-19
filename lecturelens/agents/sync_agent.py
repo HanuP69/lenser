@@ -120,9 +120,11 @@ class SyncAgent:
             "end_seconds": event.end_seconds,
             "raw_audio_path": event.raw_audio_path
         }
+        elapsed = self.session_clock.elapsed_for_epoch(event.timestamp_epoch)
         return TimelineEntry(
             session_id=event.session_id,
             timestamp_epoch=event.timestamp_epoch,
+            elapsed_seconds=elapsed,
             source_type="transcript",
             content=event.text,
             correlation_id=None,
@@ -137,9 +139,11 @@ class SyncAgent:
             "image_file_path": event.image_file_path,
             "revisited_slide_number": event.revisited_slide_number
         }
+        elapsed = self.session_clock.elapsed_for_epoch(event.timestamp_epoch)
         return TimelineEntry(
             session_id=event.session_id,
             timestamp_epoch=event.timestamp_epoch,
+            elapsed_seconds=elapsed,
             source_type="slide",
             content=event.extracted_text,
             correlation_id=None,

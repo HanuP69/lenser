@@ -184,7 +184,7 @@ class RedisBus:
                         error
                     )
                     try:
-                        dead_payload = dict(data)
+                        dead_payload = dict(message_data)
                         dead_payload["_original_id"] = str(message_id)
                         dead_payload["_error"] = str(error)
                         dead_payload["_failed_at"] = str(time.time())

@@ -154,7 +154,13 @@ async def main() -> None:
     session_dir = settings.get_session_output_dir(session_id)
     redis_bus = RedisBus(settings.redis_url)
     storage = PostgresStorage(settings.postgres_url)
-    await storage.init_schema()
+    try:
+        await storage.init_schema()
+    except Exception as pg_err:
+        logger.warning("postgres unavailable for persister (%s), persister exiting", pg_err)
+        await storage.close()
+        await redis_bus.close()
+        return
     persister = PostgresPersister(settings, redis_bus, storage)
     control = AgentControl(session_dir, "persister", stop_flag_name=PERSISTER_STOP_FLAG_NAME)
     control.write_heartbeat("live")

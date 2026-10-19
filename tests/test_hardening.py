@@ -395,7 +395,7 @@ class TestScreenAgentHardening(unittest.IsolatedAsyncioTestCase):
         bus = RecordingBus()
         return ScreenAgent(settings, bus, SessionClock(), "screen_hardening", router), bus
 
-    async def empty_ocr(self, function: Any, png_bytes: bytes, tesseract_path: str) -> str:
+    async def empty_ocr(self, *args: Any, **kwargs: Any) -> str:
         return ""
 
     async def test_slide_timestamp_is_capture_time_not_after_ocr(self) -> None:

@@ -39,14 +39,30 @@ def load_dotenv_into_environ() -> None:
     for candidate in (Path.cwd() / ".env", Path(__file__).resolve().parent.parent.parent / ".env"):
         if candidate.exists():
             try:
+                from dotenv import load_dotenv
+                load_dotenv(candidate, override=False)
+            except Exception:
+                pass
+            try:
                 with open(candidate, "r", encoding="utf-8") as f:
                     for line in f:
                         line = line.strip()
-                        if not line or line.startswith("#") or "=" not in line:
+                        if not line or line.startswith("#"):
+                            continue
+                        if line.startswith("export "):
+                            line = line[len("export "):].strip()
+                        if "=" not in line:
                             continue
                         k, v = line.split("=", 1)
                         k = k.strip()
-                        v = v.strip().strip("'\"")
+                        v = v.strip()
+                        if v.startswith(("'", '"')) and len(v) >= 2 and v[0] == v[-1]:
+                            v = v[1:-1]
+                        else:
+                            hash_pos = v.find("#")
+                            if hash_pos != -1:
+                                v = v[:hash_pos].strip()
+                            v = v.strip("'\"")
                         if k and k not in os.environ:
                             os.environ[k] = v
                 break

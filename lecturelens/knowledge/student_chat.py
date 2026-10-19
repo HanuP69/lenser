@@ -58,15 +58,30 @@ class StudentChatAgent:
             first_epoch = float(timeline_events[0].get("timestamp_epoch", 0.0)) if timeline_events else 0.0
             for event in timeline_events[-max_events:]:
                 raw_elapsed = event.get("elapsed_seconds")
-                if raw_elapsed is None and isinstance(event.get("metadata"), dict):
-                    raw_elapsed = event["metadata"].get("start_seconds")
-                if raw_elapsed is None:
+                try:
+                    num_elapsed = float(raw_elapsed) if raw_elapsed is not None else 0.0
+                except (ValueError, TypeError):
+                    num_elapsed = 0.0
+
+                if num_elapsed <= 0.0 and isinstance(event.get("metadata"), dict):
+                    meta_start = event["metadata"].get("start_seconds")
+                    if meta_start is not None:
+                        try:
+                            meta_val = float(meta_start)
+                            if meta_val > 0.0:
+                                num_elapsed = meta_val
+                        except (ValueError, TypeError):
+                            pass
+
+                if num_elapsed <= 0.0:
                     cur_epoch = float(event.get("timestamp_epoch", 0.0))
-                    if cur_epoch >= first_epoch > 0:
-                        raw_elapsed = cur_epoch - first_epoch
-                elapsed = float(raw_elapsed or 0.0)
-                mins = int(elapsed // 60)
-                secs = int(elapsed % 60)
+                    if cur_epoch >= first_epoch > 0.0:
+                        diff = cur_epoch - first_epoch
+                        if diff > 0.0:
+                            num_elapsed = diff
+
+                mins = int(num_elapsed // 60)
+                secs = int(num_elapsed % 60)
                 stamp = f"[{mins:02d}:{secs:02d}]"
                 source = event.get("source_type", "")
                 content = event.get("content", "")

@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS concepts (
     session_id TEXT,
     timestamp_epoch DOUBLE PRECISION,
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(course_id, session_id, concept_name)
+    CONSTRAINT concepts_course_id_session_id_concept_name_key UNIQUE(course_id, session_id, concept_name)
 );
 
 CREATE TABLE IF NOT EXISTS embeddings (
@@ -85,6 +85,24 @@ CREATE TABLE IF NOT EXISTS embeddings (
 CREATE INDEX IF NOT EXISTS idx_timeline_events_session ON timeline_events (session_id, timestamp_epoch);
 CREATE INDEX IF NOT EXISTS idx_general_notes_session_seq ON general_notes (session_id, sequence_number);
 CREATE INDEX IF NOT EXISTS idx_concepts_course ON concepts (course_id);
+"""
+
+MIGRATE_CONCEPTS_SQL = """
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables WHERE table_name = 'concepts'
+    ) THEN
+        ALTER TABLE concepts DROP CONSTRAINT IF EXISTS concepts_course_id_concept_name_key;
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'concepts_course_id_session_id_concept_name_key'
+        ) THEN
+            ALTER TABLE concepts ADD CONSTRAINT concepts_course_id_session_id_concept_name_key
+            UNIQUE (course_id, session_id, concept_name);
+        END IF;
+    END IF;
+END $$;
 """
 
 CREATE_VECTOR_EXTENSION_SQL = "CREATE EXTENSION IF NOT EXISTS vector;"
@@ -117,6 +135,7 @@ class PostgresStorage:
         async with conn.transaction():
             async with conn.cursor() as cur:
                 await cur.execute(CREATE_TABLES_SQL)
+                await cur.execute(MIGRATE_CONCEPTS_SQL)
 
         try:
             async with conn.transaction():
@@ -356,12 +375,29 @@ class PostgresStorage:
                session_id, timestamp_epoch, created_at
         FROM concepts
         WHERE course_id = %s
-        ORDER BY concept_name ASC;
+        ORDER BY timestamp_epoch ASC;
         """
         conn = await self.get_connection()
         async with conn.cursor() as cur:
             await cur.execute(query, (course_id,))
-            return await cur.fetchall()
+            rows = await cur.fetchall()
+
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            name = str(row["concept_name"])
+            if name not in grouped:
+                grouped[name] = dict(row)
+                grouped[name]["related_concepts"] = list(row.get("related_concepts") or [])
+            else:
+                existing = grouped[name]
+                if row.get("definition"):
+                    existing["definition"] = row["definition"]
+                existing_related = set(existing.get("related_concepts") or [])
+                existing_related.update(row.get("related_concepts") or [])
+                existing["related_concepts"] = sorted(list(existing_related))
+                existing["timestamp_epoch"] = max(float(existing.get("timestamp_epoch") or 0.0), float(row.get("timestamp_epoch") or 0.0))
+                existing["session_id"] = row.get("session_id") or existing.get("session_id")
+        return sorted(list(grouped.values()), key=lambda x: str(x["concept_name"]))
 
     async def get_all_concepts_for_session(self, session_id: str) -> list[dict[str, Any]]:
         query = """
