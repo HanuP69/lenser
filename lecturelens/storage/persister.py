@@ -3,7 +3,7 @@ import logging
 from typing import Any, Callable, Optional
 
 from lecturelens.config.settings import Settings
-from lecturelens.core.agent_runtime import AgentControl, execute_agent_main
+from lecturelens.core.agent_runtime import AgentControl, execute_agent_main, parse_runtime_arguments
 from lecturelens.core.redis_bus import RedisBus
 from lecturelens.schemas.events import GeneralNoteSegment, TimelineEntry
 from lecturelens.storage.postgres import PostgresStorage
@@ -129,18 +129,28 @@ async def main() -> None:
     if not settings.postgres_url:
         logger.warning("postgres_url not configured, persister exiting")
         return
-    session_id = settings.session_name
+    namespace = parse_runtime_arguments()
+    session_id = namespace.session or settings.session_name or "default_session"
+    session_dir = settings.get_session_output_dir(session_id)
     redis_bus = RedisBus(settings.redis_url)
     storage = PostgresStorage(settings.postgres_url)
     await storage.init_schema()
     persister = PostgresPersister(settings, redis_bus, storage)
-    control = AgentControl("persister", session_id, settings.output_dir)
+    control = AgentControl(session_dir, "persister")
+    control.write_heartbeat("live")
+    heartbeat_task = asyncio.create_task(control.heartbeat_loop())
     try:
         await persister.run_for_session(
             session_id=session_id,
-            should_stop=control.should_stop
+            should_stop=control.stop_requested
         )
     finally:
+        heartbeat_task.cancel()
+        await asyncio.gather(heartbeat_task, return_exceptions=True)
+        try:
+            control.write_heartbeat("stopped")
+        except Exception:
+            pass
         await storage.close()
         await redis_bus.close()
 

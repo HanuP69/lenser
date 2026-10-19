@@ -576,6 +576,7 @@ def ask(
     question: str = typer.Argument(...),
     session: Optional[str] = typer.Option(None, "--session"),
     llm_mode: str = typer.Option("local", "--llm-mode"),
+    student_id: Optional[str] = typer.Option(None, "--student-id", help="Student ID for personalized tutoring and misconception tracking"),
 ) -> None:
     settings = Settings()
     settings.llm_mode = llm_mode
@@ -603,6 +604,46 @@ def ask(
                     storage = PostgresStorage(settings.postgres_url)
                 except Exception:
                     storage = None
+
+            if student_id and isinstance(student_id, str):
+                import json
+                from lecturelens.knowledge.student_chat import StudentChatAgent
+                from lecturelens.knowledge.student_graph import StudentKnowledgeGraph
+
+                graph_db = settings.output_dir / student_id / "student_graph.db"
+                graph = StudentKnowledgeGraph(graph_db)
+                chat_agent = StudentChatAgent(
+                    llm_router=router,
+                    student_graph=graph,
+                    ollama_url=settings.ollama_url,
+                    model_name=settings.local_model
+                )
+
+                timeline_events: list[dict[str, Any]] = []
+                notes_segments: list[dict[str, Any]] = []
+                if storage is not None:
+                    try:
+                        timeline_events = await storage.get_timeline_events(session_id, limit=40)
+                        notes_segments = await storage.get_general_notes_since(session_id, after_sequence_number=0)
+                    except Exception:
+                        pass
+
+                if not timeline_events and (session_dir / "timeline.jsonl").exists():
+                    try:
+                        with open(session_dir / "timeline.jsonl", "r", encoding="utf-8") as file_handle:
+                            for line in file_handle:
+                                if line.strip():
+                                    timeline_events.append(json.loads(line))
+                        timeline_events = timeline_events[-40:]
+                    except Exception:
+                        pass
+
+                try:
+                    return await chat_agent.ask(question, timeline_events=timeline_events, notes_segments=notes_segments)
+                finally:
+                    if storage is not None:
+                        await storage.close()
+
             engine = QAEngine(
                 session_dir,
                 settings.ollama_url,

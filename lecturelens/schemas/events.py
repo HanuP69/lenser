@@ -1,8 +1,8 @@
 import json
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class TranscriptChunk(BaseModel):
@@ -147,6 +147,25 @@ class GeneralNoteSegment(BaseModel):
     key_points: list[str] = Field(default_factory=list)
     concept_tags: list[str] = Field(default_factory=list)
     slide_references: list[int] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _parse_serialized_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        copied = dict(data)
+        for field in ("key_points", "concept_tags", "slide_references"):
+            val = copied.get(field)
+            if isinstance(val, str):
+                trimmed = val.strip()
+                if trimmed.startswith("[") and trimmed.endswith("]"):
+                    try:
+                        copied[field] = json.loads(trimmed)
+                    except Exception:
+                        pass
+                elif len(trimmed) == 0:
+                    copied[field] = []
+        return copied
 
     def to_redis_dict(self) -> dict[str, str]:
         result = {

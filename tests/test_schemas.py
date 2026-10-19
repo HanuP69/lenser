@@ -3,7 +3,8 @@ from lecturelens.schemas.events import (
     TranscriptChunk,
     SlideCaptured,
     BoardCaptured,
-    TimelineEntry
+    TimelineEntry,
+    GeneralNoteSegment
 )
 
 
@@ -98,6 +99,24 @@ class TestSchemas(unittest.TestCase):
         legacy = slide.to_redis_dict()
         del legacy["revisited_slide_number"]
         self.assertEqual(SlideCaptured.from_redis_dict(legacy).revisited_slide_number, 0)
+
+    def test_general_note_segment_handles_serialized_json_strings(self) -> None:
+        data = {
+            "session_id": "test_sess_note",
+            "sequence_number": 1,
+            "timestamp_epoch": 1700000000.0,
+            "start_time": "00:00:00",
+            "end_time": "00:00:10",
+            "heading": "Intro",
+            "content": "Intro content",
+            "key_points": '["Point A", "Point B"]',
+            "concept_tags": '["tag1", "tag2"]',
+            "slide_references": "[1, 2]"
+        }
+        segment = GeneralNoteSegment(**data)
+        self.assertEqual(segment.key_points, ["Point A", "Point B"])
+        self.assertEqual(segment.concept_tags, ["tag1", "tag2"])
+        self.assertEqual(segment.slide_references, [1, 2])
 
 
 if __name__ == "__main__":

@@ -104,6 +104,12 @@ class TestStudentChatAgent(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(misconceptions), 1)
         self.assertEqual(misconceptions[0]["error_pattern"], "assumed trees must have >= 1 node")
 
+    async def test_student_chat_fallback_when_no_router(self) -> None:
+        agent = StudentChatAgent(llm_router=None, student_graph=self.graph)
+        answer, citations = await agent.ask("What is a red-black tree?")
+        self.assertIn("No LLM router", answer)
+        self.assertEqual(len(citations), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -29,11 +29,15 @@ GUIDELINES:
 class StudentChatAgent:
     def __init__(
         self,
-        llm_router: Any,
-        student_graph: Optional[StudentKnowledgeGraph] = None
+        llm_router: Any = None,
+        student_graph: Optional[StudentKnowledgeGraph] = None,
+        ollama_url: Optional[str] = None,
+        model_name: Optional[str] = None
     ) -> None:
         self.llm_router = llm_router
         self.student_graph = student_graph
+        self.ollama_url = ollama_url.rstrip("/") if ollama_url else None
+        self.model_name = model_name
 
     def format_context_excerpts(
         self,
@@ -86,8 +90,20 @@ class StudentChatAgent:
             f"TUTOR RESPONSE:"
         )
 
-        response = await self.llm_router.ainvoke([HumanMessage(content=prompt)])
-        raw_answer = response_to_text(response)
+        if self.llm_router is not None:
+            response = await self.llm_router.ainvoke([HumanMessage(content=prompt)])
+            raw_answer = response_to_text(response)
+        elif self.ollama_url:
+            import httpx
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    f"{self.ollama_url}/api/generate",
+                    json={"model": self.model_name or "gemma2:2b", "prompt": prompt, "stream": False}
+                )
+                resp.raise_for_status()
+                raw_answer = str(resp.json().get("response", "")).strip()
+        else:
+            raw_answer = "No LLM router or Ollama endpoint configured for student chat."
 
         citations = TIMESTAMP_PATTERN.findall(raw_answer)
 

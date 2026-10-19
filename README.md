@@ -12,7 +12,7 @@
 4. [Redis vs. Postgres: Durability & Replay](#redis-vs-postgres-durability--replay)
 5. [Thin Student Client & Personalization Engine](#thin-student-client--personalization-engine)
 6. [Student Knowledge Graph (`student_graph.db`)](#student-knowledge-graph-student_graphdb)
-7. [Automated Test Suite (256 Tests)](#automated-test-suite-256-tests)
+7. [Automated Test Suite (273 Tests)](#automated-test-suite-273-tests)
 8. [CLI Command Reference](#cli-command-reference)
 9. [Configuration & Environment Variables](#configuration--environment-variables)
 10. [Docker Compose & Getting Started](#docker-compose--getting-started)
@@ -223,12 +223,12 @@ Each student maintains an isolated, private SQLite database (`student_graph.db`)
 
 ---
 
-## Automated Test Suite (269 Tests)
+## Automated Test Suite (273 Tests)
 
-LectureLens maintains an automated test suite of **269 unit and integration tests** verifying concurrency, resilience, audio processing, screen capture, Postgres persistence, gateway fan-out, client personalization, and knowledge graphs:
+LectureLens maintains an automated test suite of **273 unit and integration tests** verifying concurrency, resilience, audio processing, screen capture, Postgres persistence, gateway fan-out, client personalization, and knowledge graphs:
 
 ```
-================= 266 passed, 3 skipped in 27.38s =================
+================= 270 passed, 3 skipped in 32.34s =================
 ```
 
 ### Module Breakdown:
@@ -236,22 +236,22 @@ LectureLens maintains an automated test suite of **269 unit and integration test
 | Test Module | Test Count | Scope & Behaviors Verified |
 | :--- | :--- | :--- |
 | `test_hardening.py` | **45 tests** | Regression coverage: replay-without-spin, duplicate protection, active-slide correlation, notes idempotency and marker, JSON recovery, adaptive VAD scenarios, vision retry, capture timestamps. |
-| `test_cli_and_runtime.py` | **30 tests** | CLI commands (`start`, `stop`, `pause`, `resume`, `status`, `export`, `replay`, `student`, `persister`, `review`), process flag coordination, option validations. |
+| `test_cli_and_runtime.py` | **31 tests** | CLI commands (`start`, `stop`, `pause`, `resume`, `status`, `export`, `replay`, `student`, `persister`, `review`, `ask`), process flag coordination, option validations. |
 | `test_gateway.py` | **29 tests** | WebSocket gateway server, API key validation, role separation, bounded subscriber queues, reconnect race buffering, two-gateway fan-out groups, datetime serialization. |
 | `test_importance.py` | **17 tests** | Verbal cue classification across English, Hindi, and Hinglish ("definition", "exam_relevant", "dhyaan do"). |
 | `test_audio_agent.py` | **16 tests** | RMS VAD energy gating, speech segmentation, audio mixing, faster-whisper chunking. |
 | `test_sync_agent.py` | **16 tests** | Redis Streams consumption, sliding merge window, cross-modal correlation IDs, chronological timeline serialization. |
 | `test_markdown_formatter.py` | **14 tests** | Code block indentation preservation, equation heading protection, unicode math preservation, display math block normalization. |
 | `test_llm_router.py` | **13 tests** | Multimodal task routing, OpenAI-compatible provider, Google GenAI, Ollama, circuit breaker rate-limiting, retries. |
-| `test_postgres_persister.py` | **12 tests** | Idempotent timeline events, general note sequence numbers, concept tag extraction and merge with `COALESCE`, crash recovery, pgvector support. |
+| `test_postgres_persister.py` | **13 tests** | Idempotent timeline events, general note sequence numbers, concept tag extraction and merge with `COALESCE`, crash recovery, pgvector support. |
 | `test_screen_agent.py` | **12 tests** | MSS screenshot grabbing, perceptual dHash hashing, Hamming distance slide cache, vision-LLM OCR fallback. |
 | `test_structuring_agent.py` | **11 tests** | LangGraph pipeline, rolling window, 20s context overlap, byte-offset tracking, robust JSON extraction, crash rollback. |
 | `test_clock_and_files.py` | **11 tests** | SessionClock persistence, elapsed duration calculation, accumulated_seconds tracking, atomic file writes. |
 | `test_redis_bus.py` | **8 tests** | Redis Streams resilient publishing, consumer group acknowledgements, delivery retry discarding with Redis persistence. |
 | `test_student_client.py` | **8 tests** | Thin client subscription, Hinglish/Hindi personalization engine, concise English rewrite, gap buffering & draining, sequence persistence across instances. |
 | `test_qa_engine.py` | **6 tests** | Vector indexing, pgvector integration with Chroma fallback, semantic search, RAG-grounded question answering with source citations. |
-| `test_schemas.py` | **5 tests** | Pydantic event schemas: `TranscriptChunk`, `SlideCaptured`, `TimelineEntry`, `GeneralNoteSegment`, `FlagMoment`. |
-| `test_student_chat_and_graph.py` | **5 tests** | Student knowledge graph, concept normalization, mastery decay, misconception recording with confidence, timestamp citations in tutor chat. |
+| `test_schemas.py` | **6 tests** | Pydantic event schemas: `TranscriptChunk`, `SlideCaptured`, `TimelineEntry`, `GeneralNoteSegment`, `FlagMoment`. |
+| `test_student_chat_and_graph.py` | **6 tests** | Student knowledge graph, concept normalization, mastery decay, misconception recording with confidence, timestamp citations in tutor chat. |
 | `test_concurrency.py` | **4 tests** | Thread pool and process pool executor allocation, worker limits, safe shutdown. |
 | `test_replay.py` | **3 tests** | ReplayEngine timeline playback, speed scaling (instant to real-time), Redis stream publishing. |
 | `test_circuit_breaker.py` | **3 tests** | Redis fixed-window rate limiter, failure count tracking and TTL cooldown. |
@@ -328,9 +328,13 @@ lecturelens export --session "cs101_01" --format md --output ./exports
 ```
 
 ### 9. `lecturelens ask`
-Interactive question-answering over indexed lecture knowledge with source citations:
+Interactive question-answering over indexed lecture knowledge with source citations and student misconception tracking:
 ```bash
+# Standard lecture QA
 lecturelens ask --session "cs101_01" "How does binary search achieve O(log n) time complexity?"
+
+# Personalized student tutor QA (updates student's personal knowledge graph and tracks misconceptions)
+lecturelens ask --session "cs101_01" --student-id "student_1" "Can a binary tree have 0 nodes?"
 ```
 
 ---

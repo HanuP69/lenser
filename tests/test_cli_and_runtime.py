@@ -279,6 +279,11 @@ class TestCliCommands(unittest.TestCase):
         cli_main.review(course="algorithms", session=None)
         cli_main.review(course=None, session="lec1")
 
+    def test_ask_command_accepts_student_id_argument(self) -> None:
+        import inspect
+        sig = inspect.signature(cli_main.ask)
+        self.assertIn("student_id", sig.parameters)
+
     def test_start_refuses_existing_session_without_resume(self) -> None:
         with self.assertRaises(typer.Exit):
             cli_main.start(

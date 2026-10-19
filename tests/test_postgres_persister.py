@@ -218,6 +218,14 @@ class TestPostgresStorageSyntax(unittest.TestCase):
         self.assertIn("COALESCE", source)
         self.assertIn("unnest", source)
 
+    def test_persister_main_inspects_parse_runtime_arguments_and_session_dir(self) -> None:
+        import inspect
+        from lecturelens.storage import persister
+        source = inspect.getsource(persister.main)
+        self.assertIn("parse_runtime_arguments", source)
+        self.assertIn("get_session_output_dir", source)
+        self.assertIn("stop_requested", source)
+
 
 @unittest.skipUnless(LIVE_PG_AVAILABLE, "Live Postgres not configured via POSTGRES_TEST_URL")
 class TestPostgresLiveIntegration(unittest.IsolatedAsyncioTestCase):
