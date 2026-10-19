@@ -310,5 +310,43 @@ class TestAudioAgent(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(source.restarts, 1)
 
 
+class TestMixedAndSystemBlockSource(unittest.TestCase):
+    def test_mixed_block_source_both_present(self) -> None:
+        from lecturelens.agents.audio_agent import MixedBlockSource
+        mixed_source = MixedBlockSource(16000, 0.1)
+        b1 = np.full(1600, 0.3, dtype=np.float32)
+        b2 = np.full(1600, 0.2, dtype=np.float32)
+        mixed_source.mic_source.block_queue.put(b1)
+        mixed_source.system_source.block_queue.put(b2)
+        out = mixed_source.read_block(0.1)
+        self.assertIsNotNone(out)
+        self.assertAlmostEqual(float(out[0]), 0.5, places=4)
+
+    def test_mixed_block_source_fallback_when_mic_none(self) -> None:
+        from lecturelens.agents.audio_agent import MixedBlockSource
+        mixed_source = MixedBlockSource(16000, 0.1)
+        b2 = np.full(1600, 0.4, dtype=np.float32)
+        mixed_source.system_source.block_queue.put(b2)
+        out = mixed_source.read_block(0.01)
+        self.assertIsNotNone(out)
+        self.assertAlmostEqual(float(out[0]), 0.4, places=4)
+
+    def test_mixed_block_source_fallback_when_sys_none(self) -> None:
+        from lecturelens.agents.audio_agent import MixedBlockSource
+        mixed_source = MixedBlockSource(16000, 0.1)
+        b1 = np.full(1600, 0.35, dtype=np.float32)
+        mixed_source.mic_source.block_queue.put(b1)
+        out = mixed_source.read_block(0.1)
+        self.assertIsNotNone(out)
+        self.assertAlmostEqual(float(out[0]), 0.35, places=4)
+
+    def test_system_block_source_strict_mode_raises_when_no_device(self) -> None:
+        from lecturelens.agents.audio_agent import SystemBlockSource
+        with mock.patch("lecturelens.agents.audio_agent.find_loopback_microphone", return_value=(None, "No loopback")):
+            sys_source = SystemBlockSource(16000, 0.1, strict=True)
+            with self.assertRaises(RuntimeError):
+                sys_source.start()
+
+
 if __name__ == "__main__":
     unittest.main()

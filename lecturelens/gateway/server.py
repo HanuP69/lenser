@@ -3,10 +3,17 @@ import base64
 import binascii
 import hmac
 import json
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
+
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
 
 from lecturelens.agents.audio_agent import AudioAgent
 from lecturelens.agents.screen_agent import ScreenAgent

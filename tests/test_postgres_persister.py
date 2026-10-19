@@ -1,8 +1,15 @@
 import asyncio
 import os
+import sys
 import unittest
 from typing import Any, Optional
 from unittest import mock
+
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
 
 from lecturelens.config.settings import Settings
 from lecturelens.core.redis_bus import RedisBus

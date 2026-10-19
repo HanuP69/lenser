@@ -8,6 +8,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
+
 import typer
 from rich.console import Console, Group
 from rich.live import Live
@@ -360,6 +366,11 @@ def start(
         validate_start_options(audio_source, llm_mode, mode)
     except ValueError as error:
         fail(str(error))
+    if mode != "server" and audio_source == "system":
+        from lecturelens.agents.audio_agent import find_loopback_microphone
+        _, loopback_err = find_loopback_microphone()
+        if loopback_err:
+            fail(f"Cannot use '--audio-source system': {loopback_err}")
     if course is not None and not is_valid_course_name(course):
         fail(f"Invalid course name: {course}")
 

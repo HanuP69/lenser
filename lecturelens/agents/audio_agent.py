@@ -343,41 +343,53 @@ class MicBlockSource:
         self.start()
 
 
+def find_loopback_microphone() -> tuple[Optional[Any], Optional[str]]:
+    import sys
+    try:
+        import soundcard
+    except Exception as err:
+        return None, f"soundcard library unavailable: {err}"
+    if sys.platform == "darwin":
+        loopbacks = [
+            m for m in soundcard.all_microphones(include_loopback=True)
+            if getattr(m, "isloopback", False)
+            or "blackhole" in str(getattr(m, "name", "")).lower()
+            or "soundflower" in str(getattr(m, "name", "")).lower()
+        ]
+        if loopbacks:
+            return loopbacks[0], None
+        return None, "System audio capture on macOS requires a virtual loopback device (such as BlackHole or Soundflower)"
+    try:
+        mic = soundcard.get_microphone(id=str(soundcard.default_speaker().id), include_loopback=True)
+        return mic, None
+    except Exception:
+        loopbacks = [m for m in soundcard.all_microphones(include_loopback=True) if getattr(m, "isloopback", False)]
+        if loopbacks:
+            return loopbacks[0], None
+    return None, "No loopback audio device found for system audio capture"
+
+
 class SystemBlockSource:
-    def __init__(self, sample_rate: int, block_seconds: float, max_queue_blocks: int = 600) -> None:
+    def __init__(
+        self,
+        sample_rate: int,
+        block_seconds: float,
+        max_queue_blocks: int = 600,
+        strict: bool = False
+    ) -> None:
         self.sample_rate: int = sample_rate
         self.block_frames: int = max(1, int(sample_rate * block_seconds))
         self.block_queue: queue.Queue = queue.Queue(maxsize=max_queue_blocks)
         self.thread: Optional[threading.Thread] = None
         self.is_running: bool = False
         self.dropped_blocks: int = 0
+        self.strict: bool = strict
+        self.mic: Any = None
+        self.device_error: Optional[str] = None
 
     def _record_loop(self) -> None:
         try:
-            import sys
-            import soundcard
-            mic = None
-            if sys.platform == "darwin":
-                loopbacks = [
-                    m for m in soundcard.all_microphones(include_loopback=True)
-                    if getattr(m, "isloopback", False)
-                    or "blackhole" in str(getattr(m, "name", "")).lower()
-                    or "soundflower" in str(getattr(m, "name", "")).lower()
-                ]
-                if loopbacks:
-                    mic = loopbacks[0]
-                else:
-                    logger.warning("System audio capture on macOS requires a virtual loopback device (e.g. BlackHole). Recording silence.")
-            else:
-                try:
-                    mic = soundcard.get_microphone(id=str(soundcard.default_speaker().id), include_loopback=True)
-                except Exception:
-                    loopbacks = [m for m in soundcard.all_microphones(include_loopback=True) if getattr(m, "isloopback", False)]
-                    if loopbacks:
-                        mic = loopbacks[0]
-
-            if mic is None:
-                logger.error("No loopback audio device found for system audio capture")
+            if self.mic is None:
                 frame_interval = float(self.block_frames) / float(self.sample_rate)
                 while self.is_running:
                     time.sleep(frame_interval)
@@ -388,7 +400,7 @@ class SystemBlockSource:
                         self.dropped_blocks += 1
                 return
 
-            with mic.recorder(samplerate=self.sample_rate, channels=1) as recorder:
+            with self.mic.recorder(samplerate=self.sample_rate, channels=1) as recorder:
                 while self.is_running:
                     data = recorder.record(numframes=self.block_frames)
                     if data is not None and len(data) > 0:
@@ -401,6 +413,11 @@ class SystemBlockSource:
             logger.error("System audio capture error: %s", error)
 
     def start(self) -> None:
+        self.mic, self.device_error = find_loopback_microphone()
+        if self.mic is None:
+            if self.strict:
+                raise RuntimeError(self.device_error or "No loopback audio device found for system audio capture")
+            logger.warning("No loopback audio device found for system audio capture; capturing silence")
         self.is_running = True
         self.thread = threading.Thread(target=self._record_loop, daemon=True)
         self.thread.start()
@@ -425,24 +442,31 @@ class SystemBlockSource:
 class MixedBlockSource:
     def __init__(self, sample_rate: int, block_seconds: float) -> None:
         self.mic_source = MicBlockSource(sample_rate, block_seconds)
-        self.system_source = SystemBlockSource(sample_rate, block_seconds)
+        self.system_source = SystemBlockSource(sample_rate, block_seconds, strict=False)
 
     def start(self) -> None:
         self.mic_source.start()
         self.system_source.start()
 
     def read_block(self, timeout_seconds: float) -> Optional[np.ndarray]:
-        mic_block = self.mic_source.read_block(timeout_seconds)
-        if mic_block is None:
-            return None
-
         while self.system_source.block_queue.qsize() > 5:
             try:
                 self.system_source.block_queue.get_nowait()
             except queue.Empty:
                 break
+        while self.mic_source.block_queue.qsize() > 5:
+            try:
+                self.mic_source.block_queue.get_nowait()
+            except queue.Empty:
+                break
 
-        sys_block = self.system_source.read_block(0.05)
+        mic_block = self.mic_source.read_block(timeout_seconds)
+        sys_block = self.system_source.read_block(0.02)
+
+        if mic_block is None and sys_block is None:
+            return None
+        if mic_block is None:
+            return sys_block
         if sys_block is None:
             return mic_block
 
@@ -464,7 +488,7 @@ def build_block_source(settings: Settings) -> Any:
     block_seconds = settings.audio_block_seconds
     audio_source = getattr(settings, "audio_source", "mic") or "mic"
     if audio_source == "system":
-        return SystemBlockSource(sample_rate, block_seconds)
+        return SystemBlockSource(sample_rate, block_seconds, strict=True)
     elif audio_source == "both":
         return MixedBlockSource(sample_rate, block_seconds)
     return MicBlockSource(sample_rate, block_seconds)

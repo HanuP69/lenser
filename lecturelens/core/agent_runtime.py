@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -192,6 +193,11 @@ async def run_standard_agent(build_agent: Callable[[RuntimeContext], Any]) -> No
 
 
 def execute_agent_main(main_function: Callable[[], Awaitable[None]]) -> None:
+    if sys.platform == "win32":
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        except Exception:
+            pass
     try:
         asyncio.run(main_function())
     except KeyboardInterrupt:

@@ -1,6 +1,13 @@
 import asyncio
 import logging
+import sys
 from typing import Any, Callable, Optional
+
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
 
 from lecturelens.config.settings import Settings
 from lecturelens.core.agent_runtime import (
