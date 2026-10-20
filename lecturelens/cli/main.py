@@ -146,6 +146,8 @@ def build_agent_environment(
         environment["LECTURELENS_POSTGRES_URL"] = settings.postgres_url
     if "UNOROUTER_API_KEY" in os.environ and "LECTURELENS_UNOROUTER_API_KEY" not in environment:
         environment["LECTURELENS_UNOROUTER_API_KEY"] = os.environ["UNOROUTER_API_KEY"]
+    if "UNOROUTER_API_KEYS" in os.environ and "LECTURELENS_UNOROUTER_API_KEYS" not in environment:
+        environment["LECTURELENS_UNOROUTER_API_KEYS"] = os.environ["UNOROUTER_API_KEYS"]
     return environment
 
 

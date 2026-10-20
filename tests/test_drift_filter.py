@@ -1,0 +1,161 @@
+import json
+import unittest
+from pathlib import Path
+from typing import Any
+from unittest import mock
+
+import numpy as np
+
+from lecturelens.core.drift_filter import (
+    ContextDriftFilter,
+    cosine_similarity,
+    is_refusal_text,
+    normalize_vector
+)
+
+
+class MockTextEmbedder:
+    def __init__(self) -> None:
+        self.vectors: dict[str, np.ndarray] = {}
+
+    def set_vector(self, text: str, vec: np.ndarray) -> None:
+        self.vectors[text.strip()] = normalize_vector(np.asarray(vec, dtype=np.float32))
+
+    def embed(self, text: str) -> np.ndarray:
+        clean = text.strip()
+        if clean in self.vectors:
+            return self.vectors[clean]
+        for key, vec in self.vectors.items():
+            if key in clean or clean in key:
+                return vec
+        return np.ones(8, dtype=np.float32) / np.sqrt(8.0)
+
+
+class TestDriftFilterMath(unittest.TestCase):
+    def test_normalize_vector(self) -> None:
+        zero = np.zeros(4, dtype=np.float32)
+        self.assertTrue(np.array_equal(normalize_vector(zero), zero))
+        vec = np.array([3.0, 4.0], dtype=np.float32)
+        normed = normalize_vector(vec)
+        self.assertAlmostEqual(float(np.linalg.norm(normed)), 1.0, places=5)
+
+    def test_cosine_similarity(self) -> None:
+        v1 = np.array([1.0, 0.0], dtype=np.float32)
+        v2 = np.array([0.0, 1.0], dtype=np.float32)
+        self.assertAlmostEqual(cosine_similarity(v1, v2), 0.0, places=5)
+        self.assertAlmostEqual(cosine_similarity(v1, v1), 1.0, places=5)
+        self.assertAlmostEqual(cosine_similarity(v1, np.zeros(2, dtype=np.float32)), 0.0, places=5)
+
+    def test_is_refusal_text(self) -> None:
+        self.assertTrue(is_refusal_text("Please provide the presentation slide image"))
+        self.assertTrue(is_refusal_text("no text or diagram was visible"))
+        self.assertTrue(is_refusal_text("I need an image of the presentation slide to transcribe"))
+        self.assertFalse(is_refusal_text("Quadratic equation roots and discriminant"))
+
+
+class TestContextDriftFilterBehavior(unittest.TestCase):
+    def setUp(self) -> None:
+        self.embedder = MockTextEmbedder()
+        self.filter = ContextDriftFilter(
+            drift_threshold=0.50,
+            sustain_consecutive=3,
+            min_words=4,
+            embedder=self.embedder
+        )
+
+        math_topic = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        math_related = np.array([0.9, 0.1, 0.0, 0.0], dtype=np.float32)
+        ad_topic = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)
+        new_chapter = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+
+        self.embedder.set_vector("Chapter 4 Quadratic Equation Master Plan", math_topic)
+        self.embedder.set_vector("Roots and discriminant of quadratic equation", math_related)
+        self.embedder.set_vector("Buy our revolutionary online communication course now", ad_topic)
+        self.embedder.set_vector("Welcome to chapter 5 arithmetic progressions", new_chapter)
+        self.embedder.set_vector("Arithmetic progressions common difference and nth term", new_chapter)
+        self.embedder.set_vector("Sum of first n terms of arithmetic progression", new_chapter)
+
+    def test_initial_anchor_and_on_topic_acceptance(self) -> None:
+        is_drift, score = self.filter.check_entry("Chapter 4 Quadratic Equation Master Plan")
+        self.assertFalse(is_drift)
+        self.assertEqual(score, 1.0)
+        self.assertEqual(self.filter.accepted_count, 1)
+
+        is_drift, score = self.filter.check_entry("Roots and discriminant of quadratic equation")
+        self.assertFalse(is_drift)
+        self.assertGreaterEqual(score, 0.50)
+        self.assertEqual(self.filter.accepted_count, 2)
+
+    def test_isolated_ad_is_filtered(self) -> None:
+        self.filter.check_entry("Chapter 4 Quadratic Equation Master Plan")
+        is_drift, score = self.filter.check_entry("Buy our revolutionary online communication course now")
+        self.assertTrue(is_drift)
+        self.assertLess(score, 0.50)
+
+        is_drift, score = self.filter.check_entry("Roots and discriminant of quadratic equation")
+        self.assertFalse(is_drift)
+        self.assertGreaterEqual(score, 0.50)
+
+    def test_sustained_shift_updates_anchor(self) -> None:
+        self.filter.check_entry("Chapter 4 Quadratic Equation Master Plan")
+
+        is_drift, _ = self.filter.check_entry("Welcome to chapter 5 arithmetic progressions")
+        self.assertTrue(is_drift)
+
+        is_drift, _ = self.filter.check_entry("Arithmetic progressions common difference and nth term")
+        self.assertTrue(is_drift)
+
+        is_drift, _ = self.filter.check_entry("Sum of first n terms of arithmetic progression")
+        self.assertFalse(is_drift)
+
+    def test_short_banter_bypasses_drift(self) -> None:
+        self.filter.check_entry("Chapter 4 Quadratic Equation Master Plan")
+        is_drift, score = self.filter.check_entry("Yes okay")
+        self.assertFalse(is_drift)
+        self.assertEqual(score, 1.0)
+
+    def test_filter_batch_entries_drops_drift(self) -> None:
+        self.filter.check_entry("Chapter 4 Quadratic Equation Master Plan")
+        entries = [
+            {"content": "Roots and discriminant of quadratic equation", "source_type": "transcript"},
+            {"content": "Buy our revolutionary online communication course now", "source_type": "slide"},
+            {"content": "Please provide the presentation slide image", "source_type": "slide"}
+        ]
+        kept = self.filter.filter_batch_entries(entries)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["content"], "Roots and discriminant of quadratic equation")
+
+
+class TestRecordedTimelineFiltering(unittest.TestCase):
+    def test_yt_test_timeline_filtering(self) -> None:
+        timeline_path = Path("C:/Users/enup1/output/yt_test/timeline.jsonl")
+        if not timeline_path.exists():
+            self.skipTest("yt_test output not available on disk")
+
+        filt = ContextDriftFilter(
+            session_topic="Chapter 4 Core Dactic Equation Master Plan Quadratic Equations",
+            drift_threshold=0.48,
+            sustain_consecutive=3,
+            min_words=8
+        )
+
+        entries = []
+        with open(timeline_path, "r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped:
+                    entries.append(json.loads(stripped))
+
+        kept = filt.filter_batch_entries(entries)
+        contents = [e.get("content", "") for e in kept]
+
+        for c in contents:
+            self.assertNotIn("The Importance of Effective Communication", c)
+            self.assertFalse(is_refusal_text(c))
+
+        has_math = any("quadratic equation" in c.lower() or "factorization" in c.lower() for c in contents)
+        self.assertTrue(has_math)
+
+
+if __name__ == "__main__":
+    unittest.main()

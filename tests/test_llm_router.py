@@ -1,4 +1,5 @@
 import asyncio
+import os
 import unittest
 from typing import Any, Optional
 from unittest import mock
@@ -259,6 +260,60 @@ class TestMessages(unittest.TestCase):
                 data = yaml.safe_load(file_handle)
             self.assertIn("screen_ocr", data.get("task_routing", {}))
             self.assertNotIn("board_ocr", data.get("task_routing", {}))
+
+    def test_extract_provider_api_keys_formats(self) -> None:
+        from lecturelens.router.llm_router import extract_provider_api_keys
+
+        with mock.patch.dict(os.environ, {"UNOROUTER_API_KEY": "single_key"}, clear=True):
+            keys = extract_provider_api_keys("unorouter", {"api_key_env": "UNOROUTER_API_KEY"})
+            self.assertEqual(keys, ["single_key"])
+
+        with mock.patch.dict(os.environ, {"UNOROUTER_API_KEY": "k1, k2, k3"}, clear=True):
+            keys = extract_provider_api_keys("unorouter", {"api_key_env": "UNOROUTER_API_KEY"})
+            self.assertEqual(keys, ["k1", "k2", "k3"])
+
+        with mock.patch.dict(os.environ, {"UNOROUTER_API_KEYS": "key_a,key_b;key_c"}, clear=True):
+            keys = extract_provider_api_keys("unorouter", {"api_key_env": "UNOROUTER_API_KEY"})
+            self.assertEqual(keys, ["key_a", "key_b", "key_c"])
+
+    def test_rotating_chat_openai_round_robin_and_failover(self) -> None:
+        from lecturelens.router.llm_router import RotatingChatOpenAI
+
+        class DummyCallModel:
+            def __init__(self, tag: str, fail_429: bool = False) -> None:
+                self.tag = tag
+                self.fail_429 = fail_429
+                self.call_count = 0
+
+            async def ainvoke(self, messages: Any, **kwargs: Any) -> Any:
+                self.call_count += 1
+                if self.fail_429:
+                    err = Exception("429 Too Many Requests: rate limit exceeded")
+                    setattr(err, "status_code", 429)
+                    raise err
+                return AIMessage(content=f"from_{self.tag}")
+
+        m1 = DummyCallModel("m1")
+        m2 = DummyCallModel("m2")
+        rotating = RotatingChatOpenAI([m1, m2], ["k1", "k2"])
+
+        res1 = asyncio.run(rotating.ainvoke([HumanMessage(content="hi")]))
+        self.assertEqual(res1.content, "from_m1")
+
+        res2 = asyncio.run(rotating.ainvoke([HumanMessage(content="hi")]))
+        self.assertEqual(res2.content, "from_m2")
+
+        res3 = asyncio.run(rotating.ainvoke([HumanMessage(content="hi")]))
+        self.assertEqual(res3.content, "from_m1")
+
+        failing_m1 = DummyCallModel("failing_m1", fail_429=True)
+        fallback_m2 = DummyCallModel("fallback_m2")
+        rotating_failover = RotatingChatOpenAI([failing_m1, fallback_m2], ["k1", "k2"])
+
+        res_recovered = asyncio.run(rotating_failover.ainvoke([HumanMessage(content="hi")]))
+        self.assertEqual(res_recovered.content, "from_fallback_m2")
+        self.assertEqual(failing_m1.call_count, 1)
+        self.assertEqual(fallback_m2.call_count, 1)
 
 
 if __name__ == "__main__":

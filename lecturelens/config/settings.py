@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     }
 
     redis_url: str = Field(default="redis://127.0.0.1:6379")
-    postgres_url: str = Field(default="postgresql://postgres:postgres@127.0.0.1:5432/lecturelens")
+    postgres_url: str = Field(default="postgresql://postgres:postgres@127.0.0.1:5433/lecturelens")
     ollama_url: str = Field(default="http://127.0.0.1:11434")
     local_model: str = Field(default=DEFAULT_LOCAL_MODEL)
     embedding_model: str = Field(default=DEFAULT_EMBEDDING_MODEL)
@@ -95,8 +95,14 @@ class Settings(BaseSettings):
     ollama_model: Optional[str] = Field(default=None)
     unorouter_model: Optional[str] = Field(default=None)
     unorouter_api_key: Optional[str] = Field(default=None)
+    unorouter_api_keys: Optional[str] = Field(default=None)
     openrouter_api_key: Optional[str] = Field(default=None)
     google_api_key: Optional[str] = Field(default=None)
+    enable_drift_filter: bool = Field(default=True)
+    drift_similarity_threshold: float = Field(default=0.48)
+    drift_consecutive_shift: int = Field(default=3)
+    drift_min_content_words: int = Field(default=8)
+    drift_embed_model: str = Field(default="nomic-embed-text")
 
     def get_session_output_dir(self, session_id: str) -> Path:
         session_dir = self.output_dir / session_id

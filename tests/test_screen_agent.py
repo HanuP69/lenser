@@ -198,5 +198,59 @@ class TestScreenHelpers(unittest.TestCase):
         self.assertEqual(decoded.getpixel((0, 0)), (30, 20, 10))
 
 
+class TestVisionEmbedderAndGate(unittest.TestCase):
+    def test_vision_embedder_preprocessing_and_similarity(self) -> None:
+        from lecturelens.core.vision_embedder import VisionEmbedder
+        embedder = VisionEmbedder(auto_download=False)
+        dummy_img = np.zeros((100, 100), dtype=np.uint8)
+        tensor = embedder.preprocess(dummy_img)
+        self.assertEqual(tensor.shape, (1, 3, 224, 224))
+        self.assertEqual(tensor.dtype, np.float32)
+
+        v1 = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        v2 = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        v3 = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        self.assertAlmostEqual(embedder.similarity(v1, v2), 1.0)
+        self.assertAlmostEqual(embedder.similarity(v1, v3), 0.0)
+
+    def test_spatial_block_similarity(self) -> None:
+        from lecturelens.core.image_utils import compute_spatial_block_similarity
+        arr1 = np.ones((60, 80), dtype=np.uint8) * 100
+        arr2 = np.ones((60, 80), dtype=np.uint8) * 100
+        sim = compute_spatial_block_similarity(arr1, arr2)
+        self.assertAlmostEqual(sim, 1.0)
+
+    def test_slide_change_gate_with_mock_embedder_filters_motion(self) -> None:
+        from lecturelens.core.image_utils import SlideChangeGate
+        class MockEmbedder:
+            def __init__(self) -> None:
+                self.sim_return = 0.98
+
+            def embed(self, arr: np.ndarray) -> np.ndarray:
+                return np.ones(10, dtype=np.float32) / np.sqrt(10.0)
+
+            def similarity(self, v1: np.ndarray, v2: np.ndarray) -> float:
+                return self.sim_return
+
+        mock_emb = MockEmbedder()
+        gate = SlideChangeGate(
+            change_threshold=0.004,
+            pixel_delta=25,
+            min_interval_seconds=1.0,
+            embedder=mock_emb,
+            similarity_threshold=0.95
+        )
+        f1 = np.zeros((100, 100), dtype=np.uint8)
+        self.assertTrue(gate.evaluate(f1, 0.0))
+
+        f2 = np.zeros((100, 100), dtype=np.uint8)
+        f2[:30, :30] = 200
+        mock_emb.sim_return = 0.98
+        self.assertFalse(gate.evaluate(f2, 2.0))
+
+        mock_emb.sim_return = 0.80
+        self.assertTrue(gate.evaluate(f2, 3.0))
+
+
 if __name__ == "__main__":
     unittest.main()

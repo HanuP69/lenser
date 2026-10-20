@@ -1,12 +1,13 @@
 import asyncio
 import os
+import re
 from pathlib import Path
 from typing import Any, Optional
 
 import yaml
 import redis.asyncio as redis
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.runnables import RunnableLambda
+from langchain_core.runnables import Runnable, RunnableLambda
 
 from lecturelens.core.circuit_breaker import RedisRateLimiter, RedisCircuitBreaker
 from lecturelens.core.logging_setup import get_logger
@@ -109,11 +110,86 @@ def provider_allowed_for_mode(provider_config: dict[str, Any], llm_mode: str) ->
     return True
 
 
+def extract_provider_api_keys(
+    provider_name: str,
+    provider_config: dict[str, Any]
+) -> list[str]:
+    env_var_name = provider_config.get("api_key_env", "OPENROUTER_API_KEY")
+    candidates: list[str] = []
+
+    plural_name = f"{env_var_name}S"
+    for candidate_name in (
+        plural_name,
+        f"LECTURELENS_{plural_name}",
+        env_var_name,
+        f"LECTURELENS_{env_var_name}"
+    ):
+        raw = os.environ.get(candidate_name, "").strip()
+        if len(raw) > 0:
+            candidates.append(raw)
+            break
+
+    if env_var_name in ("GOOGLE_API_KEY", "GEMINI_API_KEY") and len(candidates) == 0:
+        for alt in ("GEMINI_API_KEYS", "LECTURELENS_GEMINI_API_KEYS", "GEMINI_API_KEY", "LECTURELENS_GEMINI_API_KEY"):
+            raw = os.environ.get(alt, "").strip()
+            if len(raw) > 0:
+                candidates.append(raw)
+                break
+
+    keys: list[str] = []
+    for candidate in candidates:
+        tokens = re.split(r"[,;\n]+", candidate)
+        for token in tokens:
+            cleaned = token.strip().strip("'\"")
+            if len(cleaned) > 0 and cleaned not in keys:
+                keys.append(cleaned)
+    return keys
+
+
+class RotatingChatOpenAI(Runnable):
+    def __init__(self, models: list[Any], keys: list[str]) -> None:
+        self.models: list[Any] = models
+        self.keys: list[str] = keys
+        self.current_index: int = 0
+        self.key_count: int = len(models)
+        self.lock: asyncio.Lock = asyncio.Lock()
+
+    def invoke(self, input: Any, config: Optional[dict[str, Any]] = None, **kwargs: Any) -> Any:
+        idx = self.current_index % len(self.models)
+        self.current_index = (self.current_index + 1) % len(self.models)
+        return self.models[idx].invoke(input, config=config, **kwargs)
+
+    async def ainvoke(self, input: Any, config: Optional[dict[str, Any]] = None, **kwargs: Any) -> Any:
+        async with self.lock:
+            idx = self.current_index % len(self.models)
+            self.current_index = (self.current_index + 1) % len(self.models)
+
+        last_error: Optional[Exception] = None
+        for attempt in range(len(self.models)):
+            active_idx = (idx + attempt) % len(self.models)
+            active_model = self.models[active_idx]
+            try:
+                return await active_model.ainvoke(input, config=config, **kwargs)
+            except Exception as invocation_error:
+                last_error = invocation_error
+                error_str = str(invocation_error).lower()
+                status_code = getattr(invocation_error, "status_code", None)
+                if status_code in (429, 500, 502, 503, 504) or "rate limit" in error_str or "quota" in error_str:
+                    logger.warning(
+                        "key index %d hit rate limit/error (%s), rotating to next key (attempt %d/%d)",
+                        active_idx, invocation_error, attempt + 1, len(self.models)
+                    )
+                    continue
+                raise
+        if last_error is not None:
+            raise last_error
+
+
 def create_base_chat_model(
     provider_name: str,
     provider_config: dict[str, Any],
     ollama_url: Optional[str] = None
-) -> Optional[BaseChatModel]:
+) -> Optional[Any]:
     resolved_ollama_url = ollama_url or os.environ.get("LECTURELENS_OLLAMA_URL", "http://localhost:11434")
     provider_type = provider_config.get("type", "")
     model_name = provider_config.get("model", "")
@@ -133,12 +209,9 @@ def create_base_chat_model(
         )
 
     if provider_type == "openai_compatible":
-        env_var_name = provider_config.get("api_key_env", "OPENROUTER_API_KEY")
-        api_key = os.environ.get(env_var_name, "")
-        if len(api_key) == 0:
-            api_key = os.environ.get(f"LECTURELENS_{env_var_name}", "")
-        if len(api_key) == 0:
-            logger.info("provider %s skipped: %s not set", provider_name, env_var_name)
+        api_keys = extract_provider_api_keys(provider_name, provider_config)
+        if len(api_keys) == 0:
+            logger.info("provider %s skipped: %s not set", provider_name, provider_config.get("api_key_env", ""))
             return None
         try:
             from langchain_openai import ChatOpenAI
@@ -147,24 +220,28 @@ def create_base_chat_model(
             return None
         base_url = provider_config.get("base_url", "https://openrouter.ai/api/v1")
         model_name = os.environ.get(f"LECTURELENS_{provider_name.upper()}_MODEL") or provider_config.get("model", "")
-        return ChatOpenAI(
-            base_url=base_url,
-            api_key=api_key,
-            model=model_name,
-            max_retries=2
-        )
+        if len(api_keys) == 1:
+            return ChatOpenAI(
+                base_url=base_url,
+                api_key=api_keys[0],
+                model=model_name,
+                max_retries=2
+            )
+        models = [
+            ChatOpenAI(
+                base_url=base_url,
+                api_key=key,
+                model=model_name,
+                max_retries=1
+            )
+            for key in api_keys
+        ]
+        return RotatingChatOpenAI(models, api_keys)
 
     if provider_type == "google_genai":
-        env_var_name = provider_config.get("api_key_env", "GOOGLE_API_KEY")
-        api_key = os.environ.get(env_var_name, "")
-        if len(api_key) == 0 and env_var_name in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
-            api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
-        if len(api_key) == 0:
-            api_key = os.environ.get(f"LECTURELENS_{env_var_name}", "")
-        if len(api_key) == 0 and env_var_name in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
-            api_key = os.environ.get("LECTURELENS_GOOGLE_API_KEY") or os.environ.get("LECTURELENS_GEMINI_API_KEY", "")
-        if len(api_key) == 0:
-            logger.info("provider %s skipped: %s not set", provider_name, env_var_name)
+        api_keys = extract_provider_api_keys(provider_name, provider_config)
+        if len(api_keys) == 0:
+            logger.info("provider %s skipped: %s not set", provider_name, provider_config.get("api_key_env", ""))
             return None
         try:
             from langchain_google_genai import ChatGoogleGenerativeAI
@@ -173,7 +250,7 @@ def create_base_chat_model(
             return None
         return ChatGoogleGenerativeAI(
             model=model_name,
-            google_api_key=api_key,
+            google_api_key=api_keys[0],
             max_retries=0
         )
 
@@ -274,10 +351,14 @@ def build_router_for_task(
         rate_limit_info = current_provider_config.get("rate_limit", {})
         breaker_info = current_provider_config.get("circuit_breaker", {})
 
+        base_rpm = rate_limit_info.get("max_rpm", 60)
+        key_count = getattr(base_model, "key_count", 1)
+        effective_max_rpm = base_rpm * key_count
+
         rate_limiter = RedisRateLimiter(
             redis_client=redis_client,
             provider_name=provider_name,
-            max_requests_per_window=rate_limit_info.get("max_rpm", 60),
+            max_requests_per_window=effective_max_rpm,
             window_seconds=rate_limit_info.get("window_seconds", 60)
         )
         circuit_breaker = RedisCircuitBreaker(
@@ -339,9 +420,12 @@ async def get_router_status(
             rows.append(row)
             continue
 
+        keys = extract_provider_api_keys(provider_name, provider_config)
+        key_count = max(1, len(keys))
+        effective_max_rpm = rate_limit_info.get("max_rpm", 60) * key_count
         limiter = RedisRateLimiter(
             redis_client, provider_name,
-            rate_limit_info.get("max_rpm", 60), rate_limit_info.get("window_seconds", 60)
+            effective_max_rpm, rate_limit_info.get("window_seconds", 60)
         )
         breaker = RedisCircuitBreaker(
             redis_client, provider_name,

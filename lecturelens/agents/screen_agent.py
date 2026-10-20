@@ -25,6 +25,7 @@ from lecturelens.core.image_utils import (
 )
 from lecturelens.core.logging_setup import get_logger
 from lecturelens.core.redis_bus import RedisBus
+from lecturelens.core.vision_embedder import VisionEmbedder
 from lecturelens.router.messages import build_image_message, response_to_text
 from lecturelens.schemas.events import SlideCaptured
 
@@ -131,10 +132,12 @@ class ScreenAgent:
         self.stream_name: str = f"lecturelens:{session_id}:stream:slide"
         self.control: AgentControl = AgentControl(session_dir, "screen_agent")
         self.slide_counter: int = next_file_index(self.slides_dir, "slide_", ".png") - 1
+        self.vision_embedder = VisionEmbedder()
         self.gate: SlideChangeGate = SlideChangeGate(
             change_threshold=settings.slide_diff_threshold,
             pixel_delta=settings.slide_pixel_delta,
-            min_interval_seconds=settings.slide_min_interval_seconds
+            min_interval_seconds=settings.slide_min_interval_seconds,
+            embedder=self.vision_embedder
         )
         self.slide_hashes: list[tuple[int, int, np.ndarray]] = []
         self.slide_texts: dict[int, str] = {}
@@ -177,7 +180,16 @@ class ScreenAgent:
         for attempt in range(max_retries):
             try:
                 response = await self.llm_router.ainvoke([message])
-                return response_to_text(response)
+                text = response_to_text(response).strip()
+                lower = text.lower()
+                if (
+                    "please provide" in lower
+                    or "no text or diagram was visible" in lower
+                    or "i need an image" in lower
+                    or "no text is currently visible" in lower
+                ):
+                    return ""
+                return text
             except Exception as error:
                 logger.error("slide vision fallback failed (attempt %d/%d): %s", attempt + 1, max_retries, error)
                 if attempt < max_retries - 1:
@@ -315,10 +327,11 @@ class ScreenAgent:
                 if self.control.stop_requested():
                     break
                 try:
+                    detection_epoch = self.session_clock.get_timestamp()
                     png_bytes = await run_in_thread_pool(encode_frame_as_png, frame)
                     if self.control.stop_requested():
                         break
-                    await self.accept_png(png_bytes, frame.thumbnail)
+                    await self.accept_png(png_bytes, frame.thumbnail, capture_epoch=detection_epoch)
                 except Exception as error:
                     logger.error("slide processing failed: %s", error)
                     self.control.increment_stat("slide_errors")

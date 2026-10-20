@@ -19,6 +19,7 @@ from lecturelens.core.agent_runtime import (
     run_standard_agent
 )
 from lecturelens.core.fileio import atomic_write_text
+from lecturelens.core.drift_filter import ContextDriftFilter
 from lecturelens.core.logging_setup import get_logger
 from lecturelens.core.markdown_formatter import format_clean_markdown
 from lecturelens.router.messages import response_to_text
@@ -364,7 +365,8 @@ class StructuringAgent:
         session_id: str,
         llm_router: Any,
         redis_bus: Any = None,
-        storage: Any = None
+        storage: Any = None,
+        drift_filter: Optional[ContextDriftFilter] = None
     ) -> None:
         self.settings: Settings = settings
         self.session_id: str = session_id
@@ -372,6 +374,18 @@ class StructuringAgent:
         self.redis_bus: Any = redis_bus
         self.storage: Any = storage
         self.is_running: bool = False
+
+        if drift_filter is not None:
+            self.drift_filter: Optional[ContextDriftFilter] = drift_filter
+        elif getattr(settings, "enable_drift_filter", True):
+            self.drift_filter = ContextDriftFilter(
+                embed_model=getattr(settings, "drift_embed_model", "nomic-embed-text"),
+                drift_threshold=getattr(settings, "drift_similarity_threshold", 0.48),
+                sustain_consecutive=getattr(settings, "drift_consecutive_shift", 3),
+                min_words=getattr(settings, "drift_min_content_words", 3)
+            )
+        else:
+            self.drift_filter = None
 
         session_dir = settings.create_session_directories(session_id)
         self.session_dir: Path = session_dir
@@ -528,8 +542,19 @@ class StructuringAgent:
         return "\n".join(section_lines) + "\n"
 
     async def process_single_batch(self, batch: SliceBatch, running_context: str) -> str:
+        entries = batch.entries
+        if self.drift_filter is not None:
+            entries = self.drift_filter.filter_batch_entries(batch.entries)
+
+        if len(entries) == 0:
+            logger.info("all entries in batch ending at offset %d filtered as drift/ad; skipping synthesis", batch.end_offset)
+            self.save_notes_marker(batch.end_offset)
+            self.save_state(running_context, batch.end_offset, self.current_overlap)
+            return running_context
+
+        active_batch = SliceBatch(entries=entries, end_offset=batch.end_offset)
         initial_state: StructuringState = {
-            "timeline_slice": batch.entries,
+            "timeline_slice": entries,
             "running_context": running_context,
             "correlated_groups": [],
             "summary": "",
@@ -547,12 +572,12 @@ class StructuringAgent:
         concept_tags = result_state.get("concept_tags", []) or [d["term"] for d in definitions if "term" in d]
         action_items = result_state.get("action_items", []) or []
 
-        first_timestamp = float(batch.entries[0].get("timestamp_epoch", 0.0))
-        last_timestamp = float(batch.entries[-1].get("timestamp_epoch", first_timestamp))
+        first_timestamp = float(entries[0].get("timestamp_epoch", 0.0))
+        last_timestamp = float(entries[-1].get("timestamp_epoch", first_timestamp))
         start_time_str = time.strftime("%H:%M:%S", time.localtime(first_timestamp))
         end_time_str = time.strftime("%H:%M:%S", time.localtime(last_timestamp))
 
-        section_text = self.build_notes_section(batch, result_state)
+        section_text = self.build_notes_section(active_batch, result_state)
         if len(section_text) > 0:
             if self.notes_path.exists() and self.load_notes_marker() >= batch.end_offset:
                 logger.info(
@@ -566,7 +591,7 @@ class StructuringAgent:
         self.sequence_number += 1
 
         slide_references: list[int] = []
-        for entry in batch.entries:
+        for entry in entries:
             if entry.get("source_type") == "slide":
                 metadata = entry.get("metadata", {}) or {}
                 slide_num = metadata.get("slide_number")
@@ -598,7 +623,7 @@ class StructuringAgent:
             except Exception as error:
                 logger.warning("failed to publish note segment to redis: %s", error)
 
-        next_overlap = extract_overlap_entries(batch.entries, OVERLAP_WINDOW_SECONDS)
+        next_overlap = extract_overlap_entries(entries, OVERLAP_WINDOW_SECONDS)
         self.current_overlap = next_overlap
 
         new_context = str(result_state.get("running_context", running_context))

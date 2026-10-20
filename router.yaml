@@ -17,9 +17,37 @@ providers:
     type: openai_compatible
     cloud: true
     base_url: "https://api.unorouter.com/v1"
-    model: "gemma-4-26b:free"
+    model: "gemini-3.6-flash:free"
     api_key_env: "UNOROUTER_API_KEY"
     timeout_seconds: 120
+    rate_limit:
+      max_rpm: 20
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 3
+      cooldown_seconds: 60
+
+  unorouter_structuring:
+    type: openai_compatible
+    cloud: true
+    base_url: "https://api.unorouter.com/v1"
+    model: "qwen3.6-35b-a3b:free"
+    api_key_env: "UNOROUTER_API_KEY"
+    timeout_seconds: 120
+    rate_limit:
+      max_rpm: 20
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 3
+      cooldown_seconds: 60
+
+  unorouter_qa:
+    type: openai_compatible
+    cloud: true
+    base_url: "https://api.unorouter.com/v1"
+    model: "gemini-3.5-flash-lite:free"
+    api_key_env: "UNOROUTER_API_KEY"
+    timeout_seconds: 90
     rate_limit:
       max_rpm: 20
       window_seconds: 60
@@ -56,16 +84,18 @@ providers:
 
 task_routing:
   screen_ocr:
-    - gemma
     - unorouter
+    - gemma
     - openrouter
     - gemini
   structuring:
-    - gemma
+    - unorouter_structuring
     - unorouter
+    - gemma
     - openrouter
     - gemini
   qa:
+    - unorouter_qa
     - gemma
     - unorouter
     - openrouter
