@@ -258,6 +258,35 @@ class TestSyncEndToEnd(SyncTestBase):
         self.assertFalse(agent.acknowledge.called)
         self.assertFalse(agent.timeline_path.exists())
 
+    async def test_sync_agent_deduplicates_redelivered_event_id(self) -> None:
+        agent = SyncAgent(self.settings, self.bus, SessionClock(), "test_sync_dedup_session")
+        agent.acknowledge = mock.AsyncMock()
+        chunk = TranscriptChunk(
+            session_id="test_sync_dedup_session",
+            event_id="chunk_dup_1",
+            timestamp_epoch=100.0,
+            start_seconds=0.0,
+            end_seconds=2.0,
+            text="First and only",
+            confidence=0.9
+        )
+        entry1 = agent.transcript_to_entry(chunk)
+        self.assertEqual(entry1.event_id, "chunk_dup_1")
+        await agent.add_entry(entry1, stream_name="stream_tr", group_name="grp", message_id="1-0")
+        self.assertEqual(len(agent.pending_buffer), 1)
+
+        flushed = await agent.flush_ready_entries(force=True)
+        self.assertEqual(flushed, 1)
+
+        entry2 = agent.transcript_to_entry(chunk)
+        await agent.add_entry(entry2, stream_name="stream_tr", group_name="grp", message_id="2-0")
+        self.assertEqual(agent.duplicates_skipped, 1)
+        self.assertEqual(len(agent.pending_buffer), 0)
+        agent.acknowledge.assert_called_with("stream_tr", "grp", "2-0")
+
+        lines = agent.timeline_path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

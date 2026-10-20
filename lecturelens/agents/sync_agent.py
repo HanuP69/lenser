@@ -75,6 +75,7 @@ class SyncAgent:
         self.pending_buffer: list[BufferedEntry] = []
         self.pending_message_ids: set[tuple[str, str]] = set()
         self.written_fingerprints: set[str] = set()
+        self.written_event_ids: set[str] = set()
         self.fingerprint_order: deque = deque()
         self.duplicates_skipped: int = 0
         self.recent_anchors: list[AnchorRecord] = []
@@ -100,6 +101,8 @@ class SyncAgent:
             except (ValueError, TypeError):
                 continue
             self.remember_fingerprint(entry_fingerprint(restored))
+            if restored.event_id:
+                self.written_event_ids.add(restored.event_id)
 
     def remember_fingerprint(self, fingerprint: str) -> None:
         if fingerprint in self.written_fingerprints:
@@ -124,6 +127,7 @@ class SyncAgent:
         elapsed = self.session_clock.elapsed_for_epoch(event.timestamp_epoch)
         return TimelineEntry(
             session_id=event.session_id,
+            event_id=event.event_id,
             timestamp_epoch=event.timestamp_epoch,
             elapsed_seconds=elapsed,
             source_type="transcript",
@@ -143,6 +147,7 @@ class SyncAgent:
         elapsed = self.session_clock.elapsed_for_epoch(event.timestamp_epoch)
         return TimelineEntry(
             session_id=event.session_id,
+            event_id=event.event_id,
             timestamp_epoch=event.timestamp_epoch,
             elapsed_seconds=elapsed,
             source_type="slide",
@@ -171,7 +176,16 @@ class SyncAgent:
             if pending_key is not None and pending_key in self.pending_message_ids:
                 self.duplicates_skipped += 1
                 return
-            if entry_fingerprint(entry) in self.written_fingerprints:
+            if entry.event_id and any(b.entry.event_id == entry.event_id for b in self.pending_buffer):
+                self.duplicates_skipped += 1
+                await self.acknowledge(stream_name, group_name, message_id)
+                return
+            if entry.event_id and entry.event_id in self.written_event_ids:
+                self.duplicates_skipped += 1
+                await self.acknowledge(stream_name, group_name, message_id)
+                return
+            fp = entry_fingerprint(entry)
+            if fp in self.written_fingerprints:
                 self.duplicates_skipped += 1
                 await self.acknowledge(stream_name, group_name, message_id)
                 return
@@ -382,6 +396,8 @@ class SyncAgent:
 
             for buffered in ready:
                 self.remember_fingerprint(entry_fingerprint(buffered.entry))
+                if buffered.entry.event_id:
+                    self.written_event_ids.add(buffered.entry.event_id)
                 if buffered.message_id is not None:
                     self.pending_message_ids.discard((buffered.stream_name or "", buffered.message_id))
                 await self.acknowledge(buffered.stream_name, buffered.group_name, buffered.message_id)

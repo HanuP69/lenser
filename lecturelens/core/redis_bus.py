@@ -82,23 +82,24 @@ class RedisBus:
         if not self.outbox_path:
             return
         self.outbox_path.parent.mkdir(parents=True, exist_ok=True)
-        is_legacy = False
-        legacy_path = None
-        if self.outbox_path.exists():
+        legacy_path = self.outbox_path.with_suffix(".legacy_migration")
+        legacy_source = None
+        if legacy_path.exists():
+            legacy_source = legacy_path
+        elif self.outbox_path.exists():
             try:
                 with open(self.outbox_path, "rb") as check_f:
                     header = check_f.read(16)
                     if header and not header.startswith(b"SQLite format 3"):
-                        is_legacy = True
+                        self.outbox_path.rename(legacy_path)
+                        legacy_source = legacy_path
             except Exception:
                 pass
 
         legacy_items: list[tuple[str, Any]] = []
-        if is_legacy:
+        if legacy_source and legacy_source.exists():
             try:
-                legacy_path = self.outbox_path.with_suffix(".legacy_migration")
-                self.outbox_path.rename(legacy_path)
-                with open(legacy_path, "r", encoding="utf-8") as f:
+                with open(legacy_source, "r", encoding="utf-8") as f:
                     for line in f:
                         stripped = line.strip()
                         if stripped:
@@ -132,8 +133,15 @@ class RedisBus:
                     (ev_id, s, json.dumps(p), time.time())
                 )
             self._db_conn.commit()
-            if legacy_path and legacy_path.exists():
-                legacy_path.unlink(missing_ok=True)
+            try:
+                cur = self._db_conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM outbox_entries;")
+                count_row = cur.fetchone()
+                if count_row and count_row[0] >= len(legacy_items):
+                    if legacy_path and legacy_path.exists():
+                        legacy_path.unlink(missing_ok=True)
+            except Exception as ver_err:
+                logger.warning("verifying legacy outbox migration failed: %s", ver_err)
 
     def _load_outbox(self) -> None:
         if self._db_conn is None:
@@ -169,9 +177,22 @@ class RedisBus:
         if total_in_db >= self.outbox_max_size:
             raise RuntimeError(f"Persistent outbox capacity exceeded ({self.outbox_max_size})")
 
-        event_data = event_to_redis_fields(event) if isinstance(event, BaseModel) else event
+        if isinstance(event, BaseModel):
+            event_data = event_to_redis_fields(event)
+        elif isinstance(event, dict):
+            event_data = dict(event)
+        else:
+            event_data = event
+
+        if isinstance(event_data, dict):
+            event_id = str(event_data.get("event_id") or "")
+            if not event_id:
+                event_id = uuid.uuid4().hex
+                event_data["event_id"] = event_id
+        else:
+            event_id = uuid.uuid4().hex
+
         payload_str = json.dumps(event_data)
-        event_id = uuid.uuid4().hex
         if self._db_conn is not None:
             try:
                 cursor = self._db_conn.cursor()

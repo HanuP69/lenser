@@ -159,23 +159,23 @@ class StudentClient:
             conn.close()
             if not rows:
                 return
-            existing_text = ""
-            if self.notes_file.exists():
-                existing_text = self.notes_file.read_text(encoding="utf-8")
-            missing_content = []
-            for seq, content in rows:
-                if content and content.strip() and content.strip() not in existing_text:
-                    missing_content.append(content)
-            if missing_content:
+            segments_text = []
+            for _, content in rows:
+                if content and content.strip():
+                    segments_text.append(f"\n{content.strip()}\n")
+            full_markdown = "".join(segments_text)
+            existing_text = self.notes_file.read_text(encoding="utf-8") if self.notes_file.exists() else None
+            if existing_text != full_markdown:
                 self.output_dir.mkdir(parents=True, exist_ok=True)
-                with open(self.notes_file, "a", encoding="utf-8") as handle:
-                    for c in missing_content:
-                        handle.write(f"\n{c}\n")
+                tmp_file = self.notes_file.with_suffix(f".tmp_{os.getpid()}")
+                with open(tmp_file, "w", encoding="utf-8") as handle:
+                    handle.write(full_markdown)
                     handle.flush()
                     try:
                         os.fsync(handle.fileno())
                     except Exception:
                         pass
+                tmp_file.replace(self.notes_file)
         except Exception as err:
             logger.warning("failed to reconcile notes from ledger: %s", err)
 
@@ -229,7 +229,6 @@ class StudentClient:
 
     async def _apply_segment(self, segment: GeneralNoteSegment) -> str:
         personalized_content = await self.rewriter.rewrite_segment(segment)
-        is_new = False
         try:
             conn = sqlite3.connect(str(self.ledger_file), timeout=10.0)
             cur = conn.cursor()
@@ -237,22 +236,13 @@ class StudentClient:
                 "INSERT OR IGNORE INTO applied_segments (sequence_number, session_id, heading, content, created_at) VALUES (?, ?, ?, ?, ?)",
                 (segment.sequence_number, segment.session_id, segment.heading, personalized_content, time.time())
             )
-            is_new = (cur.rowcount or 0) > 0
             conn.commit()
             conn.close()
         except Exception as ledger_err:
             logger.error("saving to student ledger failed: %s", ledger_err)
             raise RuntimeError(f"saving to student ledger failed: {ledger_err}") from ledger_err
 
-        if is_new:
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-            with open(self.notes_file, "a", encoding="utf-8") as handle:
-                handle.write(f"\n{personalized_content}\n")
-                handle.flush()
-                try:
-                    os.fsync(handle.fileno())
-                except Exception:
-                    pass
+        self.reconcile_notes_from_ledger()
 
         self.received_segments.append(segment)
         self.last_sequence_number = max(self.last_sequence_number, segment.sequence_number)

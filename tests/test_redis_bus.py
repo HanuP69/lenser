@@ -300,6 +300,74 @@ class TestRedisBusReliability(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(calls["count"] >= 1)
         self.assertLess(time.monotonic() - started, 10)
 
+    async def test_unfinished_legacy_migration_file_recovered_on_startup(self) -> None:
+        import json
+        with tempfile.TemporaryDirectory() as td:
+            outbox_file = Path(td) / "outbox.db"
+            legacy_file = outbox_file.with_suffix(".legacy_migration")
+            legacy_entry = {"stream": "stream_legacy", "data": {"session_id": "s1", "text": "legacy item"}}
+            legacy_file.write_text(json.dumps(legacy_entry) + "\n", encoding="utf-8")
+            self.assertTrue(legacy_file.exists())
+            self.assertFalse(outbox_file.exists())
+
+            bus = RedisBus(Settings().redis_url, outbox_path=outbox_file)
+            self.assertEqual(len(bus.outbox), 1)
+            self.assertEqual(bus.outbox[0][0], "stream_legacy")
+            self.assertEqual(bus.outbox[0][1]["text"], "legacy item")
+            self.assertFalse(legacy_file.exists())
+            self.assertTrue(outbox_file.exists())
+            await bus.close()
+
+    async def test_crash_after_publish_before_sqlite_delete_delivers_same_event_id(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            outbox_file = Path(td) / "outbox.db"
+            bus1 = RedisBus(Settings().redis_url, outbox_path=outbox_file)
+
+            async def fail_pub(s, e):
+                raise redis_module.ConnectionError("offline")
+
+            bus1.publish = fail_pub
+            chunk = make_chunk("idempotent event")
+            chunk.event_id = "stable_evt_123"
+            await bus1.publish_resilient("stream_idem", chunk)
+            await bus1.close()
+
+            published_payloads: list[dict] = []
+            bus_recovering = RedisBus(Settings().redis_url, outbox_path=outbox_file)
+            self.assertEqual(len(bus_recovering.outbox), 1)
+
+            async def ok_pub_and_crash(s, event):
+                published_payloads.append(dict(event))
+                raise OSError("simulated process crash before sqlite delete commit")
+
+            bus_recovering.publish = ok_pub_and_crash
+            flushed = await bus_recovering.flush_outbox()
+            self.assertEqual(flushed, 0)
+            self.assertEqual(len(published_payloads), 1)
+            first_event_id = published_payloads[0].get("event_id")
+            self.assertEqual(first_event_id, "stable_evt_123")
+            if bus_recovering._db_conn is not None:
+                bus_recovering._db_conn.close()
+                bus_recovering._db_conn = None
+            bus_recovering.outbox = []
+
+            bus_post_recovery = RedisBus(Settings().redis_url, outbox_path=outbox_file)
+            try:
+                self.assertEqual(len(bus_post_recovery.outbox), 1)
+
+                async def ok_pub(s, event):
+                    published_payloads.append(dict(event))
+                    return "1-0"
+
+                bus_post_recovery.publish = ok_pub
+                flushed2 = await bus_post_recovery.flush_outbox()
+                self.assertEqual(flushed2, 1)
+                self.assertEqual(len(published_payloads), 2)
+                self.assertEqual(published_payloads[0].get("event_id"), published_payloads[1].get("event_id"))
+                self.assertEqual(published_payloads[1].get("event_id"), "stable_evt_123")
+            finally:
+                await bus_post_recovery.close()
+
 
 if __name__ == "__main__":
     unittest.main()

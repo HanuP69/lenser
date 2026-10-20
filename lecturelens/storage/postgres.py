@@ -92,7 +92,6 @@ CREATE TABLE IF NOT EXISTS embeddings (
 CREATE INDEX IF NOT EXISTS idx_timeline_events_session ON timeline_events (session_id, timestamp_epoch);
 CREATE INDEX IF NOT EXISTS idx_general_notes_session_seq ON general_notes (session_id, sequence_number);
 CREATE INDEX IF NOT EXISTS idx_concepts_course ON concepts (course_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_session_source ON embeddings (session_id, source_id);
 """
 
 MIGRATE_CONCEPTS_SQL = """

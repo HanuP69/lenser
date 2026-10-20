@@ -295,6 +295,95 @@ class TestStudentClient(unittest.IsolatedAsyncioTestCase):
         if client.notes_file.exists():
             self.assertNotIn("Content should not persist on error.", client.notes_file.read_text(encoding="utf-8"))
 
+    async def test_reconciliation_orders_segments_strictly_by_sequence(self) -> None:
+        profile = StudentProfile(student_id="student_order", preferred_language="English")
+        client = StudentClient("ws://localhost:8765", "lec_order", profile, self.output_dir)
+        seg13 = GeneralNoteSegment(
+            session_id="lec_order",
+            sequence_number=13,
+            timestamp_epoch=1700000020.0,
+            start_time="00:02:00",
+            end_time="00:03:00",
+            heading="Section 13",
+            content="Content for section 13",
+            key_points=[],
+            concept_tags=[]
+        )
+        seg12 = GeneralNoteSegment(
+            session_id="lec_order",
+            sequence_number=12,
+            timestamp_epoch=1700000010.0,
+            start_time="00:01:00",
+            end_time="00:02:00",
+            heading="Section 12",
+            content="Content for section 12",
+            key_points=[],
+            concept_tags=[]
+        )
+        await client._apply_segment(seg13)
+        await client._apply_segment(seg12)
+
+        written = client.notes_file.read_text(encoding="utf-8")
+        pos12 = written.find("Content for section 12")
+        pos13 = written.find("Content for section 13")
+        self.assertGreaterEqual(pos12, 0)
+        self.assertGreaterEqual(pos13, 0)
+        self.assertLess(pos12, pos13)
+
+    async def test_substring_collision_does_not_skip_segment(self) -> None:
+        profile = StudentProfile(student_id="student_sub", preferred_language="English")
+        client = StudentClient("ws://localhost:8765", "lec_sub", profile, self.output_dir)
+        seg1 = GeneralNoteSegment(
+            session_id="lec_sub",
+            sequence_number=1,
+            timestamp_epoch=1700000010.0,
+            start_time="00:01:00",
+            end_time="00:02:00",
+            heading="Fruit",
+            content="Apple",
+            key_points=[],
+            concept_tags=[]
+        )
+        seg2 = GeneralNoteSegment(
+            session_id="lec_sub",
+            sequence_number=2,
+            timestamp_epoch=1700000020.0,
+            start_time="00:02:00",
+            end_time="00:03:00",
+            heading="Bigger Fruit",
+            content="Pineapple",
+            key_points=[],
+            concept_tags=[]
+        )
+        await client._apply_segment(seg1)
+        await client._apply_segment(seg2)
+
+        written = client.notes_file.read_text(encoding="utf-8")
+        self.assertIn("Apple", written)
+        self.assertIn("Pineapple", written)
+
+    async def test_retry_reconciles_markdown_even_if_already_in_ledger(self) -> None:
+        profile = StudentProfile(student_id="student_retry", preferred_language="English")
+        client = StudentClient("ws://localhost:8765", "lec_retry", profile, self.output_dir)
+        seg = GeneralNoteSegment(
+            session_id="lec_retry",
+            sequence_number=1,
+            timestamp_epoch=1700000010.0,
+            start_time="00:01:00",
+            end_time="00:02:00",
+            heading="Section 1",
+            content="Durable content",
+            key_points=[],
+            concept_tags=[]
+        )
+        await client._apply_segment(seg)
+        client.notes_file.unlink()
+        self.assertFalse(client.notes_file.exists())
+
+        await client._apply_segment(seg)
+        self.assertTrue(client.notes_file.exists())
+        self.assertIn("Durable content", client.notes_file.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()
