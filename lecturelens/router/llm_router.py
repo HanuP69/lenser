@@ -235,12 +235,15 @@ def create_base_chat_model(
             logger.warning("langchain_ollama missing, provider %s skipped", provider_name)
             return None
         configured_model = str(provider_config.get("model", "")).strip()
+        # The environment wins over router.yaml, which is the same order the
+        # openai_compatible and google_genai providers already use. The
+        # router.yaml value used to win here, so LECTURELENS_LOCAL_MODEL and
+        # OLLAMA_MODEL were silently ignored for local models.
         model_name = (
-            configured_model
-            or os.environ.get("LECTURELENS_OLLAMA_MODEL")
+            os.environ.get("LECTURELENS_OLLAMA_MODEL")
             or os.environ.get("LECTURELENS_LOCAL_MODEL")
             or os.environ.get("OLLAMA_MODEL")
-            or ""
+            or configured_model
         )
         return ChatOllama(
             base_url=resolved_ollama_url,

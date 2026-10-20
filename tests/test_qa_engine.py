@@ -47,7 +47,7 @@ class TestQAEngine(unittest.IsolatedAsyncioTestCase):
         self.router = DummyLLMRouter()
         self.engine = QAEngine(self.session_dir, "http://localhost:11434", self.router)
 
-        async def mock_embeddings(texts: list[str]) -> list[list[float]]:
+        async def mock_embeddings(texts: list[str], purpose: str = "document") -> list[list[float]]:
             self.embedded_texts.extend(texts)
             vectors: list[list[float]] = []
             for text in texts:
@@ -116,7 +116,7 @@ class TestQAEngine(unittest.IsolatedAsyncioTestCase):
         engine = QAEngine(empty_dir, "http://localhost:11434", self.router)
         called = False
 
-        async def fail_embeddings(texts: list[str]) -> list[list[float]]:
+        async def fail_embeddings(texts: list[str], purpose: str = "document") -> list[list[float]]:
             nonlocal called
             called = True
             raise AssertionError("generate_embeddings should not be called when empty")

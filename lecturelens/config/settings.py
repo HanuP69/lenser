@@ -2,7 +2,7 @@ from lecturelens.config.defaults import DEFAULT_EMBEDDING_MODEL, DEFAULT_LOCAL_M
 from pathlib import Path
 from typing import Optional
 
-from pydantic import Field, model_validator
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings
 
 from lecturelens.core.validation import sanitize_file_stem
@@ -102,10 +102,44 @@ class Settings(BaseSettings):
     primary_provider: Optional[str] = Field(default=None)
     ollama_model: Optional[str] = Field(default=None)
     unorouter_model: Optional[str] = Field(default=None)
-    unorouter_api_key: Optional[str] = Field(default=None)
-    unorouter_api_keys: Optional[str] = Field(default=None)
-    openrouter_api_key: Optional[str] = Field(default=None)
-    google_api_key: Optional[str] = Field(default=None)
+
+    # The provider credentials are documented in .env.example without the
+    # LECTURELENS_ prefix. pydantic-settings only reads prefixed names, so
+    # the unprefixed spelling is accepted as well. Without this the keys in
+    # .env were silently ignored and every cloud provider was skipped.
+    unorouter_api_key: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("LECTURELENS_UNOROUTER_API_KEY", "UNOROUTER_API_KEY")
+    )
+    unorouter_api_keys: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("LECTURELENS_UNOROUTER_API_KEYS", "UNOROUTER_API_KEYS")
+    )
+    openrouter_api_key: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("LECTURELENS_OPENROUTER_API_KEY", "OPENROUTER_API_KEY")
+    )
+    openrouter_api_keys: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("LECTURELENS_OPENROUTER_API_KEYS", "OPENROUTER_API_KEYS")
+    )
+    google_api_key: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("LECTURELENS_GOOGLE_API_KEY", "GOOGLE_API_KEY")
+    )
+    google_api_keys: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("LECTURELENS_GOOGLE_API_KEYS", "GOOGLE_API_KEYS")
+    )
+    gemini_api_key: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("LECTURELENS_GEMINI_API_KEY", "GEMINI_API_KEY")
+    )
+    gemini_api_keys: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("LECTURELENS_GEMINI_API_KEYS", "GEMINI_API_KEYS")
+    )
+
     enable_drift_filter: bool = Field(default=True)
     drift_threshold: Optional[float] = Field(default=None)
     drift_similarity_threshold: float = Field(default=0.50)

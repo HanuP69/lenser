@@ -209,6 +209,29 @@ class TestContextDriftFilterBehavior(unittest.TestCase):
         self.assertEqual(accepted_after_first, self.filter.accepted_count)
         self.assertEqual(drift_after_first, self.filter.drift_count)
 
+    def test_refusal_text_is_dropped_outright(self) -> None:
+        """A refusal is a vision-model artefact. It used to be quarantined
+        like a topic drift and could be released back into the notes when an
+        important entry arrived."""
+        entries = [
+            {
+                "event_id": "refusal",
+                "content": "Please provide the presentation slide image",
+                "importance_flags": [],
+                "source_type": "slide"
+            },
+            {
+                "event_id": "important",
+                "content": "Here is the definition of a binary search tree",
+                "importance_flags": ["definition"],
+                "source_type": "transcript"
+            }
+        ]
+        kept = self.filter.filter_batch_entries(entries)
+        contents = [entry["content"] for entry in kept]
+        self.assertNotIn("Please provide the presentation slide image", contents)
+        self.assertIn("Here is the definition of a binary search tree", contents)
+
     def test_topic_shift_across_batch_boundaries(self) -> None:
         self.filter.check_entry("Chapter 4 Quadratic Equation Master Plan")
         batch1 = [

@@ -289,6 +289,13 @@ class ContextDriftFilter:
 
             content = str(entry.get("content", ""))
             source_type = str(entry.get("source_type", "transcript"))
+            if is_refusal_text(content.strip()):
+                # A refusal ("please provide the presentation slide image") is
+                # a vision-model artefact and never lecture content. It used
+                # to be quarantined like a topic drift and could be released
+                # back into the notes when an important entry arrived.
+                self.drift_count += 1
+                continue
             is_drift, score, shift_occurred, confirmed_on_topic = self.check_entry_with_shift(content, source_type=source_type)
 
             if shift_occurred:

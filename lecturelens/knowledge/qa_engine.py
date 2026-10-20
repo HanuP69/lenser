@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-import chromadb
 import httpx
 from langchain_core.messages import HumanMessage
 
@@ -19,6 +18,24 @@ EMBEDDING_MODEL = DEFAULT_EMBEDDING_MODEL
 TIMELINE_CHUNK_CHARACTERS = 600
 NOTES_CHUNK_CHARACTERS = 900
 EMBED_BATCH_SIZE = 32
+# Postgres searches with the cosine operator (<=>), so the Chroma collection
+# has to use the cosine space as well. The Chroma default is L2, which ranked
+# the same vectors differently between the two retrieval paths.
+CHROMA_COLLECTION_NAME = "lecture_chunks"
+CHROMA_COLLECTION_METADATA = {"hnsw:space": "cosine"}
+
+
+def require_chromadb() -> Any:
+    """Import chromadb lazily so the base install is usable."""
+    try:
+        import chromadb
+    except ImportError as error:
+        raise ImportError(
+            "chromadb is required for lecture indexing and question answering. "
+            "Install it with: pip install 'lecturelens[full]'"
+        ) from error
+    return chromadb
+
 
 
 @dataclass
@@ -66,6 +83,7 @@ class QAEngine:
         self.embed_batch_size: int = embed_batch_size if embed_batch_size is not None else EMBED_BATCH_SIZE
         self.timeline_path: Path = self.session_dir / "timeline.jsonl"
         self.notes_path: Path = self.session_dir / "notes.md"
+        chromadb = require_chromadb()
         self.chroma_client: Any = chromadb.PersistentClient(path=str(self.session_dir / "chroma_db"))
         meta_file = self.session_dir / "chroma_db" / "index_meta.json"
         if meta_file.exists():
@@ -74,12 +92,12 @@ class QAEngine:
                     stored_meta = json.load(mf)
                 if stored_meta.get("embedding_model") != self.embedding_model:
                     try:
-                        self.chroma_client.delete_collection("lecture_chunks")
+                        self.chroma_client.delete_collection(CHROMA_COLLECTION_NAME)
                     except Exception:
                         pass
             except Exception:
                 pass
-        self.collection: Any = self.chroma_client.get_or_create_collection(name="lecture_chunks")
+        self.collection: Any = self._open_collection()
         try:
             meta_file.parent.mkdir(parents=True, exist_ok=True)
             with open(meta_file, "w", encoding="utf-8") as mf:
@@ -87,23 +105,75 @@ class QAEngine:
         except Exception:
             pass
 
-    async def generate_embeddings(self, texts: list[str]) -> list[list[float]]:
+    def _open_collection(self) -> Any:
+        """Open the chunk collection, rebuilding it if it uses the wrong space.
+
+        A collection created before the cosine fix used the Chroma default
+        (L2) while Postgres searches with cosine distance, so the two paths
+        returned different results for the same vectors.
+        """
+        try:
+            collection = self.chroma_client.get_or_create_collection(
+                name=CHROMA_COLLECTION_NAME, metadata=CHROMA_COLLECTION_METADATA
+            )
+            existing_metadata = getattr(collection, "metadata", None) or {}
+            if existing_metadata.get("hnsw:space") != CHROMA_COLLECTION_METADATA["hnsw:space"]:
+                self.chroma_client.delete_collection(CHROMA_COLLECTION_NAME)
+                collection = self.chroma_client.get_or_create_collection(
+                    name=CHROMA_COLLECTION_NAME, metadata=CHROMA_COLLECTION_METADATA
+                )
+            return collection
+        except Exception as error:
+            logger.warning("could not create the chroma collection: %s", error)
+            return self.chroma_client.get_or_create_collection(name=CHROMA_COLLECTION_NAME)
+
+    def _prefix_for(self, text: str, purpose: str) -> str:
+        """Apply the nomic-embed-text task prefixes.
+
+        nomic-embed-text expects `search_document:` for indexed passages and
+        `search_query:` for the question. Without them the retrieval quality
+        drops noticeably.
+        """
+        if "nomic" not in self.embedding_model.lower():
+            return text
+        prefix = "search_query:" if purpose == "query" else "search_document:"
+        if text.startswith(("search_document:", "search_query:")):
+            return text
+        return f"{prefix} {text}"
+
+    async def generate_embeddings(
+        self,
+        texts: list[str],
+        purpose: str = "document"
+    ) -> list[list[float]]:
         embeddings: list[list[float]] = []
         async with httpx.AsyncClient(timeout=120.0) as client:
             for start_index in range(0, len(texts), self.embed_batch_size):
                 batch_texts = texts[start_index:start_index + self.embed_batch_size]
+                payload_texts = [self._prefix_for(text, purpose) for text in batch_texts]
                 response = await client.post(
                     f"{self.ollama_url}/api/embed",
-                    json={"model": self.embedding_model, "input": batch_texts, "keep_alive": "10m"}
+                    json={"model": self.embedding_model, "input": payload_texts, "keep_alive": "10m"}
                 )
                 response.raise_for_status()
                 payload = response.json()
-                for vector in payload["embeddings"]:
+                batch_vectors = payload.get("embeddings") or []
+                if len(batch_vectors) != len(batch_texts):
+                    # The vector count was never validated, so a short response
+                    # either raised an IndexError later or silently truncated
+                    # the index, leaving Postgres and Chroma out of sync.
+                    raise ValueError(
+                        f"embedding model returned {len(batch_vectors)} vectors for "
+                        f"{len(batch_texts)} inputs"
+                    )
+                for vector in batch_vectors:
                     embeddings.append(vector)
         return embeddings
 
-    async def generate_embedding(self, text: str) -> list[float]:
-        vectors = await self.generate_embeddings([text])
+    async def generate_embedding(self, text: str, purpose: str = "query") -> list[float]:
+        vectors = await self.generate_embeddings([text], purpose=purpose)
+        if len(vectors) == 0:
+            raise ValueError("the embedding model returned no vectors")
         return vectors[0]
 
     def collect_timeline_chunks(self) -> list[IndexedChunk]:
@@ -279,7 +349,7 @@ class QAEngine:
             texts: list[str] = []
             for chunk in new_chunks:
                 texts.append(chunk.text)
-            vectors = await self.generate_embeddings(texts)
+            vectors = await self.generate_embeddings(texts, purpose="document")
             if len(vectors) > 0 and len(vectors[0]) > 0:
                 actual_dim = len(vectors[0])
                 if self.storage is not None and hasattr(self.storage, "init_schema"):
@@ -341,7 +411,7 @@ class QAEngine:
         has_pg = self.storage is not None and hasattr(self.storage, "search_embeddings")
         if total == 0 and not has_pg:
             return []
-        question_vectors = await self.generate_embeddings([question])
+        question_vectors = await self.generate_embeddings([question], purpose="query")
         retrieved: list[tuple[str, str]] = []
         seen_texts: set[str] = set()
 

@@ -170,15 +170,25 @@ def build_agent_environment(
         environment["LECTURELENS_UNOROUTER_API_KEYS"] = str(settings.unorouter_api_keys)
     if getattr(settings, "google_api_key", None):
         environment["LECTURELENS_GOOGLE_API_KEY"] = str(settings.google_api_key)
+    if getattr(settings, "google_api_keys", None):
+        environment["LECTURELENS_GOOGLE_API_KEYS"] = str(settings.google_api_keys)
+    if getattr(settings, "gemini_api_key", None):
+        environment["LECTURELENS_GEMINI_API_KEY"] = str(settings.gemini_api_key)
+    if getattr(settings, "gemini_api_keys", None):
+        environment["LECTURELENS_GEMINI_API_KEYS"] = str(settings.gemini_api_keys)
     if getattr(settings, "openrouter_api_key", None):
         environment["LECTURELENS_OPENROUTER_API_KEY"] = str(settings.openrouter_api_key)
+    if getattr(settings, "openrouter_api_keys", None):
+        environment["LECTURELENS_OPENROUTER_API_KEYS"] = str(settings.openrouter_api_keys)
+    # The credentials may also come straight from the environment. The
+    # Settings object only reads the LECTURELENS_ prefixed names, so the
+    # unprefixed spellings documented in .env.example are copied here.
     for plural_key in ("GOOGLE_API_KEYS", "GEMINI_API_KEYS", "OPENROUTER_API_KEYS", "UNOROUTER_API_KEYS"):
         if plural_key in os.environ and f"LECTURELENS_{plural_key}" not in environment:
             environment[f"LECTURELENS_{plural_key}"] = os.environ[plural_key]
-    if "UNOROUTER_API_KEY" in os.environ and "LECTURELENS_UNOROUTER_API_KEY" not in environment:
-        environment["LECTURELENS_UNOROUTER_API_KEY"] = os.environ["UNOROUTER_API_KEY"]
-    if "UNOROUTER_API_KEYS" in os.environ and "LECTURELENS_UNOROUTER_API_KEYS" not in environment:
-        environment["LECTURELENS_UNOROUTER_API_KEYS"] = os.environ["UNOROUTER_API_KEYS"]
+    for single_key in ("UNOROUTER_API_KEY", "OPENROUTER_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY"):
+        if single_key in os.environ and f"LECTURELENS_{single_key}" not in environment:
+            environment[f"LECTURELENS_{single_key}"] = os.environ[single_key]
     return environment
 
 
@@ -228,7 +238,11 @@ def structuring_backlog_bytes(session_dir: Path) -> int:
         try:
             import json
             with open(context_path, "r", encoding="utf-8") as file_handle:
-                processed = int(json.load(file_handle).get("processed_byte_offset", 0))
+                state = json.load(file_handle)
+            # The structuring agent writes "timeline_byte_offset"; reading
+            # "processed_byte_offset" always returned 0, so the backlog never
+            # shrank in the dashboard.
+            processed = int(state.get("timeline_byte_offset", 0))
         except (ValueError, OSError):
             processed = 0
     return max(0, timeline_path.stat().st_size - processed)
@@ -386,23 +400,31 @@ def run_shutdown(monitor: AgentMonitor, session_dir: Path, planned_agents: list[
 @app.command()
 def start(
     mode: str = typer.Option("local", help="local or server"),
-    audio_source: str = typer.Option("mic", "--audio-source", help="mic, system or both"),
+    audio_source: Optional[str] = typer.Option(None, "--audio-source", help="mic, system or both"),
     no_screen: bool = typer.Option(False, "--no-screen"),
     audio_only: bool = typer.Option(False, "--audio-only"),
     persist: bool = typer.Option(False, "--persist", help="Enable durable Postgres persister in local mode"),
     session: Optional[str] = typer.Option(None, "--session"),
     course: Optional[str] = typer.Option(None, "--course"),
-    monitor_index: int = typer.Option(1, "--monitor"),
-    llm_mode: str = typer.Option("local", "--llm-mode", help="local, hybrid or cloud"),
+    monitor_index: Optional[int] = typer.Option(None, "--monitor"),
+    llm_mode: Optional[str] = typer.Option(None, "--llm-mode", help="local, hybrid or cloud"),
     resume: bool = typer.Option(False, "--resume", help="continue an existing session"),
 ) -> None:
     settings = Settings()
 
+    # The option defaults used to be exported to the agents unconditionally,
+    # so a value configured in .env (for example LECTURELENS_AUDIO_SOURCE)
+    # was always overridden by the CLI default. The options now default to
+    # None and fall back to the configured settings.
+    resolved_audio_source = audio_source if audio_source is not None else settings.audio_source
+    resolved_monitor_index = monitor_index if monitor_index is not None else settings.monitor_index
+    resolved_llm_mode = llm_mode if llm_mode is not None else settings.llm_mode
+
     try:
-        validate_start_options(audio_source, llm_mode, mode)
+        validate_start_options(resolved_audio_source, resolved_llm_mode, mode)
     except ValueError as error:
         fail(str(error))
-    if mode != "server" and audio_source == "system":
+    if mode != "server" and resolved_audio_source == "system":
         from lecturelens.agents.audio_agent import find_loopback_microphone
         _, loopback_err = find_loopback_microphone()
         if loopback_err:
@@ -420,7 +442,7 @@ def start(
 
     if not check_redis(settings):
         fail(f"Redis is not reachable at {settings.redis_url}")
-    if llm_mode != "cloud" and not check_ollama(settings):
+    if resolved_llm_mode != "cloud" and not check_ollama(settings):
         console.print(
             f"[yellow]Ollama not reachable at {settings.ollama_url}. "
             "Capture continues; structuring will retry when it returns.[/yellow]"
@@ -453,9 +475,9 @@ def start(
         course,
         {
             "mode": mode,
-            "audio_source": audio_source,
-            "monitor_index": monitor_index,
-            "llm_mode": llm_mode,
+            "audio_source": resolved_audio_source,
+            "monitor_index": resolved_monitor_index,
+            "llm_mode": resolved_llm_mode,
             "audio_only": audio_only,
             "no_screen": no_screen,
             "persist": persist
@@ -464,13 +486,13 @@ def start(
     )
 
     environment = build_agent_environment(
-        settings, session_id, audio_source, monitor_index, llm_mode, course
+        settings, session_id, resolved_audio_source, resolved_monitor_index, resolved_llm_mode, course
     )
     monitor = AgentMonitor()
     for agent_name in planned_agents:
         command = [sys.executable, "-m", module_for_agent(agent_name)]
         if agent_name != "gateway":
-            command.extend(["--session", session_id, "--audio-source", audio_source])
+            command.extend(["--session", session_id, "--audio-source", resolved_audio_source])
         monitor.register_agent(
             agent_name,
             command,
@@ -479,7 +501,7 @@ def start(
         )
         monitor.start_agent(agent_name)
 
-    settings.llm_mode = llm_mode
+    settings.llm_mode = resolved_llm_mode
     try:
         try:
             asyncio.run(live_dashboard_loop(settings, session_id, monitor, session_dir))
