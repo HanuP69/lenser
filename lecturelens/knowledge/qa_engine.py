@@ -51,7 +51,8 @@ class QAEngine:
         llm_timeout_seconds: float = 180.0,
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
         fallback_model: str = DEFAULT_LOCAL_MODEL,
-        storage: Any = None
+        storage: Any = None,
+        embed_batch_size: Optional[int] = None
     ) -> None:
         self.embedding_model: str = embedding_model
         self.fallback_model: str = fallback_model
@@ -62,6 +63,7 @@ class QAEngine:
         self.top_k: int = top_k
         self.llm_timeout_seconds: float = llm_timeout_seconds
         self.storage: Any = storage
+        self.embed_batch_size: int = embed_batch_size if embed_batch_size is not None else EMBED_BATCH_SIZE
         self.timeline_path: Path = self.session_dir / "timeline.jsonl"
         self.notes_path: Path = self.session_dir / "notes.md"
         self.chroma_client: Any = chromadb.PersistentClient(path=str(self.session_dir / "chroma_db"))
@@ -70,8 +72,8 @@ class QAEngine:
     async def generate_embeddings(self, texts: list[str]) -> list[list[float]]:
         embeddings: list[list[float]] = []
         async with httpx.AsyncClient(timeout=120.0) as client:
-            for start_index in range(0, len(texts), EMBED_BATCH_SIZE):
-                batch_texts = texts[start_index:start_index + EMBED_BATCH_SIZE]
+            for start_index in range(0, len(texts), self.embed_batch_size):
+                batch_texts = texts[start_index:start_index + self.embed_batch_size]
                 response = await client.post(
                     f"{self.ollama_url}/api/embed",
                     json={"model": self.embedding_model, "input": batch_texts, "keep_alive": "10m"}

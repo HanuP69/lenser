@@ -80,6 +80,7 @@ class SyncAgent:
         self.recent_anchors: list[AnchorRecord] = []
         self.buffer_lock: asyncio.Lock = asyncio.Lock()
         self.entries_written: int = 0
+        self.fingerprint_history_limit: int = getattr(settings, "fingerprint_history_limit", FINGERPRINT_HISTORY_LIMIT)
         self.load_written_fingerprints()
 
     def load_written_fingerprints(self) -> None:
@@ -87,7 +88,7 @@ class SyncAgent:
             return
         try:
             with open(self.timeline_path, "r", encoding="utf-8") as file_handle:
-                tail_lines = deque(file_handle, maxlen=FINGERPRINT_HISTORY_LIMIT)
+                tail_lines = deque(file_handle, maxlen=self.fingerprint_history_limit)
         except OSError:
             return
         for raw_line in tail_lines:
@@ -105,7 +106,7 @@ class SyncAgent:
             return
         self.written_fingerprints.add(fingerprint)
         self.fingerprint_order.append(fingerprint)
-        while len(self.fingerprint_order) > FINGERPRINT_HISTORY_LIMIT:
+        while len(self.fingerprint_order) > self.fingerprint_history_limit:
             self.written_fingerprints.discard(self.fingerprint_order.popleft())
 
     def build_stream_name(self, source_type: str) -> str:

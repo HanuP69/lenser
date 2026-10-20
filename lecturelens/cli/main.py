@@ -32,6 +32,7 @@ from lecturelens.cli.helpers import (
 )
 from lecturelens.config.settings import Settings
 from lecturelens.core import session_meta
+from lecturelens.core.validation import sanitize_file_stem
 from lecturelens.core.agent_runtime import (
     PAUSE_FLAG_NAME,
     PERSISTER_STOP_FLAG_NAME,
@@ -424,6 +425,9 @@ def start(
     if disk_warning is not None:
         console.print(f"[yellow]{disk_warning}[/yellow]")
     clear_all_flags(session_dir)
+    existing_meta = session_meta.load_session_meta(session_dir)
+    if resume and course is None:
+        course = existing_meta.get("course_name")
     offset_seconds = session_meta.get_previous_duration_seconds(session_dir) if resume else 0.0
     clock = SessionClock(elapsed_offset_seconds=offset_seconds)
     clock.save_to_file(session_dir / "clock.json")
@@ -679,7 +683,8 @@ def ask(
                 from lecturelens.knowledge.student_chat import StudentChatAgent
                 from lecturelens.knowledge.student_graph import StudentKnowledgeGraph
 
-                graph_db = settings.output_dir / student_id / "student_graph.db"
+                safe_id = sanitize_file_stem(student_id)
+                graph_db = settings.output_dir / safe_id / "student_graph.db"
                 graph = StudentKnowledgeGraph(graph_db)
                 chat_agent = StudentChatAgent(
                     llm_router=router,
@@ -719,7 +724,8 @@ def ask(
                 router,
                 embedding_model=settings.embedding_model,
                 fallback_model=settings.local_model,
-                storage=storage
+                storage=storage,
+                embed_batch_size=settings.embed_batch_size
             )
             try:
                 return await engine.ask_with_sources(question)
@@ -749,7 +755,8 @@ def review(
     settings = Settings()
     if student_id and isinstance(student_id, str):
         from lecturelens.knowledge.student_graph import StudentKnowledgeGraph
-        graph_db = settings.output_dir / student_id / "student_graph.db"
+        safe_id = sanitize_file_stem(student_id)
+        graph_db = settings.output_dir / safe_id / "student_graph.db"
         if graph_db.exists():
             graph = StudentKnowledgeGraph(graph_db)
             summary = graph.get_student_summary()
@@ -798,7 +805,8 @@ def student(
     api_key: Optional[str] = typer.Option(None, "--api-key", envvar="LECTURELENS_GATEWAY_API_KEY"),
 ) -> None:
     settings = Settings()
-    resolved_server = server or f"ws://{settings.gateway_host}:{settings.gateway_port}"
+    client_host = "127.0.0.1" if settings.gateway_host in ("0.0.0.0", "::") else settings.gateway_host
+    resolved_server = server or f"ws://{client_host}:{settings.gateway_port}"
     from lecturelens.client.student_client import StudentClient, StudentProfile
     from lecturelens.knowledge.student_graph import StudentKnowledgeGraph
 
@@ -807,7 +815,8 @@ def student(
         preferred_language=language,
         detail_level=detail
     )
-    graph_db = settings.output_dir / student_id / "student_graph.db"
+    safe_id = sanitize_file_stem(student_id)
+    graph_db = settings.output_dir / safe_id / "student_graph.db"
     graph = StudentKnowledgeGraph(graph_db)
 
     router = None
@@ -910,7 +919,8 @@ def client(
     settings = Settings()
     settings.audio_source = audio_source
     settings.monitor_index = monitor_index
-    resolved_server = server or f"ws://{settings.gateway_host}:{settings.gateway_port}"
+    client_host = "127.0.0.1" if settings.gateway_host in ("0.0.0.0", "::") else settings.gateway_host
+    resolved_server = server or f"ws://{client_host}:{settings.gateway_port}"
 
     async def run() -> None:
         stop_event = asyncio.Event()

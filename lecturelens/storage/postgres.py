@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import logging
 from typing import Any, Optional
@@ -118,6 +119,7 @@ class PostgresStorage:
     def __init__(self, connection_url: str) -> None:
         self.connection_url = connection_url
         self._connection: Optional[psycopg.AsyncConnection[dict_row]] = None
+        self._lock: asyncio.Lock = asyncio.Lock()
 
     async def get_connection(self) -> psycopg.AsyncConnection[dict_row]:
         if self._connection is None or self._connection.closed:
@@ -128,26 +130,31 @@ class PostgresStorage:
             )
         return self._connection
 
-    async def init_schema(self) -> None:
-        conn = await self.get_connection()
-        try:
+    @asynccontextmanager
+    async def transaction(self):
+        async with self._lock:
+            conn = await self.get_connection()
             async with conn.transaction():
+                yield conn
+
+    async def init_schema(self, vector_dimensions: int = 768) -> None:
+        async with self.transaction() as conn:
+            try:
                 async with conn.cursor() as cur:
                     await cur.execute(CREATE_VECTOR_EXTENSION_SQL)
-        except Exception as vector_error:
-            logger.info("pgvector extension not installed or available: %s", vector_error)
+            except Exception as vector_error:
+                logger.info("pgvector extension not installed or available: %s", vector_error)
 
-        async with conn.transaction():
             async with conn.cursor() as cur:
                 await cur.execute(CREATE_TABLES_SQL)
                 await cur.execute(MIGRATE_CONCEPTS_SQL)
 
-        try:
-            async with conn.transaction():
+            try:
                 async with conn.cursor() as cur:
-                    await cur.execute(ADD_VECTOR_COLUMN_SQL)
-        except Exception as vector_col_error:
-            logger.debug("vector column skipped: %s", vector_col_error)
+                    sql = f"ALTER TABLE embeddings ADD COLUMN IF NOT EXISTS embedding vector({vector_dimensions});"
+                    await cur.execute(sql)
+            except Exception as vector_col_error:
+                logger.debug("vector column skipped: %s", vector_col_error)
 
     async def insert_timeline_event(self, entry: TimelineEntry | dict[str, Any]) -> bool:
         if isinstance(entry, TimelineEntry):
@@ -181,8 +188,7 @@ class PostgresStorage:
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (event_id) DO NOTHING;
         """
-        conn = await self.get_connection()
-        async with conn.transaction():
+        async with self.transaction() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     query,
@@ -235,8 +241,7 @@ class PostgresStorage:
             start_time = EXCLUDED.start_time,
             end_time = EXCLUDED.end_time;
         """
-        conn = await self.get_connection()
-        async with conn.transaction():
+        async with self.transaction() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     query,
@@ -269,8 +274,7 @@ class PostgresStorage:
             ),
             timestamp_epoch = EXCLUDED.timestamp_epoch;
         """
-        conn = await self.get_connection()
-        async with conn.transaction():
+        async with self.transaction() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     query,

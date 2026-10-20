@@ -157,7 +157,12 @@ def build_runtime_context(namespace: argparse.Namespace) -> RuntimeContext:
 
     session_dir = settings.create_session_directories(session_id)
     session_clock = SessionClock.load_or_create(session_dir / "clock.json")
-    redis_bus = RedisBus(settings.redis_url)
+    redis_bus = RedisBus(
+        settings.redis_url,
+        stream_max_length=getattr(settings, "stream_max_length", 200000),
+        reclaim_idle_ms=getattr(settings, "reclaim_idle_ms", 30000),
+        retry_ttl_seconds=getattr(settings, "redis_retry_ttl_seconds", 86400)
+    )
     configure_pools(settings.thread_pool_max_workers, settings.process_pool_max_workers)
     return RuntimeContext(
         settings=settings,

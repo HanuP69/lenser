@@ -227,8 +227,9 @@ class ScreenAgent:
             extracted_text=extracted_text,
             revisited_slide_number=revisited_number
         )
-        await self.redis_bus.publish_resilient(self.stream_name, slide_event)
-        self.control.increment_stat("slides_published")
+        published_id = await self.redis_bus.publish_resilient(self.stream_name, slide_event)
+        if published_id is not None:
+            self.control.increment_stat("slides_published")
         needs_text_retry = (
             len(extracted_text.strip()) == 0
             and revisited_number == 0

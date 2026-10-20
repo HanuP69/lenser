@@ -344,7 +344,7 @@ lecturelens ask --session "cs101_01" --student-id "student_1" "Can a binary tree
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `LECTURELENS_REDIS_URL` | `redis://localhost:6379` | Redis connection URL. |
-| `LECTURELENS_POSTGRES_URL` | `postgresql://postgres:postgres@localhost:5432/lecturelens` | PostgreSQL connection URL. |
+| `LECTURELENS_POSTGRES_URL` | `postgresql://postgres:postgres@localhost:5433/lecturelens` | PostgreSQL connection URL. |
 | `LECTURELENS_OLLAMA_URL` | `http://localhost:11434` | Local Ollama base URL. |
 | `LECTURELENS_LLM_MODE` | `local` | `local` (Ollama), `hybrid` (Cloud with local fallback), or `cloud`. |
 | `LECTURELENS_GATEWAY_HOST` | `127.0.0.1` | Gateway bind host (`0.0.0.0` for remote clients). |

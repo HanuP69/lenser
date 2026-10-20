@@ -197,7 +197,6 @@ class TestRecordedTimelineFiltering(unittest.TestCase):
         candidates = [
             Path.home() / "output" / "yt_test" / "timeline.jsonl",
             Path.cwd() / "output" / "yt_test" / "timeline.jsonl",
-            Path("C:/Users/enup1/output/yt_test/timeline.jsonl")
         ]
         timeline_path = next((p for p in candidates if p.exists()), None)
         if timeline_path is None:

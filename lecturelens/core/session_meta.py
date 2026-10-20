@@ -28,7 +28,18 @@ def get_previous_duration_seconds(session_dir: Path) -> float:
     meta = load_session_meta(session_dir)
     total_seconds = 0.0
     for run_record in meta["runs"]:
-        total_seconds += float(run_record.get("duration_seconds", 0.0))
+        recorded = float(run_record.get("duration_seconds", 0.0))
+        if recorded > 0.0:
+            total_seconds += recorded
+        elif run_record.get("started_epoch") and run_record.get("ended_epoch"):
+            total_seconds += max(0.0, float(run_record["ended_epoch"]) - float(run_record["started_epoch"]))
+        elif run_record.get("started_epoch"):
+            try:
+                mtime = get_meta_path(session_dir).stat().st_mtime
+                estimated = max(0.0, mtime - float(run_record["started_epoch"]))
+                total_seconds += estimated
+            except OSError:
+                pass
     return total_seconds
 
 
@@ -41,7 +52,10 @@ def begin_run(
 ) -> None:
     meta = load_session_meta(session_dir)
     meta["session_id"] = session_id
-    meta["course_name"] = course_name
+    if course_name is not None and len(course_name.strip()) > 0:
+        meta["course_name"] = course_name
+    elif "course_name" not in meta:
+        meta["course_name"] = None
     run_record = {
         "started_epoch": time.time(),
         "ended_epoch": None,

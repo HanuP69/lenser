@@ -627,10 +627,13 @@ class StructuringAgent:
 
         if self.redis_bus is not None:
             stream_name = f"lecturelens:{self.session_id}:stream:notes"
-            try:
-                await self.redis_bus.publish(stream_name, note_segment)
-            except Exception as error:
-                logger.warning("failed to publish note segment to redis: %s", error)
+            if hasattr(self.redis_bus, "publish_resilient"):
+                await self.redis_bus.publish_resilient(stream_name, note_segment)
+            else:
+                try:
+                    await self.redis_bus.publish(stream_name, note_segment)
+                except Exception as error:
+                    logger.warning("failed to publish note segment to redis: %s", error)
 
         next_overlap = extract_overlap_entries(entries, OVERLAP_WINDOW_SECONDS)
         self.current_overlap = next_overlap
@@ -641,7 +644,8 @@ class StructuringAgent:
 
     async def process_all_pending(self) -> int:
         processed_batches = 0
-        for _ in range(1000):
+        max_batches = getattr(self.settings, "max_structuring_batches", 1000)
+        for _ in range(max_batches):
             batches = self.read_pending_batches()
             if len(batches) == 0:
                 break

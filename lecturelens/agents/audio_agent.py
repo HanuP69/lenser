@@ -517,6 +517,7 @@ class AudioAgent:
         self.chunk_counter: int = next_file_index(self.raw_audio_dir, "chunk_", ".wav") - 1
         self.locked_language: Optional[str] = settings.whisper_language
         self.transcription_queue: asyncio.Queue = asyncio.Queue(maxsize=settings.audio_queue_capacity)
+        self.spillover_queue: list[PendingTranscription] = []
         self.dropped_transcriptions: int = 0
 
     async def preload_model(self) -> None:
@@ -613,12 +614,25 @@ class AudioAgent:
         except asyncio.QueueFull:
             self.dropped_transcriptions += 1
             self.control.set_stat("dropped_transcriptions", self.dropped_transcriptions)
-            logger.warning("transcription backlog full, raw chunk kept only: %s", wav_path)
+            logger.warning("transcription backlog full, buffering to spillover queue: %s", wav_path)
+            if len(self.spillover_queue) < 100:
+                self.spillover_queue.append(pending)
 
     async def transcription_loop(self) -> None:
         while True:
+            if self.spillover_queue and not self.transcription_queue.full():
+                try:
+                    self.transcription_queue.put_nowait(self.spillover_queue.pop(0))
+                except asyncio.QueueFull:
+                    pass
             pending = await self.transcription_queue.get()
             if pending is None:
+                while self.spillover_queue:
+                    spill_pending = self.spillover_queue.pop(0)
+                    try:
+                        await self.transcribe_and_publish(spill_pending)
+                    except Exception as error:
+                        logger.error("transcription failed for spillover %s: %s", spill_pending.wav_path, error)
                 return
             try:
                 await self.transcribe_and_publish(pending)
@@ -666,8 +680,9 @@ class AudioAgent:
             importance_flags=importance_flags,
             raw_audio_path=pending.wav_path
         )
-        await self.redis_bus.publish_resilient(self.stream_name, chunk_event)
-        self.control.increment_stat("transcripts_published")
+        published_id = await self.redis_bus.publish_resilient(self.stream_name, chunk_event)
+        if published_id is not None:
+            self.control.increment_stat("transcripts_published")
         return chunk_event
 
     async def ingest_wav_bytes(

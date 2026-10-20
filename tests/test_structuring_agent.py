@@ -3,7 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from lecturelens.agents.structuring_agent import (
     SliceBatch,
@@ -51,6 +51,9 @@ class MockRedisBus:
     async def publish(self, stream_name: str, event: Any) -> str:
         self.published.append((stream_name, event))
         return "1-0"
+
+    async def publish_resilient(self, stream_name: str, event: Any) -> Optional[str]:
+        return await self.publish(stream_name, event)
 
 
 def timeline_line(timestamp: float, source: str, content: str, flags: list[str] = None, correlation: str = None, metadata: dict = None) -> str:
