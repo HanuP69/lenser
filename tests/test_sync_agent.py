@@ -42,7 +42,7 @@ class SyncTestBase(unittest.IsolatedAsyncioTestCase):
         self.settings.output_dir = Path(self.temp_dir.name)
         self.settings.sync_merge_window_seconds = 0.5
         self.settings.correlation_window_seconds = 5.0
-        self.bus = RedisBus("redis://localhost:6379")
+        self.bus = RedisBus(self.settings.redis_url)
         self.agent = SyncAgent(self.settings, self.bus, SessionClock(), SESSION)
 
     async def asyncTearDown(self) -> None:

@@ -30,7 +30,7 @@ from tests.test_structuring_agent import MockRouter, timeline_line
 def redis_is_available() -> bool:
     import socket
     try:
-        with socket.create_connection(("localhost", 6379), timeout=0.3):
+        with socket.create_connection(("127.0.0.1", 6379), timeout=0.3):
             return True
     except OSError:
         return False
@@ -55,7 +55,7 @@ class TestRedisBusBacklog(unittest.IsolatedAsyncioTestCase):
     async def test_unacked_backlog_is_replayed_once_without_spinning(self) -> None:
         session = "spin_" + uuid.uuid4().hex[:6]
         stream = f"lecturelens:{session}:stream:transcript"
-        bus = RedisBus("redis://localhost:6379")
+        bus = RedisBus(Settings().redis_url)
         try:
             for index in range(3):
                 await bus.publish(stream, TranscriptChunk(
@@ -104,7 +104,7 @@ class SyncHardeningBase(unittest.IsolatedAsyncioTestCase):
         self.settings.output_dir = Path(self.temp_dir.name)
         self.settings.sync_merge_window_seconds = 0.2
         self.settings.correlation_window_seconds = 5.0
-        self.bus = RedisBus("redis://localhost:6379")
+        self.bus = RedisBus(self.settings.redis_url)
         self.agent = SyncAgent(self.settings, self.bus, SessionClock(), self.session)
 
     async def asyncTearDown(self) -> None:

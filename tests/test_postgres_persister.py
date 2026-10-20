@@ -2,6 +2,7 @@ import asyncio
 import os
 import sys
 import unittest
+import uuid
 from typing import Any, Optional
 from unittest import mock
 
@@ -84,12 +85,12 @@ class FakeStorage:
 
 
 def check_live_postgres() -> bool:
-    test_url = os.environ.get("POSTGRES_TEST_URL")
+    test_url = os.environ.get("POSTGRES_TEST_URL") or Settings().postgres_url
     if not test_url:
         return False
     try:
         import psycopg
-        with psycopg.connect(test_url, timeout=1):
+        with psycopg.connect(test_url, connect_timeout=2):
             return True
     except Exception:
         return False
@@ -235,7 +236,7 @@ class TestPostgresStorageSyntax(unittest.TestCase):
 @unittest.skipUnless(LIVE_PG_AVAILABLE, "Live Postgres not configured via POSTGRES_TEST_URL")
 class TestPostgresLiveIntegration(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
-        test_url = os.environ.get("POSTGRES_TEST_URL", "")
+        test_url = os.environ.get("POSTGRES_TEST_URL") or Settings().postgres_url
         self.storage = PostgresStorage(test_url)
         await self.storage.init_schema()
 
@@ -243,10 +244,10 @@ class TestPostgresLiveIntegration(unittest.IsolatedAsyncioTestCase):
         await self.storage.close()
 
     async def test_round_trip_timeline_and_notes(self) -> None:
-        session_id = "test_live_session"
+        session_id = f"test_live_session_{uuid.uuid4().hex[:8]}"
         entry = TimelineEntry(
             session_id=session_id,
-            event_id="live_evt_1",
+            event_id=f"live_evt_{uuid.uuid4().hex[:6]}",
             timestamp_epoch=1700000000.0,
             elapsed_seconds=5.0,
             source_type="transcript",
@@ -260,11 +261,11 @@ class TestPostgresLiveIntegration(unittest.IsolatedAsyncioTestCase):
 
         events = await self.storage.get_timeline_events(session_id)
         self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["event_id"], "live_evt_1")
+        self.assertEqual(events[0]["event_id"], entry.event_id)
 
     async def test_round_trip_general_notes_and_json_serialization(self) -> None:
         import json
-        session_id = "test_live_notes_sess"
+        session_id = f"test_live_notes_sess_{uuid.uuid4().hex[:8]}"
         note = GeneralNoteSegment(
             session_id=session_id,
             sequence_number=1,
@@ -285,8 +286,8 @@ class TestPostgresLiveIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Live Postgres Note Content", serialized)
 
     async def test_concept_merge_in_live_postgres(self) -> None:
-        session_id = "test_live_concept_sess"
-        course_id = "test_course_live"
+        session_id = f"test_live_concept_sess_{uuid.uuid4().hex[:8]}"
+        course_id = f"test_course_live_{uuid.uuid4().hex[:8]}"
         await self.storage.insert_concept(
             course_id=course_id,
             concept_name="binary_search",

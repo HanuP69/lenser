@@ -5,6 +5,8 @@ from unittest import mock
 
 import redis.asyncio as redis_module
 
+from lecturelens.config.settings import Settings
+
 from lecturelens.core.circuit_breaker import RedisCircuitBreaker, RedisRateLimiter
 from lecturelens.router import llm_router
 from lecturelens.router.llm_router import (
@@ -58,7 +60,7 @@ CONFIG = {
 
 class RouterTestBase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
-        self.client = redis_module.from_url("redis://localhost:6379", decode_responses=True)
+        self.client = redis_module.from_url(Settings().redis_url, decode_responses=True)
         try:
             await self.client.ping()
             self.redis_available = True

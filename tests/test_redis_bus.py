@@ -4,13 +4,14 @@ import unittest
 
 import redis.asyncio as redis_module
 
+from lecturelens.config.settings import Settings
 from lecturelens.core.redis_bus import RedisBus
 from lecturelens.schemas.events import TranscriptChunk
 
 
 class TestRedisBus(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
-        self.bus = RedisBus("redis://localhost:6379")
+        self.bus = RedisBus(Settings().redis_url)
         try:
             await self.bus.client.ping()
             self.redis_available = True
@@ -75,7 +76,7 @@ def make_chunk(text: str) -> TranscriptChunk:
 
 class TestRedisBusReliability(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
-        self.bus = RedisBus("redis://localhost:6379", reclaim_interval_seconds=0.0, reclaim_idle_ms=0)
+        self.bus = RedisBus(Settings().redis_url, reclaim_interval_seconds=0.0, reclaim_idle_ms=0)
         try:
             await self.bus.client.ping()
             self.redis_available = True
@@ -175,7 +176,7 @@ class TestRedisBusReliability(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received, ["orphan"])
 
     async def test_publish_resilient_returns_none_on_connection_error(self) -> None:
-        bus = RedisBus("redis://localhost:6379")
+        bus = RedisBus(Settings().redis_url)
 
         async def flaky_publish(stream_name, event):
             raise redis_module.ConnectionError("down")

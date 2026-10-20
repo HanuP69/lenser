@@ -36,7 +36,8 @@ class RecordingRouter:
 
 class TestPipeline(unittest.IsolatedAsyncioTestCase):
     async def test_events_flow_to_notes_through_the_shutdown_protocol(self) -> None:
-        bus = RedisBus("redis://localhost:6379")
+        settings = Settings()
+        bus = RedisBus(settings.redis_url)
         try:
             await bus.client.ping()
         except Exception:
