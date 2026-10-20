@@ -36,6 +36,7 @@ full = [
     "langgraph>=0.2",
     "chromadb>=0.5",
     "websockets>=12.0",
+    "onnxruntime>=1.15.0",
 ]
 client = [
     "sounddevice>=0.4",
@@ -44,6 +45,7 @@ client = [
     "mss>=9.0",
     "Pillow>=10.0",
     "websockets>=12.0",
+    "onnxruntime>=1.15.0",
 ]
 
 dev = [

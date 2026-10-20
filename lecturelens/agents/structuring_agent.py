@@ -18,6 +18,7 @@ from lecturelens.core.agent_runtime import (
     execute_agent_main,
     run_standard_agent
 )
+from lecturelens.core.concurrency import run_in_thread_pool
 from lecturelens.core.fileio import atomic_write_text
 from lecturelens.core.drift_filter import ContextDriftFilter
 from lecturelens.core.logging_setup import get_logger
@@ -428,6 +429,8 @@ class StructuringAgent:
         try:
             with open(self.context_path, "r", encoding="utf-8") as file_handle:
                 data = json.load(file_handle)
+            if self.drift_filter is not None and "drift_filter_state" in data:
+                self.drift_filter.load_dict(data["drift_filter_state"])
             return {
                 "running_context": str(data.get("running_context", "")),
                 "timeline_byte_offset": int(data.get("timeline_byte_offset", 0)),
@@ -450,6 +453,8 @@ class StructuringAgent:
             "overlap_entries": overlap_entries,
             "sequence_number": self.sequence_number
         }
+        if self.drift_filter is not None:
+            payload["drift_filter_state"] = self.drift_filter.to_dict()
         atomic_write_text(self.context_path, json.dumps(payload, indent=2))
 
     def read_pending_batches(self) -> list[SliceBatch]:
@@ -547,7 +552,7 @@ class StructuringAgent:
     async def process_single_batch(self, batch: SliceBatch, running_context: str) -> str:
         entries = batch.entries
         if self.drift_filter is not None:
-            entries = self.drift_filter.filter_batch_entries(batch.entries)
+            entries = await run_in_thread_pool(self.drift_filter.filter_batch_entries, batch.entries)
 
         if len(entries) == 0:
             logger.info("all entries in batch ending at offset %d filtered as drift/ad; skipping synthesis", batch.end_offset)

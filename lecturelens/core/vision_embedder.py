@@ -8,6 +8,16 @@ from lecturelens.core.logging_setup import get_logger
 logger = get_logger("lecturelens.vision_embedder")
 
 DEFAULT_MODEL_URL = "https://github.com/onnx/models/raw/main/validated/vision/classification/squeezenet/model/squeezenet1.1-7.onnx"
+MIN_MODEL_BYTES = 4_000_000
+
+_SHARED_VISION_EMBEDDER: Optional["VisionEmbedder"] = None
+
+
+def get_shared_vision_embedder() -> "VisionEmbedder":
+    global _SHARED_VISION_EMBEDDER
+    if _SHARED_VISION_EMBEDDER is None:
+        _SHARED_VISION_EMBEDDER = VisionEmbedder()
+    return _SHARED_VISION_EMBEDDER
 
 
 class VisionEmbedder:
@@ -30,16 +40,35 @@ class VisionEmbedder:
         self._initialize_session()
 
     def _ensure_model_file(self) -> bool:
-        if self.model_path.exists() and self.model_path.stat().st_size > 1000000:
-            return True
+        if self.model_path.exists():
+            try:
+                if self.model_path.stat().st_size >= MIN_MODEL_BYTES:
+                    return True
+                self.model_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         if not self.auto_download:
             return False
         try:
             self.model_path.parent.mkdir(parents=True, exist_ok=True)
             temp_path = self.model_path.with_suffix(".tmp")
-            urllib.request.urlretrieve(DEFAULT_MODEL_URL, temp_path)
-            temp_path.replace(self.model_path)
-            return True
+            req = urllib.request.Request(
+                DEFAULT_MODEL_URL,
+                headers={"User-Agent": "LectureLens/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=10.0) as resp:
+                with open(temp_path, "wb") as out_file:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        out_file.write(chunk)
+            if temp_path.stat().st_size >= MIN_MODEL_BYTES:
+                temp_path.replace(self.model_path)
+                return True
+            temp_path.unlink(missing_ok=True)
+            logger.warning("Downloaded model file is too small or truncated")
+            return False
         except Exception as error:
             logger.warning("Failed to download vision embedder model: %s", error)
             return False

@@ -16,6 +16,7 @@ from lecturelens.config.settings import Settings
 from lecturelens.core.concurrency import run_in_thread_pool
 from lecturelens.core.image_utils import SlideChangeGate
 from lecturelens.core.logging_setup import get_logger
+from lecturelens.core.vision_embedder import get_shared_vision_embedder
 
 logger = get_logger("lecturelens.client")
 
@@ -69,14 +70,16 @@ async def stream_screen(websocket: Any, settings: Settings, stop_event: asyncio.
     gate = SlideChangeGate(
         settings.slide_diff_threshold,
         settings.slide_pixel_delta,
-        settings.slide_min_interval_seconds
+        settings.slide_min_interval_seconds,
+        embedder=get_shared_vision_embedder()
     )
     while not stop_event.is_set():
         try:
             frame = await run_in_thread_pool(
                 capture_screen_frame, settings.monitor_index, settings.slide_thumbnail_width
             )
-            if gate.evaluate(frame.thumbnail, time.monotonic()):
+            gate_accepted = await run_in_thread_pool(gate.evaluate, frame.thumbnail, time.monotonic())
+            if gate_accepted:
                 captured_at = time.time()
                 png_bytes = await run_in_thread_pool(encode_frame_as_png, frame)
                 await send_and_wait(

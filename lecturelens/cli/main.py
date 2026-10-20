@@ -144,6 +144,23 @@ def build_agent_environment(
         environment["LECTURELENS_COURSE_NAME"] = course
     if settings.postgres_url:
         environment["LECTURELENS_POSTGRES_URL"] = settings.postgres_url
+    if getattr(settings, "local_model", None):
+        environment["LECTURELENS_LOCAL_MODEL"] = str(settings.local_model)
+        environment["LECTURELENS_OLLAMA_MODEL"] = str(settings.local_model)
+    if getattr(settings, "ollama_model", None):
+        environment["LECTURELENS_OLLAMA_MODEL"] = str(settings.ollama_model)
+    if getattr(settings, "primary_provider", None):
+        environment["LECTURELENS_PRIMARY_PROVIDER"] = str(settings.primary_provider)
+    if getattr(settings, "unorouter_model", None):
+        environment["LECTURELENS_UNOROUTER_MODEL"] = str(settings.unorouter_model)
+    if getattr(settings, "unorouter_api_key", None):
+        environment["LECTURELENS_UNOROUTER_API_KEY"] = str(settings.unorouter_api_key)
+    if getattr(settings, "unorouter_api_keys", None):
+        environment["LECTURELENS_UNOROUTER_API_KEYS"] = str(settings.unorouter_api_keys)
+    if getattr(settings, "google_api_key", None):
+        environment["LECTURELENS_GOOGLE_API_KEY"] = str(settings.google_api_key)
+    if getattr(settings, "openrouter_api_key", None):
+        environment["LECTURELENS_OPENROUTER_API_KEY"] = str(settings.openrouter_api_key)
     if "UNOROUTER_API_KEY" in os.environ and "LECTURELENS_UNOROUTER_API_KEY" not in environment:
         environment["LECTURELENS_UNOROUTER_API_KEY"] = os.environ["UNOROUTER_API_KEY"]
     if "UNOROUTER_API_KEYS" in os.environ and "LECTURELENS_UNOROUTER_API_KEYS" not in environment:

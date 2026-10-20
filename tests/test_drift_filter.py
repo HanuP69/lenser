@@ -74,6 +74,7 @@ class TestContextDriftFilterBehavior(unittest.TestCase):
         self.embedder.set_vector("Welcome to chapter 5 arithmetic progressions", new_chapter)
         self.embedder.set_vector("Arithmetic progressions common difference and nth term", new_chapter)
         self.embedder.set_vector("Sum of first n terms of arithmetic progression", new_chapter)
+        self.embedder.set_vector("Next example of arithmetic progression", new_chapter)
 
     def test_initial_anchor_and_on_topic_acceptance(self) -> None:
         is_drift, score = self.filter.check_entry("Chapter 4 Quadratic Equation Master Plan")
@@ -124,6 +125,53 @@ class TestContextDriftFilterBehavior(unittest.TestCase):
         kept = self.filter.filter_batch_entries(entries)
         self.assertEqual(len(kept), 1)
         self.assertEqual(kept[0]["content"], "Roots and discriminant of quadratic equation")
+
+    def test_exam_and_definition_bypass_drift(self) -> None:
+        self.filter.check_entry("Chapter 4 Quadratic Equation Master Plan")
+        entries = [
+            {
+                "content": "Exam is on Friday, Chapter 4 is extremely important",
+                "importance_flags": ["exam_relevant"],
+                "source_type": "transcript"
+            },
+            {
+                "content": "Buy our revolutionary online communication course now",
+                "importance_flags": [],
+                "source_type": "slide"
+            }
+        ]
+        kept = self.filter.filter_batch_entries(entries)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["content"], "Exam is on Friday, Chapter 4 is extremely important")
+
+    def test_topic_shift_releases_all_quarantined_entries(self) -> None:
+        self.filter.check_entry("Chapter 4 Quadratic Equation Master Plan")
+        entries = [
+            {"content": "Welcome to chapter 5 arithmetic progressions", "source_type": "transcript"},
+            {"content": "Arithmetic progressions common difference and nth term", "source_type": "transcript"},
+            {"content": "Sum of first n terms of arithmetic progression", "source_type": "transcript"},
+            {"content": "Next example of arithmetic progression", "source_type": "transcript"}
+        ]
+        kept = self.filter.filter_batch_entries(entries)
+        self.assertEqual(len(kept), 4)
+
+    def test_code_not_refusal_false_positive(self) -> None:
+        self.assertFalse(is_refusal_text("result = data[name]"))
+        self.assertFalse(is_refusal_text("mapping = {'k': [name]}"))
+        self.assertFalse(is_refusal_text("template = '{{ [title] }}'"))
+        self.assertTrue(is_refusal_text("Presented by: [Name]"))
+        self.assertTrue(is_refusal_text("Presented by: [Your Name]"))
+
+    def test_state_persistence_dict(self) -> None:
+        self.filter.check_entry("Chapter 4 Quadratic Equation Master Plan")
+        state = self.filter.to_dict()
+        self.assertIsNotNone(state.get("running_anchor"))
+        self.assertEqual(state.get("accepted_count"), 1)
+
+        new_filter = ContextDriftFilter(embedder=self.embedder)
+        new_filter.load_dict(state)
+        self.assertEqual(new_filter.accepted_count, 1)
+        self.assertTrue(np.array_equal(new_filter.running_anchor, self.filter.running_anchor))
 
 
 class TestRecordedTimelineFiltering(unittest.TestCase):

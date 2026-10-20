@@ -81,6 +81,31 @@ CONFUSION_PATTERNS: tuple[str, ...] = (
     r"doubt hai",
 )
 
+AD_PATTERNS: tuple[str, ...] = (
+    r"promo\s+codes?",
+    r"coupon\s+codes?",
+    r"discount\s+codes?",
+    r"sponsored\s+by",
+    r"brought\s+to\s+you\s+by",
+    r"use\s+code\s+[a-z0-9_-]+",
+    r"special\s+offers?",
+    r"limited\s+time\s+offer",
+    r"(?:link|check\s+the\s+link)\s+in\s+the\s+description",
+    r"description\s+box\s+below",
+    r"(?:get|for)\s+\d+%\s+off",
+    r"nordvpn",
+    r"expressvpn",
+    r"surfshark",
+    r"squarespace",
+    r"skillshare",
+    r"audible(?:\.com)?",
+    r"patreon(?:\.com)?",
+    r"download\s+(?:the\s+)?app",
+    r"subscribe\s+to\s+my\s+channel",
+    r"smash\s+that\s+like\s+button",
+    r"hit\s+the\s+bell\s+icon",
+)
+
 
 def compile_pattern_group(patterns: tuple[str, ...]) -> re.Pattern:
     alternatives: list[str] = []
@@ -94,6 +119,7 @@ EXAM_RELEVANT_REGEX: re.Pattern = compile_pattern_group(EXAM_RELEVANT_PATTERNS)
 DEFINITION_REGEX: re.Pattern = compile_pattern_group(DEFINITION_PATTERNS)
 EXAMPLE_REGEX: re.Pattern = compile_pattern_group(EXAMPLE_PATTERNS)
 CONFUSION_REGEX: re.Pattern = compile_pattern_group(CONFUSION_PATTERNS)
+AD_REGEX: re.Pattern = compile_pattern_group(AD_PATTERNS)
 
 
 def detect_importance_flags(text: str) -> list[str]:
@@ -108,5 +134,7 @@ def detect_importance_flags(text: str) -> list[str]:
         flags.append("example")
     if CONFUSION_REGEX.search(normalized_text) is not None:
         flags.append("confusion")
+    if AD_REGEX.search(normalized_text) is not None:
+        flags.append("ad")
 
     return flags

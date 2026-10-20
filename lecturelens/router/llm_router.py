@@ -11,7 +11,6 @@ from langchain_core.runnables import Runnable, RunnableLambda
 
 from lecturelens.core.circuit_breaker import RedisRateLimiter, RedisCircuitBreaker
 from lecturelens.core.logging_setup import get_logger
-from lecturelens.config.defaults import DEFAULT_LOCAL_MODEL
 
 logger = get_logger("lecturelens.router")
 
@@ -24,6 +23,16 @@ class ProviderUnavailableError(RuntimeError):
 
 
 def is_provider_failure(error: BaseException) -> bool:
+    err_msg = str(error).lower()
+    for signature in (
+        "not found", "model", "unsupported", "image", "vision",
+        "decommissioned", "deprecated", "retired", "does not exist",
+        "rate limit", "quota", "overloaded", "capacity", "timeout",
+        "not available", "no endpoints"
+    ):
+        if signature in err_msg:
+            return True
+
     status_code = getattr(error, "status_code", None)
     if isinstance(status_code, int):
         if status_code in NON_PROVIDER_STATUS_CODES:
@@ -115,38 +124,38 @@ def extract_provider_api_keys(
     provider_config: dict[str, Any]
 ) -> list[str]:
     env_var_name = provider_config.get("api_key_env", "OPENROUTER_API_KEY")
-    candidates: list[str] = []
+    keys: list[str] = []
 
     plural_name = f"{env_var_name}S"
-    for candidate_name in (
+    candidate_names = [
         plural_name,
         f"LECTURELENS_{plural_name}",
         env_var_name,
         f"LECTURELENS_{env_var_name}"
-    ):
+    ]
+
+    if env_var_name in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
+        candidate_names.extend([
+            "GEMINI_API_KEYS",
+            "LECTURELENS_GEMINI_API_KEYS",
+            "GEMINI_API_KEY",
+            "LECTURELENS_GEMINI_API_KEY",
+            "GOOGLE_API_KEYS",
+            "LECTURELENS_GOOGLE_API_KEYS"
+        ])
+
+    for candidate_name in candidate_names:
         raw = os.environ.get(candidate_name, "").strip()
         if len(raw) > 0:
-            candidates.append(raw)
-            break
-
-    if env_var_name in ("GOOGLE_API_KEY", "GEMINI_API_KEY") and len(candidates) == 0:
-        for alt in ("GEMINI_API_KEYS", "LECTURELENS_GEMINI_API_KEYS", "GEMINI_API_KEY", "LECTURELENS_GEMINI_API_KEY"):
-            raw = os.environ.get(alt, "").strip()
-            if len(raw) > 0:
-                candidates.append(raw)
-                break
-
-    keys: list[str] = []
-    for candidate in candidates:
-        tokens = re.split(r"[,;\n]+", candidate)
-        for token in tokens:
-            cleaned = token.strip().strip("'\"")
-            if len(cleaned) > 0 and cleaned not in keys:
-                keys.append(cleaned)
+            tokens = re.split(r"[,;\n]+", raw)
+            for token in tokens:
+                cleaned = token.strip().strip("'\"")
+                if len(cleaned) > 0 and cleaned not in keys:
+                    keys.append(cleaned)
     return keys
 
 
-class RotatingChatOpenAI(Runnable):
+class RotatingChatModel(Runnable):
     def __init__(self, models: list[Any], keys: list[str]) -> None:
         self.models: list[Any] = models
         self.keys: list[str] = keys
@@ -185,6 +194,9 @@ class RotatingChatOpenAI(Runnable):
             raise last_error
 
 
+RotatingChatOpenAI = RotatingChatModel
+
+
 def create_base_chat_model(
     provider_name: str,
     provider_config: dict[str, Any],
@@ -200,7 +212,12 @@ def create_base_chat_model(
         except ImportError:
             logger.warning("langchain_ollama missing, provider %s skipped", provider_name)
             return None
-        model_name = os.environ.get("LECTURELENS_OLLAMA_MODEL") or provider_config.get("model", "")
+        model_name = (
+            os.environ.get("LECTURELENS_OLLAMA_MODEL")
+            or os.environ.get("LECTURELENS_LOCAL_MODEL")
+            or os.environ.get("OLLAMA_MODEL")
+            or provider_config.get("model", "")
+        )
         return ChatOllama(
             base_url=resolved_ollama_url,
             model=model_name,
@@ -219,7 +236,11 @@ def create_base_chat_model(
             logger.warning("langchain_openai missing, provider %s skipped", provider_name)
             return None
         base_url = provider_config.get("base_url", "https://openrouter.ai/api/v1")
-        model_name = os.environ.get(f"LECTURELENS_{provider_name.upper()}_MODEL") or provider_config.get("model", "")
+        model_name = (
+            os.environ.get(f"LECTURELENS_{provider_name.upper()}_MODEL")
+            or os.environ.get(f"{provider_name.upper()}_MODEL")
+            or provider_config.get("model", "")
+        )
         if len(api_keys) == 1:
             return ChatOpenAI(
                 base_url=base_url,
@@ -236,7 +257,7 @@ def create_base_chat_model(
             )
             for key in api_keys
         ]
-        return RotatingChatOpenAI(models, api_keys)
+        return RotatingChatModel(models, api_keys)
 
     if provider_type == "google_genai":
         api_keys = extract_provider_api_keys(provider_name, provider_config)
@@ -248,11 +269,28 @@ def create_base_chat_model(
         except ImportError:
             logger.warning("langchain_google_genai missing, provider %s skipped", provider_name)
             return None
-        return ChatGoogleGenerativeAI(
-            model=model_name,
-            google_api_key=api_keys[0],
-            max_retries=0
+        model_name = (
+            os.environ.get("LECTURELENS_GOOGLE_MODEL")
+            or os.environ.get("LECTURELENS_GEMINI_MODEL")
+            or os.environ.get("GOOGLE_MODEL")
+            or os.environ.get(f"LECTURELENS_{provider_name.upper()}_MODEL")
+            or provider_config.get("model", "")
         )
+        if len(api_keys) == 1:
+            return ChatGoogleGenerativeAI(
+                model=model_name,
+                google_api_key=api_keys[0],
+                max_retries=0
+            )
+        models = [
+            ChatGoogleGenerativeAI(
+                model=model_name,
+                google_api_key=key,
+                max_retries=0
+            )
+            for key in api_keys
+        ]
+        return RotatingChatModel(models, api_keys)
 
     return None
 

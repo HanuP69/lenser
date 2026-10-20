@@ -102,7 +102,7 @@ class SlideChangeGate:
             return False
 
         current_embedding: Optional[np.ndarray] = None
-        if self.embedder is not None:
+        if self.embedder is not None and (not hasattr(self.embedder, "is_available") or self.embedder.is_available()):
             current_embedding = self.embedder.embed(thumbnail)
             if current_embedding is not None and self.last_accepted_embedding is not None:
                 sim = self.embedder.similarity(self.last_accepted_embedding, current_embedding)

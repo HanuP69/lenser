@@ -2,6 +2,7 @@ import asyncio
 import base64
 import binascii
 import hmac
+import inspect
 import json
 import sys
 import time
@@ -236,7 +237,11 @@ class GatewayServer:
             return {"status": "acknowledged"}
         if message_type == "screen":
             png_bytes = decode_base64_field(message, "png_b64")
-            await runtime.screen_agent.ingest_png_bytes(png_bytes, capture_epoch)
+            sig = inspect.signature(runtime.screen_agent.ingest_png_bytes)
+            if "enforce_gate" in sig.parameters:
+                await runtime.screen_agent.ingest_png_bytes(png_bytes, capture_epoch, enforce_gate=True)
+            else:
+                await runtime.screen_agent.ingest_png_bytes(png_bytes, capture_epoch)
             return {"status": "acknowledged"}
         if message_type == "event":
             source_type = message.get("source_type")

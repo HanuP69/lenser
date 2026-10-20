@@ -21,11 +21,13 @@ from lecturelens.core.image_utils import (
     SlideChangeGate,
     compute_changed_fraction,
     compute_difference_hash,
+    compute_spatial_block_similarity,
     hamming_distance
 )
+from lecturelens.core.drift_filter import is_refusal_text
 from lecturelens.core.logging_setup import get_logger
 from lecturelens.core.redis_bus import RedisBus
-from lecturelens.core.vision_embedder import VisionEmbedder
+from lecturelens.core.vision_embedder import VisionEmbedder, get_shared_vision_embedder
 from lecturelens.router.messages import build_image_message, response_to_text
 from lecturelens.schemas.events import SlideCaptured
 
@@ -132,7 +134,7 @@ class ScreenAgent:
         self.stream_name: str = f"lecturelens:{session_id}:stream:slide"
         self.control: AgentControl = AgentControl(session_dir, "screen_agent")
         self.slide_counter: int = next_file_index(self.slides_dir, "slide_", ".png") - 1
-        self.vision_embedder = VisionEmbedder()
+        self.vision_embedder = get_shared_vision_embedder()
         self.gate: SlideChangeGate = SlideChangeGate(
             change_threshold=settings.slide_diff_threshold,
             pixel_delta=settings.slide_pixel_delta,
@@ -153,7 +155,9 @@ class ScreenAgent:
                 stored_thumbnail, small_thumbnail, self.settings.slide_pixel_delta
             )
             if changed_fraction <= REVISIT_MAX_CHANGED_FRACTION:
-                return slide_number
+                spatial_sim = compute_spatial_block_similarity(stored_thumbnail, small_thumbnail)
+                if spatial_sim >= 0.85:
+                    return slide_number
         return 0
 
     def remember_slide(
@@ -181,13 +185,7 @@ class ScreenAgent:
             try:
                 response = await self.llm_router.ainvoke([message])
                 text = response_to_text(response).strip()
-                lower = text.lower()
-                if (
-                    "please provide" in lower
-                    or "no text or diagram was visible" in lower
-                    or "i need an image" in lower
-                    or "no text is currently visible" in lower
-                ):
+                if is_refusal_text(text):
                     return ""
                 return text
             except Exception as error:
@@ -292,11 +290,18 @@ class ScreenAgent:
     async def ingest_png_bytes(
         self,
         png_bytes: bytes,
-        capture_epoch: Optional[float] = None
-    ) -> SlideCaptured:
+        capture_epoch: Optional[float] = None,
+        enforce_gate: bool = False
+    ) -> Optional[SlideCaptured]:
         thumbnail = await run_in_thread_pool(
             build_thumbnail_from_png, png_bytes, self.settings.slide_thumbnail_width
         )
+        if enforce_gate:
+            gate_accepted = await run_in_thread_pool(
+                self.gate.evaluate, thumbnail, capture_epoch or time.monotonic()
+            )
+            if not gate_accepted:
+                return None
         return await self.accept_png(png_bytes, thumbnail, capture_epoch)
 
     async def run(self) -> None:
@@ -323,7 +328,10 @@ class ScreenAgent:
             if self.control.stop_requested():
                 break
 
-            if self.gate.evaluate(frame.thumbnail, time.monotonic()):
+            gate_accepted = await run_in_thread_pool(
+                self.gate.evaluate, frame.thumbnail, time.monotonic()
+            )
+            if gate_accepted:
                 if self.control.stop_requested():
                     break
                 try:
