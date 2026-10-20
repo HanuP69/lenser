@@ -2,8 +2,10 @@ import asyncio
 import inspect
 import json
 from pathlib import Path
+import sqlite3
 import time
 from typing import Any, Awaitable, Callable, Optional
+import uuid
 
 import redis.asyncio as redis
 from pydantic import BaseModel
@@ -65,56 +67,139 @@ class RedisBus:
         self.outbox_max_size: int = outbox_max_size
         self.outbox_path: Optional[Path] = Path(outbox_path) if outbox_path else None
         self.outbox: list[tuple[str, Any]] = []
+        self._outbox_row_ids: list[int] = []
         self._outbox_lock: asyncio.Lock = asyncio.Lock()
         self.failure_counts: dict[str, int] = {}
-        if self.outbox_path and self.outbox_path.exists():
+        self._last_flush_attempt: float = 0.0
+        self._flush_backoff_seconds: float = 1.0
+        self._db_conn: Optional[sqlite3.Connection] = None
+        if self.outbox_path:
+            self._init_db()
             self._load_outbox()
 
+    def _init_db(self) -> None:
+        if not self.outbox_path:
+            return
+        self.outbox_path.parent.mkdir(parents=True, exist_ok=True)
+        is_legacy = False
+        if self.outbox_path.exists():
+            try:
+                with open(self.outbox_path, "rb") as check_f:
+                    header = check_f.read(16)
+                    if header and not header.startswith(b"SQLite format 3"):
+                        is_legacy = True
+            except Exception:
+                pass
+
+        legacy_items: list[tuple[str, Any]] = []
+        if is_legacy:
+            try:
+                with open(self.outbox_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        stripped = line.strip()
+                        if stripped:
+                            item = json.loads(stripped)
+                            s = item.get("stream")
+                            p = item.get("data")
+                            if s and p:
+                                legacy_items.append((s, p))
+                self.outbox_path.unlink(missing_ok=True)
+            except Exception as err:
+                logger.warning("migrating legacy outbox file failed: %s", err)
+
+        self._db_conn = sqlite3.connect(str(self.outbox_path), timeout=10.0, check_same_thread=False)
+        self._db_conn.execute("PRAGMA journal_mode = WAL;")
+        self._db_conn.execute("PRAGMA busy_timeout = 5000;")
+        self._db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS outbox_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT UNIQUE,
+                stream_name TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+        """)
+        self._db_conn.commit()
+
+        if legacy_items:
+            for s, p in legacy_items:
+                ev_id = uuid.uuid4().hex
+                self._db_conn.execute(
+                    "INSERT OR IGNORE INTO outbox_entries (event_id, stream_name, payload, created_at) VALUES (?, ?, ?, ?)",
+                    (ev_id, s, json.dumps(p), time.time())
+                )
+            self._db_conn.commit()
+
     def _load_outbox(self) -> None:
-        if not self.outbox_path or not self.outbox_path.exists():
+        if self._db_conn is None:
             return
         try:
-            with open(self.outbox_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    stripped = line.strip()
-                    if stripped:
-                        item = json.loads(stripped)
-                        stream_name = item.get("stream")
-                        payload = item.get("data")
-                        if stream_name and payload:
-                            self.outbox.append((stream_name, payload))
+            cursor = self._db_conn.cursor()
+            cursor.execute("SELECT id, stream_name, payload FROM outbox_entries ORDER BY id ASC;")
+            rows = cursor.fetchall()
+            self.outbox.clear()
+            self._outbox_row_ids.clear()
+            for row_id, stream_name, payload_raw in rows:
+                try:
+                    payload = json.loads(payload_raw)
+                except Exception:
+                    payload = payload_raw
+                self.outbox.append((stream_name, payload))
+                self._outbox_row_ids.append(row_id)
         except Exception as err:
             logger.warning("loading persistent outbox failed: %s", err)
 
-    def _save_outbox(self) -> None:
-        if not self.outbox_path:
-            return
-        try:
-            self.outbox_path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path = self.outbox_path.with_suffix(".tmp")
-            with open(temp_path, "w", encoding="utf-8") as f:
-                for stream_name, event in self.outbox:
-                    data = event_to_redis_fields(event) if isinstance(event, BaseModel) else event
-                    line = json.dumps({"stream": stream_name, "data": data})
-                    f.write(line + "\n")
-            temp_path.replace(self.outbox_path)
-        except Exception as err:
-            logger.warning("saving persistent outbox failed: %s", err)
+    def _append_to_outbox(self, stream_name: str, event: Any) -> None:
+        if len(self.outbox) >= self.outbox_max_size:
+            raise RuntimeError(f"Persistent outbox capacity exceeded ({self.outbox_max_size})")
+
+        event_data = event_to_redis_fields(event) if isinstance(event, BaseModel) else event
+        payload_str = json.dumps(event_data)
+        event_id = uuid.uuid4().hex
+        if self._db_conn is not None:
+            try:
+                cursor = self._db_conn.cursor()
+                cursor.execute(
+                    "INSERT INTO outbox_entries (event_id, stream_name, payload, created_at) VALUES (?, ?, ?, ?)",
+                    (event_id, stream_name, payload_str, time.time())
+                )
+                self._db_conn.commit()
+                row_id = cursor.lastrowid
+                if row_id is not None:
+                    self._outbox_row_ids.append(row_id)
+            except Exception as err:
+                logger.error("saving persistent outbox failed: %s", err)
+                raise RuntimeError(f"Persisting to outbox failed: {err}") from err
+        self.outbox.append((stream_name, event_data))
 
     async def flush_outbox(self) -> int:
         async with self._outbox_lock:
             if not self.outbox:
                 return 0
+            self._last_flush_attempt = time.monotonic()
             flushed = 0
-            remaining: list[tuple[str, Any]] = []
-            for stream_name, event in self.outbox:
+            fail_idx = None
+            for idx, (stream_name, event) in enumerate(list(self.outbox)):
                 try:
                     await self.publish(stream_name, event)
                     flushed += 1
-                except Exception:
-                    remaining.append((stream_name, event))
-            self.outbox = remaining
-            self._save_outbox()
+                    if self._db_conn is not None and idx < len(self._outbox_row_ids):
+                        row_id = self._outbox_row_ids[idx]
+                        self._db_conn.execute("DELETE FROM outbox_entries WHERE id = ?", (row_id,))
+                        self._db_conn.commit()
+                except (redis.RedisError, OSError) as net_err:
+                    fail_idx = idx
+                    self._flush_backoff_seconds = min(60.0, max(2.0, self._flush_backoff_seconds * 2.0))
+                    break
+
+            if fail_idx is not None:
+                self.outbox = self.outbox[fail_idx:]
+                self._outbox_row_ids = self._outbox_row_ids[fail_idx:]
+            else:
+                self.outbox = []
+                self._outbox_row_ids = []
+                self._flush_backoff_seconds = 1.0
+
             if flushed > 0:
                 logger.info("flushed %d events from outbox (%d remaining)", flushed, len(self.outbox))
             return flushed
@@ -135,14 +220,18 @@ class RedisBus:
         return entry_id
 
     async def publish_resilient(self, stream_name: str, event: BaseModel) -> Optional[str]:
-        await self.flush_outbox()
+        now = time.monotonic()
+        if now - self._last_flush_attempt >= self._flush_backoff_seconds:
+            await self.flush_outbox()
         try:
             return await self.publish(stream_name, event)
         except (redis.RedisError, OSError) as error:
             logger.warning("publish failed for %s: %s, buffering in persistent outbox", stream_name, error)
             async with self._outbox_lock:
-                self.outbox.append((stream_name, event))
-                self._save_outbox()
+                try:
+                    self._append_to_outbox(stream_name, event)
+                except Exception as save_err:
+                    raise RuntimeError(f"Publish to redis failed ({error}) and outbox persistence failed: {save_err}") from save_err
             return None
 
     async def ensure_consumer_group(self, stream_name: str, group_name: str) -> None:
@@ -391,4 +480,10 @@ class RedisBus:
             return False
 
     async def close(self) -> None:
+        if self._db_conn is not None:
+            try:
+                self._db_conn.close()
+            except Exception:
+                pass
+            self._db_conn = None
         await self.client.aclose()

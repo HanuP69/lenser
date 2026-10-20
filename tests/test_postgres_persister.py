@@ -403,6 +403,49 @@ class TestPostgresSchemaFallback(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0]["event_id"], "e1")
         self.assertEqual(events[1]["event_id"], "e2")
 
+    async def test_delete_embeddings_and_delete_session_embeddings(self) -> None:
+        executed: list[tuple[str, Any]] = []
+
+        class FakeDeleteCursor:
+            def __init__(self) -> None:
+                self.rowcount = 3
+
+            async def execute(self, sql: str, params: Any = None) -> None:
+                executed.append((sql, params))
+
+            async def __aenter__(self) -> "FakeDeleteCursor":
+                return self
+
+            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                pass
+
+        class FakeDeleteConn:
+            def cursor(self) -> FakeDeleteCursor:
+                return FakeDeleteCursor()
+
+            async def __aenter__(self) -> "FakeDeleteConn":
+                return self
+
+            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                pass
+
+            def transaction(self) -> "FakeDeleteConn":
+                return self
+
+        storage = PostgresStorage("postgresql://mock/db")
+        storage._connection = FakeDeleteConn()
+        storage.get_connection = mock.AsyncMock(return_value=FakeDeleteConn())
+
+        count = await storage.delete_embeddings("sess_abc", ["chunk1", "chunk2"])
+        self.assertEqual(count, 3)
+        self.assertIn("DELETE FROM embeddings", executed[0][0])
+        self.assertEqual(executed[0][1], ("sess_abc", ["chunk1", "chunk2"]))
+
+        del_count = await storage.delete_session_embeddings("sess_abc", exclude_model="nomic-embed-text")
+        self.assertEqual(del_count, 3)
+        self.assertIn("embedding_model !=", executed[1][0])
+        self.assertEqual(executed[1][1], ("sess_abc", "nomic-embed-text"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -151,7 +151,7 @@ class TestQAEngine(unittest.IsolatedAsyncioTestCase):
         fake_conn.cursor = mock.MagicMock(return_value=fake_cursor)
         mock_storage.get_connection = mock.AsyncMock(return_value=fake_conn)
 
-        async def record_insert(session_id, source_type, source_id, chunk_text, vector):
+        async def record_insert(session_id, source_type, source_id, chunk_text, vector, **kwargs):
             inserted_records.append((source_id, chunk_text, vector))
             return True
 
@@ -161,6 +161,18 @@ class TestQAEngine(unittest.IsolatedAsyncioTestCase):
         await self.engine.build_index()
         self.assertEqual(len(self.embedded_texts), 0)
         self.assertGreater(len(inserted_records), 0)
+
+    async def test_stale_chunks_deleted_from_postgres_on_build_index(self) -> None:
+        await self.engine.build_index()
+        deleted_from_pg = []
+        mock_storage = mock.MagicMock()
+        mock_storage.delete_embeddings = mock.AsyncMock(side_effect=lambda sess, ids: deleted_from_pg.extend(ids))
+        mock_storage.delete_session_embeddings = mock.AsyncMock(return_value=0)
+        self.engine.storage = mock_storage
+
+        (self.session_dir / "notes.md").write_text("# New Title\n\nEntirely new notes content.\n", encoding="utf-8")
+        await self.engine.build_index()
+        self.assertGreater(len(deleted_from_pg), 0)
 
 
 if __name__ == "__main__":

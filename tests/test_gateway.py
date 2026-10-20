@@ -435,6 +435,40 @@ class TestGatewayMessages(GatewayTestBase):
         self.assertEqual(len(note_payloads), 1)
         self.assertEqual(note_payloads[0]["sequence_number"], 2)
 
+    async def test_subscriber_replay_falls_back_to_redis_when_postgres_fails(self) -> None:
+        class FailingPostgresStorage:
+            async def get_general_notes_since(self, session_id: str, after_seq: int) -> list[dict[str, Any]]:
+                raise RuntimeError("Postgres connection dropped")
+
+        self.gateway.storage = FailingPostgresStorage()
+        redis_notes = [{
+            "session_id": "room1",
+            "sequence_number": 2,
+            "timestamp_epoch": 100.0,
+            "start_time": "00:01:00",
+            "end_time": "00:02:00",
+            "heading": "From Redis",
+            "content": "Redis note content",
+            "key_points": [],
+            "concept_tags": []
+        }]
+        self.gateway._replay_notes_from_redis = mock.AsyncMock(return_value=redis_notes)
+
+        sub_hello = json.dumps({
+            "type": "hello",
+            "api_key": "secret",
+            "session_id": "room1",
+            "role": "subscriber",
+            "last_sequence_number": 1
+        })
+        socket = FakeWebSocket([sub_hello])
+        await self.gateway.handle_connection(socket)
+
+        note_payloads = [msg["payload"] for msg in socket.sent if msg.get("type") == "note_segment"]
+        self.assertEqual(len(note_payloads), 1)
+        self.assertEqual(note_payloads[0]["heading"], "From Redis")
+        self.assertEqual(note_payloads[0]["sequence_number"], 2)
+
     def test_active_subscribers_prevent_session_eviction(self) -> None:
         runtime = self.gateway.get_or_create_session("active_sub_session")
         runtime.connection_count = 0

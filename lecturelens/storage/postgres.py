@@ -85,12 +85,15 @@ CREATE TABLE IF NOT EXISTS embeddings (
     source_type TEXT,
     source_id TEXT,
     chunk_text TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    embedding_model TEXT DEFAULT '',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT embeddings_session_id_source_id_key UNIQUE(session_id, source_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_timeline_events_session ON timeline_events (session_id, timestamp_epoch);
 CREATE INDEX IF NOT EXISTS idx_general_notes_session_seq ON general_notes (session_id, sequence_number);
 CREATE INDEX IF NOT EXISTS idx_concepts_course ON concepts (course_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_session_source ON embeddings (session_id, source_id);
 """
 
 MIGRATE_CONCEPTS_SQL = """
@@ -150,6 +153,14 @@ class PostgresStorage:
             async with conn.cursor() as cur:
                 await cur.execute(CREATE_TABLES_SQL)
                 await cur.execute(MIGRATE_CONCEPTS_SQL)
+
+        try:
+            async with self.transaction() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("ALTER TABLE embeddings ADD COLUMN IF NOT EXISTS embedding_model TEXT DEFAULT '';")
+                    await cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_session_source ON embeddings (session_id, source_id);")
+        except Exception as schema_err:
+            logger.debug("embeddings schema update skipped: %s", schema_err)
 
         try:
             async with self.transaction() as conn:
@@ -348,42 +359,98 @@ class PostgresStorage:
         source_type: str,
         source_id: str,
         chunk_text: str,
-        vector: Optional[list[float]] = None
+        vector: Optional[list[float]] = None,
+        embedding_model: str = ""
     ) -> bool:
         async with self.transaction() as conn:
             async with conn.cursor() as cur:
                 if vector is not None:
                     query = """
-                    INSERT INTO embeddings (session_id, source_type, source_id, chunk_text, embedding)
-                    VALUES (%s, %s, %s, %s, %s::vector);
+                    INSERT INTO embeddings (session_id, source_type, source_id, chunk_text, embedding, embedding_model)
+                    VALUES (%s, %s, %s, %s, %s::vector, %s)
+                    ON CONFLICT (session_id, source_id) DO UPDATE SET
+                        source_type = EXCLUDED.source_type,
+                        chunk_text = EXCLUDED.chunk_text,
+                        embedding = EXCLUDED.embedding,
+                        embedding_model = EXCLUDED.embedding_model,
+                        created_at = NOW();
                     """
-                    await cur.execute(query, (session_id, source_type, source_id, chunk_text, vector))
+                    await cur.execute(query, (session_id, source_type, source_id, chunk_text, vector, embedding_model))
                 else:
                     query = """
-                    INSERT INTO embeddings (session_id, source_type, source_id, chunk_text)
-                    VALUES (%s, %s, %s, %s);
+                    INSERT INTO embeddings (session_id, source_type, source_id, chunk_text, embedding_model)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (session_id, source_id) DO UPDATE SET
+                        source_type = EXCLUDED.source_type,
+                        chunk_text = EXCLUDED.chunk_text,
+                        embedding_model = EXCLUDED.embedding_model,
+                        created_at = NOW();
                     """
-                    await cur.execute(query, (session_id, source_type, source_id, chunk_text))
+                    await cur.execute(query, (session_id, source_type, source_id, chunk_text, embedding_model))
                 return True
+
+    async def delete_embeddings(
+        self,
+        session_id: str,
+        source_ids: list[str]
+    ) -> int:
+        if not source_ids:
+            return 0
+        query = """
+        DELETE FROM embeddings
+        WHERE session_id = %s AND source_id = ANY(%s);
+        """
+        async with self.transaction() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(query, (session_id, source_ids))
+                return cur.rowcount or 0
+
+    async def delete_session_embeddings(
+        self,
+        session_id: str,
+        exclude_model: Optional[str] = None
+    ) -> int:
+        if exclude_model:
+            query = "DELETE FROM embeddings WHERE session_id = %s AND embedding_model != %s AND embedding_model != '';"
+            params = (session_id, exclude_model)
+        else:
+            query = "DELETE FROM embeddings WHERE session_id = %s;"
+            params = (session_id,)
+        async with self.transaction() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(query, params)
+                return cur.rowcount or 0
 
     async def search_embeddings(
         self,
         session_id: str,
         query_vector: list[float],
-        top_k: int = 5
+        top_k: int = 5,
+        embedding_model: Optional[str] = None
     ) -> list[dict[str, Any]]:
-        query = """
-        SELECT chunk_text, source_id, source_type, (embedding <=> %s::vector) AS distance
-        FROM embeddings
-        WHERE session_id = %s AND embedding IS NOT NULL
-        ORDER BY distance ASC
-        LIMIT %s;
-        """
+        if embedding_model:
+            query = """
+            SELECT chunk_text, source_id, source_type, (embedding <=> %s::vector) AS distance
+            FROM embeddings
+            WHERE session_id = %s AND embedding IS NOT NULL AND (embedding_model = %s OR embedding_model = '' OR embedding_model IS NULL)
+            ORDER BY distance ASC
+            LIMIT %s;
+            """
+            params = (query_vector, session_id, embedding_model, top_k)
+        else:
+            query = """
+            SELECT chunk_text, source_id, source_type, (embedding <=> %s::vector) AS distance
+            FROM embeddings
+            WHERE session_id = %s AND embedding IS NOT NULL
+            ORDER BY distance ASC
+            LIMIT %s;
+            """
+            params = (query_vector, session_id, top_k)
         async with self._lock:
             conn = await self.get_connection()
             async with conn.cursor() as cur:
                 try:
-                    await cur.execute(query, (query_vector, session_id, top_k))
+                    await cur.execute(query, params)
                     return await cur.fetchall()
                 except Exception as err:
                     await conn.rollback()

@@ -206,6 +206,17 @@ class QAEngine:
                 stale_ids.append(existing_id)
         if len(stale_ids) > 0:
             self.collection.delete(ids=stale_ids)
+            if self.storage is not None and hasattr(self.storage, "delete_embeddings"):
+                try:
+                    await self.storage.delete_embeddings(self.session_dir.name, stale_ids)
+                except Exception as del_err:
+                    logger.debug("deleting stale postgres embeddings failed: %s", del_err)
+
+        if self.storage is not None and hasattr(self.storage, "delete_session_embeddings"):
+            try:
+                await self.storage.delete_session_embeddings(self.session_dir.name, exclude_model=self.embedding_model)
+            except Exception as clean_err:
+                logger.debug("cleaning non-matching postgres embeddings failed: %s", clean_err)
 
         new_chunks: list[IndexedChunk] = []
         seen_new: set[str] = set()
@@ -251,7 +262,8 @@ class QAEngine:
                             source_type=chunk.source,
                             source_id=chunk.chunk_id,
                             chunk_text=chunk.text,
-                            vector=vector
+                            vector=vector,
+                            embedding_model=self.embedding_model
                         )
                     except Exception as err:
                         logger.debug("persisting embedding to postgres failed: %s", err)
@@ -282,7 +294,8 @@ class QAEngine:
                                 source_type=chunk.source,
                                 source_id=chunk.chunk_id,
                                 chunk_text=chunk.text,
-                                vector=vec
+                                vector=vec,
+                                embedding_model=self.embedding_model
                             )
                         except Exception as retry_err:
                             logger.debug("retrying embedding to postgres failed: %s", retry_err)
@@ -296,31 +309,42 @@ class QAEngine:
         if total == 0 and not has_pg:
             return []
         question_vectors = await self.generate_embeddings([question])
+        retrieved: list[tuple[str, str]] = []
+        seen_texts: set[str] = set()
+
         if has_pg:
             try:
                 pg_results = await self.storage.search_embeddings(
                     session_id=self.session_dir.name,
                     query_vector=question_vectors[0],
-                    top_k=self.top_k
+                    top_k=self.top_k,
+                    embedding_model=self.embedding_model
                 )
-                if pg_results:
-                    return [(row["chunk_text"], str(row.get("source_id", "pgvector"))) for row in pg_results]
+                for row in pg_results:
+                    txt = str(row.get("chunk_text") or "")
+                    if txt and txt not in seen_texts:
+                        seen_texts.add(txt)
+                        retrieved.append((txt, str(row.get("source_id", "notes.md"))))
             except Exception as err:
                 logger.debug("pgvector search fallback to chroma: %s", err)
-        if total == 0:
-            return []
-        result = self.collection.query(
-            query_embeddings=[question_vectors[0]],
-            n_results=min(self.top_k, total)
-        )
-        documents = result["documents"][0]
-        metadatas = result["metadatas"][0]
-        retrieved: list[tuple[str, str]] = []
-        for index in range(len(documents)):
-            reference = "unknown"
-            if metadatas[index] is not None:
-                reference = str(metadatas[index].get("reference", "unknown"))
-            retrieved.append((documents[index], reference))
+
+        if total > 0 and len(retrieved) < self.top_k:
+            result = self.collection.query(
+                query_embeddings=[question_vectors[0]],
+                n_results=min(self.top_k, total)
+            )
+            documents = result["documents"][0]
+            metadatas = result["metadatas"][0]
+            for index in range(len(documents)):
+                doc = str(documents[index])
+                if doc not in seen_texts:
+                    seen_texts.add(doc)
+                    reference = "unknown"
+                    if metadatas[index] is not None:
+                        reference = str(metadatas[index].get("reference", "unknown"))
+                    retrieved.append((doc, reference))
+                    if len(retrieved) >= self.top_k:
+                        break
         return retrieved
 
     async def call_language_model(self, prompt: str) -> str:

@@ -3,6 +3,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import redis.asyncio as redis_module
 
@@ -217,6 +218,60 @@ class TestRedisBusReliability(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(bus2.outbox), 0)
             self.assertEqual(len(published_events), 1)
             await bus2.close()
+
+    async def test_publish_resilient_raises_when_outbox_persistence_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            outbox_file = Path(td) / "outbox.db"
+            bus = RedisBus(Settings().redis_url, outbox_path=outbox_file)
+            try:
+                async def fail_pub(s, e):
+                    raise redis_module.ConnectionError("redis unreachable")
+
+                bus.publish = fail_pub
+                bus._append_to_outbox = mock.Mock(side_effect=IOError("disk full"))
+                with self.assertRaises(RuntimeError):
+                    await bus.publish_resilient("stream1", make_chunk("fail disk"))
+            finally:
+                await bus.close()
+
+    async def test_flush_outbox_stops_on_first_error_without_quadratic_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            outbox_file = Path(td) / "outbox.db"
+            bus = RedisBus(Settings().redis_url, outbox_path=outbox_file)
+            try:
+                for i in range(5):
+                    bus.outbox.append(("stream1", {"text": f"item {i}"}))
+                    bus._outbox_row_ids.append(i + 1)
+                publish_attempts = 0
+
+                async def failing_publish(s, e):
+                    nonlocal publish_attempts
+                    publish_attempts += 1
+                    raise redis_module.ConnectionError("still down")
+
+                bus.publish = failing_publish
+                flushed = await bus.flush_outbox()
+                self.assertEqual(flushed, 0)
+                self.assertEqual(publish_attempts, 1)
+                self.assertEqual(len(bus.outbox), 5)
+            finally:
+                await bus.close()
+
+    async def test_outbox_max_size_enforced(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            outbox_file = Path(td) / "outbox.db"
+            bus = RedisBus(Settings().redis_url, outbox_max_size=2, outbox_path=outbox_file)
+            try:
+                async def failing_pub(s, e):
+                    raise redis_module.ConnectionError("down")
+
+                bus.publish = failing_pub
+                await bus.publish_resilient("s", make_chunk("1"))
+                await bus.publish_resilient("s", make_chunk("2"))
+                with self.assertRaises(RuntimeError):
+                    await bus.publish_resilient("s", make_chunk("3"))
+            finally:
+                await bus.close()
 
     async def test_consume_survives_read_errors_with_backoff(self) -> None:
         original_read = self.bus.read_group_messages

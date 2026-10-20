@@ -144,13 +144,22 @@ def parse_runtime_arguments(argument_list: Optional[list[str]] = None) -> argpar
     return namespace
 
 
-def create_redis_bus(settings: Settings, outbox_path: Optional[Path] = None) -> RedisBus:
-    resolved_outbox = outbox_path or (settings.output_dir / "redis_outbox.jsonl")
+def create_redis_bus(
+    settings: Settings,
+    outbox_path: Optional[Path] = None,
+    component_name: Optional[str] = None
+) -> RedisBus:
+    if outbox_path is not None:
+        resolved_outbox = outbox_path
+    else:
+        comp = component_name or f"proc_{os.getpid()}"
+        resolved_outbox = settings.output_dir / f"redis_outbox_{comp}.db"
     return RedisBus(
         settings.redis_url,
         stream_max_length=getattr(settings, "stream_max_length", 200000),
         reclaim_idle_ms=getattr(settings, "reclaim_idle_ms", 30000),
         retry_ttl_seconds=getattr(settings, "retry_key_ttl_seconds", getattr(settings, "redis_retry_ttl_seconds", 86400)),
+        outbox_max_size=getattr(settings, "outbox_max_size", getattr(settings, "redis_outbox_max_size", 1000)),
         outbox_path=resolved_outbox
     )
 

@@ -327,7 +327,7 @@ async def live_dashboard_loop(
     monitor: AgentMonitor,
     session_dir: Path
 ) -> None:
-    bus = RedisBus(settings.redis_url)
+    bus = create_redis_bus(settings, component_name="dashboard")
     line_counter = LineCounter(session_dir / "timeline.jsonl")
     try:
         with Live(console=console, refresh_per_second=1) as live:

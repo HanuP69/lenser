@@ -2,9 +2,12 @@ import asyncio
 import json
 import logging
 import math
-import re
-from dataclasses import dataclass, field
+import os
 from pathlib import Path
+import re
+import sqlite3
+import time
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from lecturelens.config.settings import Settings
@@ -136,21 +139,53 @@ class StudentClient:
         self.student_graph = student_graph
         self.rewriter = PersonalizationEngine(profile, llm_router)
         self.state_file = output_dir / f"{session_id}_{profile.student_id}_state.json"
+        self.ledger_file = output_dir / f"{session_id}_{profile.student_id}_ledger.db"
+        self._init_ledger()
         self.last_sequence_number = self.load_persisted_sequence()
         self.notes_file = output_dir / f"{session_id}_personalized_notes.md"
         self.received_segments: list[GeneralNoteSegment] = []
         self.pending_segments: dict[int, GeneralNoteSegment] = {}
         self.is_running = False
 
+    def _init_ledger(self) -> None:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            conn = sqlite3.connect(str(self.ledger_file), timeout=10.0)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS applied_segments (
+                    sequence_number INTEGER PRIMARY KEY,
+                    session_id TEXT,
+                    heading TEXT,
+                    content TEXT,
+                    created_at REAL
+                );
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as err:
+            logger.warning("failed to initialize student ledger: %s", err)
+
     def load_persisted_sequence(self) -> int:
+        persisted = 0
         if self.state_file.exists():
             try:
                 with open(self.state_file, "r", encoding="utf-8") as handle:
                     data = json.load(handle)
-                    return int(data.get("last_sequence_number", 0))
+                    persisted = int(data.get("last_sequence_number", 0))
             except Exception:
                 pass
-        return 0
+        if hasattr(self, "ledger_file") and self.ledger_file.exists():
+            try:
+                conn = sqlite3.connect(str(self.ledger_file), timeout=5.0)
+                cur = conn.cursor()
+                cur.execute("SELECT MAX(sequence_number) FROM applied_segments;")
+                row = cur.fetchone()
+                conn.close()
+                if row and row[0] is not None:
+                    persisted = max(persisted, int(row[0]))
+            except Exception:
+                pass
+        return persisted
 
     def save_persisted_sequence(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -162,8 +197,32 @@ class StudentClient:
 
     async def _apply_segment(self, segment: GeneralNoteSegment) -> str:
         personalized_content = await self.rewriter.rewrite_segment(segment)
+        is_new = True
+        try:
+            conn = sqlite3.connect(str(self.ledger_file), timeout=10.0)
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT OR IGNORE INTO applied_segments (sequence_number, session_id, heading, content, created_at) VALUES (?, ?, ?, ?, ?)",
+                (segment.sequence_number, segment.session_id, segment.heading, personalized_content, time.time())
+            )
+            is_new = (cur.rowcount or 0) > 0
+            conn.commit()
+            conn.close()
+        except Exception as ledger_err:
+            logger.warning("saving to student ledger failed: %s", ledger_err)
+
+        if is_new:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            with open(self.notes_file, "a", encoding="utf-8") as handle:
+                handle.write(f"\n{personalized_content}\n")
+                handle.flush()
+                try:
+                    os.fsync(handle.fileno())
+                except Exception:
+                    pass
+
         self.received_segments.append(segment)
-        self.last_sequence_number = segment.sequence_number
+        self.last_sequence_number = max(self.last_sequence_number, segment.sequence_number)
         self.save_persisted_sequence()
 
         if self.student_graph is not None:
@@ -173,9 +232,6 @@ class StudentClient:
                 except Exception as graph_err:
                     logger.debug("failed to record concept in student graph: %s", graph_err)
 
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.notes_file, "a", encoding="utf-8") as handle:
-            handle.write(f"\n{personalized_content}\n")
         return personalized_content
 
     async def on_note_segment_received(

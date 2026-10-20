@@ -19,6 +19,7 @@ from lecturelens.agents.screen_agent import ScreenAgent
 from lecturelens.config.settings import Settings
 from lecturelens.core.agent_runtime import (
     AgentControl,
+    create_postgres_storage,
     create_redis_bus,
     execute_agent_main,
     parse_runtime_arguments
@@ -367,26 +368,13 @@ class GatewayServer:
 
                 last_seq = int(hello_message.get("last_sequence_number", 0))
                 highest_seq = last_seq
-                if self.storage is not None and last_seq >= 0:
-                    try:
-                        missed = await self.storage.get_general_notes_since(session_id, last_seq)
-                        for note in missed:
-                            note_seq = int(note.get("sequence_number", 0))
-                            if note_seq > highest_seq:
-                                highest_seq = note_seq
-                            await client_queue.put({"type": "note_segment", "payload": note})
-                    except Exception as replay_err:
-                        logger.warning("postgres replay failed for %s: %s", session_id, replay_err)
-                elif self.storage is None and last_seq >= 0:
-                    try:
-                        missed = await self._replay_notes_from_redis(session_id, last_seq)
-                        for note in missed:
-                            note_seq = int(note.get("sequence_number", 0))
-                            if note_seq > highest_seq:
-                                highest_seq = note_seq
-                            await client_queue.put({"type": "note_segment", "payload": note})
-                    except Exception as replay_err:
-                        logger.warning("redis replay failed for %s: %s", session_id, replay_err)
+                if last_seq >= 0:
+                    missed = await self._replay_notes(session_id, last_seq)
+                    for note in missed:
+                        note_seq = int(note.get("sequence_number", 0))
+                        if note_seq > highest_seq:
+                            highest_seq = note_seq
+                        await client_queue.put({"type": "note_segment", "payload": note})
 
                 for live_note in pending_live:
                     note_seq = int(live_note.get("sequence_number", 0))
@@ -427,12 +415,8 @@ class GatewayServer:
                             continue
                         if msg_type == "request_replay":
                             req_last_seq = int(message.get("last_sequence_number", 0))
-                            if self.storage is not None and client_queue is not None:
-                                missed = await self.storage.get_general_notes_since(session_id, req_last_seq)
-                                for note in missed:
-                                    await client_queue.put({"type": "note_segment", "payload": note})
-                            elif self.storage is None and client_queue is not None:
-                                missed = await self._replay_notes_from_redis(session_id, req_last_seq)
+                            if client_queue is not None:
+                                missed = await self._replay_notes(session_id, req_last_seq)
                                 for note in missed:
                                     await client_queue.put({"type": "note_segment", "payload": note})
                             await self.send_json(websocket, {"status": "acknowledged"})
@@ -490,6 +474,32 @@ class GatewayServer:
         )
         logger.info("gateway listening on %s:%d", bind_host, bind_port)
 
+    async def _replay_notes(self, session_id: str, after_seq: int = 0) -> list[dict[str, Any]]:
+        notes_by_seq: dict[int, dict[str, Any]] = {}
+        pg_success = False
+        if self.storage is not None:
+            try:
+                pg_notes = await self.storage.get_general_notes_since(session_id, after_seq)
+                for note in pg_notes:
+                    seq = int(note.get("sequence_number", 0))
+                    if seq > after_seq:
+                        notes_by_seq[seq] = note
+                pg_success = True
+            except Exception as replay_err:
+                logger.warning("postgres replay failed for %s: %s; falling back to redis", session_id, replay_err)
+
+        if not pg_success or self.storage is None or not notes_by_seq:
+            try:
+                redis_notes = await self._replay_notes_from_redis(session_id, after_seq)
+                for note in redis_notes:
+                    seq = int(note.get("sequence_number", 0))
+                    if seq > after_seq and seq not in notes_by_seq:
+                        notes_by_seq[seq] = note
+            except Exception as redis_err:
+                logger.warning("redis replay failed for %s: %s", session_id, redis_err)
+
+        return [notes_by_seq[s] for s in sorted(notes_by_seq.keys())]
+
     async def _replay_notes_from_redis(self, session_id: str, after_seq: int = 0) -> list[dict[str, Any]]:
         stream_name = f"lecturelens:{session_id}:stream:notes"
         try:
@@ -545,7 +555,7 @@ async def main() -> None:
     control = AgentControl(session_dir, "gateway")
     control.write_heartbeat("live")
     heartbeat_task = asyncio.create_task(control.heartbeat_loop())
-    redis_bus = create_redis_bus(settings)
+    redis_bus = create_redis_bus(settings, component_name="gateway")
     router = None
     try:
         from lecturelens.router.llm_router import build_router_for_task, load_router_config
@@ -560,8 +570,7 @@ async def main() -> None:
     storage = None
     if settings.postgres_url:
         try:
-            from lecturelens.storage.postgres import PostgresStorage
-            storage = PostgresStorage(settings.postgres_url)
+            storage = create_postgres_storage(settings)
             await storage.init_schema()
         except Exception as error:
             logger.warning("gateway postgres storage initialization failed: %s", error)

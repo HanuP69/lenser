@@ -218,6 +218,26 @@ class TestStudentClient(unittest.IsolatedAsyncioTestCase):
         self.assertIn("graph_theory", names)
         self.assertIn("nodes", names)
 
+    async def test_client_ledger_prevents_duplicate_markdown_and_persists(self) -> None:
+        profile = StudentProfile(student_id="student_ledger_test", preferred_language="English")
+        client = StudentClient("ws://localhost:8765", "lec_ledger", profile, self.output_dir)
+        seg = GeneralNoteSegment(
+            session_id="lec_ledger",
+            sequence_number=1,
+            timestamp_epoch=1700000010.0,
+            start_time="00:00:10",
+            end_time="00:00:20",
+            heading="Ledger Section",
+            content="Ledger content should appear once.",
+            key_points=[],
+            concept_tags=[]
+        )
+        await client._apply_segment(seg)
+        await client._apply_segment(seg)
+        written = client.notes_file.read_text(encoding="utf-8")
+        self.assertEqual(written.count("Ledger content should appear once."), 1)
+        self.assertTrue(client.ledger_file.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

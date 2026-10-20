@@ -96,6 +96,44 @@ async def stream_screen(websocket: Any, settings: Settings, stop_event: asyncio.
         await asyncio.sleep(settings.screenshot_interval_seconds)
 
 
+async def wait_with_stop(coro: Any, stop_event: asyncio.Event, timeout: float = 10.0) -> Any:
+    if stop_event.is_set():
+        raise asyncio.CancelledError("Stopped before starting operation")
+    stop_task = asyncio.create_task(stop_event.wait())
+    op_task = asyncio.create_task(coro)
+    done, pending = await asyncio.wait([op_task, stop_task], timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+    for p in pending:
+        p.cancel()
+    if stop_event.is_set():
+        raise asyncio.CancelledError("Operation interrupted by stop_event")
+    if op_task not in done:
+        raise TimeoutError("Operation timed out")
+    return op_task.result()
+
+
+async def connect_and_auth(
+    server_url: str,
+    max_bytes: int,
+    api_key: Optional[str],
+    session_id: str,
+    stop_event: asyncio.Event
+) -> tuple[Any, Any]:
+    from websockets import connect
+    ctx = connect(server_url, max_size=max_bytes)
+    socket = await wait_with_stop(ctx.__aenter__(), stop_event, timeout=10.0)
+    try:
+        hello_payload = json.dumps({"type": "hello", "api_key": api_key, "session_id": session_id})
+        await wait_with_stop(socket.send(hello_payload), stop_event, timeout=5.0)
+        raw_reply = await wait_with_stop(socket.recv(), stop_event, timeout=10.0)
+        reply = json.loads(raw_reply)
+        if reply.get("status") != "authenticated":
+            raise PermissionError(str(reply))
+        return ctx, socket
+    except Exception:
+        await ctx.__aexit__(None, None, None)
+        raise
+
+
 async def run_remote_client(
     settings: Settings,
     server_url: str,
@@ -107,57 +145,54 @@ async def run_remote_client(
 ) -> None:
     if stop_event is None:
         stop_event = asyncio.Event()
-    from websockets import connect
 
     while not stop_event.is_set():
+        tasks: list[asyncio.Task] = []
+        contexts: list[Any] = []
+        session_stop_event = asyncio.Event()
+
+        async def watch_stop() -> None:
+            await stop_event.wait()
+            session_stop_event.set()
+
+        stop_watcher = asyncio.create_task(watch_stop())
+        tasks.append(stop_watcher)
+
         try:
-            async with connect(server_url, max_size=settings.gateway_max_message_bytes) as audio_socket:
-                await audio_socket.send(json.dumps({"type": "hello", "api_key": api_key, "session_id": session_id}))
-                hello_reply = json.loads(await audio_socket.recv())
-                if hello_reply.get("status") != "authenticated":
-                    raise PermissionError(str(hello_reply))
+            audio_ctx, audio_socket = await connect_and_auth(
+                server_url, settings.gateway_max_message_bytes, api_key, session_id, stop_event
+            )
+            contexts.append(audio_ctx)
 
-                tasks: list[asyncio.Task] = []
-                extra_sockets: list[Any] = []
-                session_stop_event = asyncio.Event()
+            if use_audio:
+                tasks.append(asyncio.create_task(stream_audio(audio_socket, settings, session_stop_event)))
 
-                async def watch_stop() -> None:
-                    await stop_event.wait()
-                    session_stop_event.set()
+            if use_screen:
+                screen_ctx, screen_socket = await connect_and_auth(
+                    server_url, settings.gateway_max_message_bytes, api_key, session_id, stop_event
+                )
+                contexts.append(screen_ctx)
+                tasks.append(asyncio.create_task(stream_screen(screen_socket, settings, session_stop_event)))
 
-                stop_watcher = asyncio.create_task(watch_stop())
-                tasks.append(stop_watcher)
-
-                try:
-                    if use_audio:
-                        tasks.append(asyncio.create_task(stream_audio(audio_socket, settings, session_stop_event)))
-
-                    if use_screen:
-                        extra_context = connect(server_url, max_size=settings.gateway_max_message_bytes)
-                        extra_socket = await extra_context.__aenter__()
-                        extra_sockets.append(extra_context)
-                        await extra_socket.send(json.dumps({"type": "hello", "api_key": api_key, "session_id": session_id}))
-                        reply = json.loads(await extra_socket.recv())
-                        if reply.get("status") != "authenticated":
-                            raise PermissionError(str(reply))
-                        tasks.append(asyncio.create_task(stream_screen(extra_socket, settings, session_stop_event)))
-
-                    if len(tasks) == 1 and tasks[0] is stop_watcher:
-                        return
-                    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                    session_stop_event.set()
-                finally:
-                    session_stop_event.set()
-                    for task in tasks:
-                        if not task.done():
-                            task.cancel()
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    for extra_context in extra_sockets:
-                        await extra_context.__aexit__(None, None, None)
+            if len(tasks) == 1 and tasks[0] is stop_watcher:
+                return
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            session_stop_event.set()
         except PermissionError:
             raise
-        except Exception as conn_error:
+        except (asyncio.CancelledError, Exception) as conn_error:
             if stop_event.is_set():
                 break
             logger.warning("remote client connection lost (%s), reconnecting in 2s...", conn_error)
             await asyncio.sleep(2.0)
+        finally:
+            session_stop_event.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for ctx in contexts:
+                try:
+                    await ctx.__aexit__(None, None, None)
+                except Exception:
+                    pass
