@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from lecturelens.knowledge.student_chat import StudentChatAgent
+from lecturelens.knowledge.student_chat import StudentChatAgent, extract_misconception_payload
 from lecturelens.knowledge.student_graph import StudentKnowledgeGraph
 
 
@@ -15,6 +15,34 @@ class MockChatRouter:
     async def ainvoke(self, messages: list) -> str:
         self.recorded_prompts.append(messages[0].content)
         return self.answer
+
+
+class TestMisconceptionExtraction(unittest.TestCase):
+    def test_payload_with_nested_braces_is_extracted(self) -> None:
+        """The old pattern stopped at the first closing brace, so the
+        annotation was never matched and leaked into the answer."""
+        answer = (
+            'Recursion needs a memo set. [MISCONCEPTION: {"concept": "recursion", '
+            '"error": "thinks f(f(n)) is O(n)", "correction": "use memo set {x}"}]'
+        )
+        payload, clean = extract_misconception_payload(answer)
+        self.assertIsNotNone(payload)
+        self.assertIn('"concept": "recursion"', payload)
+        self.assertIn("Recursion needs a memo set.", clean)
+        self.assertNotIn("MISCONCEPTION", clean)
+
+    def test_answer_without_annotation_is_unchanged(self) -> None:
+        payload, clean = extract_misconception_payload("Just a normal answer [01:23].")
+        self.assertIsNone(payload)
+        self.assertEqual(clean, "Just a normal answer [01:23].")
+
+    def test_trailing_text_after_the_annotation_is_kept(self) -> None:
+        answer = 'Answer with [MISCONCEPTION: {"concept": "a", "error": "b", "correction": "c"}] trailing.'
+        payload, clean = extract_misconception_payload(answer)
+        self.assertIsNotNone(payload)
+        self.assertIn("Answer with", clean)
+        self.assertIn("trailing.", clean)
+        self.assertNotIn("MISCONCEPTION", clean)
 
 
 class TestStudentKnowledgeGraph(unittest.TestCase):

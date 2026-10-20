@@ -11,7 +11,64 @@ from lecturelens.router.messages import HumanMessage, response_to_text
 logger = logging.getLogger(__name__)
 
 TIMESTAMP_PATTERN = re.compile(r"\[\d\d:\d\d(?::\d\d)?\]")
-MISCONCEPTION_TAG_PATTERN = re.compile(r"\[MISCONCEPTION:\s*(\{.*?\})\s*\]", re.DOTALL)
+# The annotation holds a JSON object, which may itself contain braces (for
+# example a correction that mentions a set literal). A non greedy \{.*?\}
+# stopped at the first closing brace, so the tag was never matched: the
+# misconception was not recorded and the raw annotation leaked into the
+# answer shown to the student.
+MISCONCEPTION_TAG_START = re.compile(r"\[MISCONCEPTION:\s*", re.IGNORECASE)
+
+
+def extract_misconception_payload(text: str) -> tuple[Optional[str], str]:
+    """Split a misconception annotation off the answer.
+
+    Returns the JSON payload and the answer with the annotation removed.
+    """
+    match = MISCONCEPTION_TAG_START.search(text)
+    if match is None:
+        return None, text.strip()
+
+    brace_index = text.find("{", match.end())
+    if brace_index < 0:
+        return None, text.strip()
+
+    depth = 0
+    in_string = False
+    escaped = False
+    closing_index = -1
+    for index in range(brace_index, len(text)):
+        character = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                closing_index = index
+                break
+    if closing_index < 0:
+        return None, text.strip()
+
+    payload = text[brace_index:closing_index + 1]
+    # The annotation ends with a closing bracket right after the payload. Only
+    # whitespace may separate them, otherwise a later bracket (for example a
+    # timestamp citation) would be swallowed.
+    head = text[:match.start()]
+    tail = text[closing_index + 1:]
+    stripped_tail = tail.lstrip()
+    if stripped_tail.startswith("]"):
+        tail = tail[len(tail) - len(stripped_tail) + 1:]
+    remainder = (head.rstrip() + " " + tail.lstrip()).strip() if head.strip() and tail.strip() else (head + tail).strip()
+    return payload, remainder
 
 STUDENT_CHAT_SYSTEM_PROMPT = """
 You are an intelligent, empathetic academic tutor helping a student understand their lecture.
@@ -129,33 +186,28 @@ class StudentChatAgent:
         else:
             raw_answer = "No LLM router or Ollama endpoint configured for student chat."
 
-        citations = TIMESTAMP_PATTERN.findall(raw_answer)
+        tag_payload, clean_answer = extract_misconception_payload(raw_answer)
 
-        tag_match = MISCONCEPTION_TAG_PATTERN.search(raw_answer)
-        if tag_match and self.student_graph is not None:
+        tag_payload, clean_answer = extract_misconception_payload(raw_answer)
+        if tag_payload and self.student_graph is not None:
             try:
-                data = json.loads(tag_match.group(1))
-                concept = str(data.get("concept", "general"))
+                data = json.loads(tag_payload)
+                concept = str(data.get("concept", "")).strip()
                 error = str(data.get("error", ""))
                 correction = str(data.get("correction", ""))
-                self.student_graph.record_misconception(concept, error, correction)
-                self.student_graph.record_evidence(
-                    concept_name=concept,
-                    lecture_id="live_session",
-                    timestamp_epoch=time.time(),
-                    evidence_type="student_chat_misconception",
-                    excerpt=f"Q: {question} | Error: {error}"
-                )
+                if concept:
+                    self.student_graph.record_misconception(concept, error, correction)
+                    self.student_graph.record_evidence(
+                        concept_name=concept,
+                        lecture_id="live_session",
+                        timestamp_epoch=time.time(),
+                        evidence_type="student_chat_misconception",
+                        excerpt=f"Q: {question} | Error: {error}"
+                    )
             except Exception as parse_error:
                 logger.warning("could not parse misconception tag: %s", parse_error)
-        elif self.student_graph is not None:
-            self.student_graph.record_evidence(
-                concept_name="general",
-                lecture_id="live_session",
-                timestamp_epoch=time.time(),
-                evidence_type="student_chat_inquiry",
-                excerpt=question[:200]
-            )
+        elif tag_payload and self.student_graph is not None:
+            logger.warning("misconception annotation without a concept name was ignored")
 
-        clean_answer = MISCONCEPTION_TAG_PATTERN.sub("", raw_answer).strip()
+        citations = TIMESTAMP_PATTERN.findall(clean_answer)
         return clean_answer, citations

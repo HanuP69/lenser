@@ -197,12 +197,30 @@ class TestRouter(RouterTestBase):
     async def test_router_status_reports_state(self) -> None:
         if not self.redis_available:
             self.skipTest("Redis not available")
-        breaker = RedisCircuitBreaker(self.client, "local", 1, 30)
+        # The breaker is scoped per task and provider, so a vision failure
+        # does not disable the structuring route.
+        breaker = RedisCircuitBreaker(self.client, "structuring:local", 1, 30)
         await breaker.record_failure()
         rows = await get_router_status(self.client, CONFIG, "structuring", "local")
         by_name = index_by(rows, "provider")
         self.assertEqual(by_name["local"]["state"], "breaker tripped")
         self.assertEqual(by_name["cloud_a"]["state"], "disabled")
+
+    async def test_breaker_is_scoped_per_task(self) -> None:
+        if not self.redis_available:
+            self.skipTest("Redis not available")
+        config = {
+            "providers": {"local": CONFIG["providers"]["local"]},
+            "task_routing": {"structuring": ["local"], "screen_ocr": ["local"]}
+        }
+        breaker = RedisCircuitBreaker(self.client, "screen_ocr:local", 1, 30)
+        await breaker.record_failure()
+        structuring_rows = await get_router_status(self.client, config, "structuring", "local")
+        by_name = index_by(structuring_rows, "provider")
+        self.assertEqual(by_name["local"]["state"], "OK")
+        screen_rows = await get_router_status(self.client, config, "screen_ocr", "local")
+        by_screen = index_by(screen_rows, "provider")
+        self.assertEqual(by_screen["local"]["state"], "breaker tripped")
 
     async def test_guard_store_outage_fails_open(self) -> None:
         model = FakeModel("t_provider")

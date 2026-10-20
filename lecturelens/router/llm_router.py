@@ -24,6 +24,17 @@ class ProviderUnavailableError(RuntimeError):
 
 
 def is_provider_failure(error: BaseException) -> bool:
+    status_code = getattr(error, "status_code", None)
+    if isinstance(status_code, int):
+        # An explicit HTTP status is authoritative. 400, 404, 413 and 422
+        # are client side configuration errors and must not trip the circuit
+        # breaker. The keyword scan used to run first, so a 404 with the body
+        # "model 'x' not found" was classified as a provider failure and
+        # disabled the provider.
+        if status_code in NON_PROVIDER_STATUS_CODES:
+            return False
+        return True
+
     err_msg = str(error).lower()
     for signature in (
         "not found", "model", "unsupported", "image", "vision",
@@ -34,11 +45,6 @@ def is_provider_failure(error: BaseException) -> bool:
         if signature in err_msg:
             return True
 
-    status_code = getattr(error, "status_code", None)
-    if isinstance(status_code, int):
-        if status_code in NON_PROVIDER_STATUS_CODES:
-            return False
-        return True
     if isinstance(error, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)):
         return True
     if isinstance(error, NON_PROVIDER_ERROR_TYPES):
@@ -162,7 +168,10 @@ class RotatingChatModel(Runnable):
         self.keys: list[str] = keys
         self.current_index: int = 0
         self.key_count: int = len(models)
-        self.lock: asyncio.Lock = asyncio.Lock()
+        # One lock protects the rotation counter. It used to be guarded by a
+        # threading.Lock on the sync path and an asyncio.Lock on the async
+        # path, so a concurrent sync and async call could read the same index
+        # and use one key twice while skipping another.
         self.sync_lock: threading.Lock = threading.Lock()
 
     def invoke(self, input: Any, config: Optional[dict[str, Any]] = None, **kwargs: Any) -> Any:
@@ -191,7 +200,9 @@ class RotatingChatModel(Runnable):
             raise last_error
 
     async def ainvoke(self, input: Any, config: Optional[dict[str, Any]] = None, **kwargs: Any) -> Any:
-        async with self.lock:
+        # The threading lock is held for a very short, non blocking critical
+        # section, so it is safe to use from the event loop.
+        with self.sync_lock:
             idx = self.current_index % len(self.models)
             self.current_index = (self.current_index + 1) % len(self.models)
 
@@ -428,7 +439,10 @@ def build_router_for_task(
         )
         circuit_breaker = RedisCircuitBreaker(
             redis_client=redis_client,
-            provider_name=provider_name,
+            # The breaker is scoped to the task as well as the provider. It
+            # used to be keyed by the provider alone, so a vision failure on a
+            # shared provider also disabled the structuring and QA routes.
+            provider_name=f"{task_type}:{provider_name}",
             failure_threshold=breaker_info.get("failure_threshold", 3),
             cooldown_seconds=breaker_info.get("cooldown_seconds", 30)
         )
@@ -493,7 +507,7 @@ async def get_router_status(
             effective_max_rpm, rate_limit_info.get("window_seconds", 60)
         )
         breaker = RedisCircuitBreaker(
-            redis_client, provider_name,
+            redis_client, f"{task_type}:{provider_name}",
             breaker_info.get("failure_threshold", 3), breaker_info.get("cooldown_seconds", 30)
         )
         try:

@@ -406,7 +406,19 @@ class TestGatewayMessages(GatewayTestBase):
     async def test_subscribers_are_read_only_and_cannot_push_capture_events(self) -> None:
         class DummyStorage:
             async def get_general_notes_since(self, session_id: str, after_seq: int) -> list[dict]:
-                return []
+                # The session has to exist, otherwise the subscriber is
+                # rejected before the read-only check is reached.
+                return [{
+                    "session_id": session_id,
+                    "sequence_number": 1,
+                    "timestamp_epoch": 100.0,
+                    "start_time": "00:01:00",
+                    "end_time": "00:02:00",
+                    "heading": "Existing note",
+                    "content": "Existing content",
+                    "key_points": [],
+                    "concept_tags": []
+                }]
 
         self.gateway.storage = DummyStorage()
         sub_hello = json.dumps({
@@ -436,6 +448,26 @@ class TestGatewayMessages(GatewayTestBase):
         self.assertEqual(socket.sent[0]["status"], "unauthorized")
         self.assertEqual(socket.sent[0]["error"], "session does not exist")
         self.assertNotIn("nonexistent_room_999", self.gateway.sessions)
+
+    async def test_subscriber_is_not_authorized_for_an_unknown_session(self) -> None:
+        """A storage without session_exists used to authorise every session
+        id, so any authenticated client could read any session's notes."""
+        class EmptyStorage:
+            async def get_general_notes_since(self, session_id: str, after_seq: int) -> list[dict]:
+                return []
+
+        self.gateway.storage = EmptyStorage()
+        sub_hello = json.dumps({
+            "type": "hello",
+            "api_key": "secret",
+            "session_id": "room_without_notes",
+            "role": "subscriber"
+        })
+        socket = FakeWebSocket([sub_hello])
+        await self.gateway.handle_connection(socket)
+
+        self.assertEqual(socket.sent[0]["status"], "unauthorized")
+        self.assertEqual(socket.sent[0]["error"], "session does not exist")
 
     def test_two_gateway_fanout_distinct_groups(self) -> None:
         gw1 = GatewayServer(self.settings, self.bus, instance_id="gw_alpha")

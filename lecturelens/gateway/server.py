@@ -237,24 +237,34 @@ class GatewayServer:
     async def run_notes_fanout(self, session_id: str) -> None:
         stream_name = f"lecturelens:{session_id}:stream:notes"
         group_name = f"group:gateway_{session_id}_{self.instance_id}"
-        await self.redis_bus.ensure_consumer_group(stream_name, group_name)
+        # The consumer group has to start at the end of the stream. The
+        # shared helper creates the group at offset 0, which made the
+        # fanout replay the entire note history as if it were live and
+        # overflowed the bounded subscriber queue.
+        await self.redis_bus.ensure_consumer_group(stream_name, group_name, start_id="$")
 
         async def handler(data: dict[str, Any]) -> None:
             await self.broadcast_note_segment(session_id, data)
 
-        try:
-            await self.redis_bus.consume(
-                stream_name=stream_name,
-                group_name=group_name,
-                consumer_name=f"gateway_{self.instance_id}_{session_id}",
-                handler=handler,
-                batch_size=5,
-                block_ms=500
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            logger.error("fanout loop error for %s: %s", session_id, error)
+        while True:
+            try:
+                await self.redis_bus.consume(
+                    stream_name=stream_name,
+                    group_name=group_name,
+                    consumer_name=f"gateway_{self.instance_id}_{session_id}",
+                    handler=handler,
+                    batch_size=5,
+                    block_ms=500
+                )
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                # A dead fanout task silently stopped the live note delivery
+                # for every connected subscriber, and nothing ever restarted
+                # it.
+                logger.error("fanout loop error for %s: %s", session_id, error)
+                await asyncio.sleep(1.0)
 
     def get_or_create_session(self, session_id: str) -> SessionRuntime:
         existing = self.sessions.get(session_id)
@@ -337,22 +347,32 @@ class GatewayServer:
         runtime.last_active = time.monotonic()
         capture_id = message.get("capture_id")
         is_tracked_capture = isinstance(capture_id, str) and bool(capture_id)
+        in_flight_event: Optional[asyncio.Event] = None
         if is_tracked_capture:
             if capture_id in self.accepted_capture_ids:
                 return {"status": "acknowledged", "duplicate": True}
             while capture_id in self.in_flight_captures:
-                waiter = self.in_flight_captures[capture_id]
+                waiter = self.in_flight_captures.get(capture_id)
+                if waiter is None:
+                    break
                 try:
                     await asyncio.wait_for(waiter.wait(), timeout=15.0)
                 except Exception:
-                    break
+                    # The barrier timed out. The capture is still being
+                    # processed by the other holder, so the wait is retried
+                    # instead of falling open and processing the same capture
+                    # twice. The client's ack timeout is shorter than this
+                    # barrier, so a timeout here means the server is slow,
+                    # not that the capture was lost.
+                    if capture_id in self.accepted_capture_ids:
+                        return {"status": "acknowledged", "duplicate": True}
+                    continue
                 if capture_id in self.accepted_capture_ids:
                     return {"status": "acknowledged", "duplicate": True}
             if capture_id in self.accepted_capture_ids:
                 return {"status": "acknowledged", "duplicate": True}
             in_flight_event = asyncio.Event()
             self.in_flight_captures[capture_id] = in_flight_event
-
         try:
             capture_epoch = resolve_capture_epoch(message, runtime.clock)
             message_type = message.get("type")
@@ -394,9 +414,13 @@ class GatewayServer:
                 return {"status": "acknowledged"}
             raise ValueError("unknown message type")
         finally:
-            if is_tracked_capture and capture_id in self.in_flight_captures:
-                event_obj = self.in_flight_captures.pop(capture_id)
-                event_obj.set()
+            if is_tracked_capture and in_flight_event is not None:
+                # Only release the marker that this handler installed. The
+                # finally block used to pop whatever event happened to be in
+                # the dictionary, which released another holder's waiters.
+                if self.in_flight_captures.get(capture_id) is in_flight_event:
+                    self.in_flight_captures.pop(capture_id, None)
+                    in_flight_event.set()
 
     async def check_session_exists(self, session_id: str) -> bool:
         if session_id in self.sessions:
@@ -412,7 +436,16 @@ class GatewayServer:
                 except Exception:
                     pass
             elif hasattr(self.storage, "get_general_notes_since"):
-                return True
+                # The fallback has to verify the session instead of
+                # authorising every session id: returning True unconditionally
+                # let any authenticated client attach to any session.
+                try:
+                    notes = await self.storage.get_general_notes_since(session_id, 0)
+                    return len(notes) > 0
+                except Exception:
+                    # The storage cannot answer, so the session cannot be
+                    # ruled out either.
+                    return True
         return False
 
     async def _subscriber_writer(self, websocket: Any, queue: asyncio.Queue) -> None:
@@ -498,6 +531,14 @@ class GatewayServer:
                     if note_seq > highest_seq:
                         highest_seq = note_seq
                         await client_queue.put({"type": "note_segment", "payload": live_note})
+
+                # The high water mark used to be computed and thrown away, so
+                # a client could never tell a temporary gap from a permanent
+                # one.
+                await client_queue.put({
+                    "type": "session_state",
+                    "highest_sequence_number": highest_seq
+                })
 
                 if session_id in self.catching_up and websocket in self.catching_up[session_id]:
                     del self.catching_up[session_id][websocket]
@@ -616,10 +657,19 @@ class GatewayServer:
 
     async def _replay_notes_from_redis(self, session_id: str, after_seq: int = 0) -> list[dict[str, Any]]:
         stream_name = f"lecturelens:{session_id}:stream:notes"
+        scan_limit = int(getattr(self.settings, "gateway_replay_scan_limit", 5000))
         try:
-            raw_entries = await self.redis_bus.client.xrange(stream_name, "-", "+")
+            # The scan is bounded: the notes stream can hold up to
+            # stream_max_length entries and reading all of them on every
+            # replay was a client triggerable memory spike that stalled the
+            # event loop. The newest entries are scanned first because the
+            # notes are appended in sequence order.
+            raw_entries = await self.redis_bus.client.xrevrange(
+                stream_name, "+", "-", count=scan_limit
+            )
+            raw_entries = list(reversed(raw_entries))
         except Exception as err:
-            logger.warning("xrange on %s failed: %s", stream_name, err)
+            logger.warning("xrevrange on %s failed: %s", stream_name, err)
             return []
         by_seq: dict[int, dict[str, Any]] = {}
         for _, data in raw_entries:
@@ -688,6 +738,14 @@ async def main() -> None:
             await storage.init_schema()
         except Exception as error:
             logger.warning("gateway postgres storage initialization failed: %s", error)
+            if storage is not None:
+                # The connection was opened by init_schema, so it has to be
+                # closed again. Dropping the reference leaked the socket for
+                # the lifetime of the gateway process.
+                try:
+                    await storage.close()
+                except Exception:
+                    pass
             storage = None
 
     gateway = GatewayServer(settings, redis_bus, router, storage=storage)

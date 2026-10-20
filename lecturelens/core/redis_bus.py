@@ -487,12 +487,24 @@ class RedisBus:
                     raise RuntimeError(f"Publish to redis failed ({error}) and outbox persistence failed: {save_err}") from save_err
             return None
 
-    async def ensure_consumer_group(self, stream_name: str, group_name: str) -> None:
+    async def ensure_consumer_group(
+        self,
+        stream_name: str,
+        group_name: str,
+        start_id: str = "0"
+    ) -> None:
+        """Create the consumer group if it does not exist yet.
+
+        ``start_id`` decides where the group starts reading. "0" replays the
+        whole stream (used by the sync agent and the persister, which must not
+        miss anything); "$" starts at the end of the stream (used by the
+        gateway fanout, which only wants live notes).
+        """
         try:
             await self.client.xgroup_create(
                 name=stream_name,
                 groupname=group_name,
-                id="0",
+                id=start_id,
                 mkstream=True
             )
         except redis.ResponseError as error:

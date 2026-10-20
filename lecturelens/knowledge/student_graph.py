@@ -4,7 +4,8 @@ import re
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Optional
+from contextlib import contextmanager
+from typing import Any, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +68,23 @@ class StudentKnowledgeGraph:
         connection.row_factory = sqlite3.Row
         return connection
 
+    @contextmanager
+    def connection(self) -> Iterator[sqlite3.Connection]:
+        """Open a connection and always close it.
+
+        ``with sqlite3.connect(...)`` is a transaction context manager: it
+        commits or rolls back but does not close the connection, so every
+        call leaked a file handle.
+        """
+        conn = self.get_connection()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
     def init_schema(self) -> None:
-        with self.get_connection() as conn:
+        with self.connection() as conn:
             conn.executescript(CREATE_STUDENT_GRAPH_SCHEMA)
 
     def normalize(self, name: str) -> str:
@@ -83,13 +99,16 @@ class StudentKnowledgeGraph:
             review_count = review_count + 1,
             last_reviewed_epoch = excluded.last_reviewed_epoch;
         """
-        with self.get_connection() as conn:
+        with self.connection() as conn:
             conn.execute(query, (norm_name, mastery_level, time.time()))
 
     def update_mastery(self, concept_name: str, delta: float) -> float:
         norm_name = self.normalize(concept_name)
-        with self.get_connection() as conn:
-            cursor = conn.execute("SELECT mastery_level FROM concepts WHERE concept_name = ?", (norm_name,))
+        with self.connection() as conn:
+            cursor = conn.execute(
+                "SELECT mastery_level, last_reviewed_epoch FROM concepts WHERE concept_name = ?",
+                (norm_name,)
+            )
             row = cursor.fetchone()
             if row is None:
                 current = 0.5
@@ -101,6 +120,13 @@ class StudentKnowledgeGraph:
                 conn.execute(insert_query, (norm_name, new_level, time.time()))
                 return new_level
             current = float(row["mastery_level"])
+            last_reviewed = row["last_reviewed_epoch"]
+            if last_reviewed is not None:
+                # The graph decays mastery towards the baseline over time and
+                # the summary reports the decayed value. The delta used to be
+                # applied to the stale stored value, which over-credited the
+                # student relative to the model the interface shows.
+                current = compute_decayed_mastery(current, float(last_reviewed))
             new_level = max(0.0, min(1.0, current + delta))
             conn.execute(
                 "UPDATE concepts SET mastery_level = ?, review_count = review_count + 1, last_reviewed_epoch = ? WHERE concept_name = ?",
@@ -122,7 +148,7 @@ class StudentKnowledgeGraph:
         INSERT INTO misconceptions (concept_name, error_pattern, correction, detected_at_epoch, confidence)
         VALUES (?, ?, ?, ?, ?);
         """
-        with self.get_connection() as conn:
+        with self.connection() as conn:
             conn.execute(query, (norm_name, error_pattern, correction, epoch, confidence))
         self.update_mastery(norm_name, -0.2)
 
@@ -140,11 +166,11 @@ class StudentKnowledgeGraph:
         INSERT INTO evidence (concept_name, lecture_id, timestamp_epoch, evidence_type, excerpt)
         VALUES (?, ?, ?, ?, ?);
         """
-        with self.get_connection() as conn:
+        with self.connection() as conn:
             conn.execute(query, (norm_name, lecture_id, timestamp_epoch, evidence_type, excerpt))
 
     def get_known_misconceptions(self, concept_name: Optional[str] = None) -> list[dict[str, Any]]:
-        with self.get_connection() as conn:
+        with self.connection() as conn:
             if concept_name is not None:
                 query = "SELECT * FROM misconceptions WHERE concept_name = ? ORDER BY detected_at_epoch DESC;"
                 cursor = conn.execute(query, (self.normalize(concept_name),))
@@ -154,7 +180,7 @@ class StudentKnowledgeGraph:
             return [dict(row) for row in cursor.fetchall()]
 
     def get_student_summary(self) -> dict[str, Any]:
-        with self.get_connection() as conn:
+        with self.connection() as conn:
             concepts_cur = conn.execute("SELECT * FROM concepts ORDER BY mastery_level ASC;")
             concepts = []
             for row in concepts_cur.fetchall():

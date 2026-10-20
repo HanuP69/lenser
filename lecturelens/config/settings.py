@@ -86,6 +86,7 @@ class Settings(BaseSettings):
     gateway_max_sessions: int = Field(default=8)
     gateway_capture_id_capacity: int = Field(default=5000)
     gateway_capture_id_ttl_seconds: float = Field(default=600.0)
+    gateway_replay_scan_limit: int = Field(default=5000)
 
     thread_pool_max_workers: int = Field(default=4)
     process_pool_max_workers: int = Field(default=2)
