@@ -30,14 +30,14 @@ class ReplayEngine:
             return []
         entries: list[TimelineEntry] = []
         with open(self.timeline_path, "r", encoding="utf-8") as file_handle:
-            for line in file_handle:
+            for idx, line in enumerate(file_handle):
                 stripped = line.strip()
                 if not stripped:
                     continue
                 try:
                     payload = json.loads(stripped)
                     if hasattr(TimelineEntry, "from_jsonl_dict"):
-                        entry = TimelineEntry.from_jsonl_dict(payload)
+                        entry = TimelineEntry.from_jsonl_dict(payload, record_index=idx)
                     else:
                         entry = TimelineEntry(**payload)
                     entries.append(entry)

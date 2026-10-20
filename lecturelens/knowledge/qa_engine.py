@@ -212,6 +212,32 @@ class QAEngine:
                 except Exception as del_err:
                     logger.debug("deleting stale postgres embeddings failed: %s", del_err)
 
+        if self.storage is not None:
+            if hasattr(self.storage, "delete_embeddings_not_in"):
+                try:
+                    await self.storage.delete_embeddings_not_in(self.session_dir.name, list(wanted_ids))
+                except Exception as sync_del_err:
+                    logger.debug("reconciling postgres embeddings against manifest failed: %s", sync_del_err)
+            elif hasattr(self.storage, "get_connection") and hasattr(self.storage, "_lock"):
+                try:
+                    async with self.storage._lock:
+                        conn = await self.storage.get_connection()
+                        async with conn.cursor() as cur:
+                            await cur.execute(
+                                "SELECT source_id FROM embeddings WHERE session_id = %s;",
+                                (self.session_dir.name,)
+                            )
+                            pg_rows = await cur.fetchall()
+                            pg_ids = {str(r["source_id"]) for r in pg_rows if r and "source_id" in r}
+                            stale_pg = list(pg_ids - wanted_ids)
+                            if stale_pg:
+                                await cur.execute(
+                                    "DELETE FROM embeddings WHERE session_id = %s AND source_id = ANY(%s);",
+                                    (self.session_dir.name, stale_pg)
+                                )
+                except Exception as sync_del_err:
+                    logger.debug("reconciling postgres embeddings against manifest failed: %s", sync_del_err)
+
         if self.storage is not None and hasattr(self.storage, "delete_session_embeddings"):
             try:
                 await self.storage.delete_session_embeddings(self.session_dir.name, exclude_model=self.embedding_model)
@@ -254,6 +280,13 @@ class QAEngine:
             for chunk in new_chunks:
                 texts.append(chunk.text)
             vectors = await self.generate_embeddings(texts)
+            if len(vectors) > 0 and len(vectors[0]) > 0:
+                actual_dim = len(vectors[0])
+                if self.storage is not None and hasattr(self.storage, "init_schema"):
+                    try:
+                        await self.storage.init_schema(vector_dimensions=actual_dim)
+                    except Exception as pg_init_err:
+                        logger.debug("re-initializing postgres schema with vector dimension %d failed: %s", actual_dim, pg_init_err)
             if self.storage is not None and hasattr(self.storage, "insert_embedding"):
                 for chunk, vector in zip(new_chunks, vectors):
                     try:

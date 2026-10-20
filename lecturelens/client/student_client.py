@@ -166,7 +166,6 @@ class StudentClient:
             if not rows:
                 is_legacy_upgrade = (
                     self.state_file.exists()
-                    and self.notes_file.exists()
                     and getattr(self, "_ledger_was_new", False)
                 )
                 if is_legacy_upgrade:
@@ -177,8 +176,12 @@ class StudentClient:
                     except Exception:
                         pass
                     if legacy_seq > 0:
-                        legacy_text = self.notes_file.read_text(encoding="utf-8")
-                        if legacy_text.strip():
+                        has_usable_notes = (
+                            self.notes_file.exists()
+                            and bool(self.notes_file.read_text(encoding="utf-8").strip())
+                        )
+                        if has_usable_notes:
+                            legacy_text = self.notes_file.read_text(encoding="utf-8")
                             conn = sqlite3.connect(str(self.ledger_file), timeout=5.0)
                             conn.execute(
                                 "INSERT OR IGNORE INTO applied_segments (sequence_number, session_id, heading, content, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -187,6 +190,16 @@ class StudentClient:
                             conn.commit()
                             conn.close()
                             conn = None
+                            self.pending_reconciliation = False
+                            return True
+                        else:
+                            try:
+                                with open(self.state_file, "w", encoding="utf-8") as handle:
+                                    json.dump({"last_sequence_number": 0}, handle)
+                            except Exception:
+                                pass
+                            self.pending_reconciliation = True
+                            return False
                     self.pending_reconciliation = False
                     return True
                 elif self.notes_file.exists():
@@ -288,6 +301,15 @@ class StudentClient:
             if ledger_max is not None:
                 return min(persisted, ledger_max)
             return 0
+
+        if getattr(self, "_ledger_was_new", False) and (ledger_max is None or ledger_max == 0):
+            has_usable_notes = (
+                self.notes_file.exists()
+                and bool(self.notes_file.read_text(encoding="utf-8").strip())
+            )
+            if not has_usable_notes and persisted > 0:
+                self.pending_reconciliation = True
+                return 0
 
         if ledger_max is not None:
             return max(persisted, ledger_max)

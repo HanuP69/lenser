@@ -280,10 +280,18 @@ class TimelineEntry(BaseModel):
         return self.model_dump()
 
     @classmethod
-    def from_jsonl_dict(cls, data: dict) -> "TimelineEntry":
+    def from_jsonl_dict(cls, data: dict, record_index: Optional[int] = None) -> "TimelineEntry":
         if not data.get("event_id"):
+            rec_id = data.get("record_id")
+            if rec_id is None:
+                rec_id = data.get("line_number")
+            if rec_id is None:
+                rec_id = record_index
+            rec_part = f":{rec_id}" if rec_id is not None else ""
+            elapsed_part = f":{data.get('elapsed_seconds')}" if data.get('elapsed_seconds') is not None else ""
+            meta_str = json.dumps(data.get("metadata", {}), sort_keys=True)
             content_hash = hashlib.sha256(
-                f"{data.get('session_id')}:{data.get('timestamp_epoch')}:{data.get('source_type')}:{data.get('content')}".encode()
+                f"{data.get('session_id')}:{data.get('timestamp_epoch')}:{data.get('source_type')}:{data.get('content')}{elapsed_part}{rec_part}:{meta_str}".encode()
             ).hexdigest()[:32]
             data["event_id"] = f"legacy_{content_hash}"
         return cls(**data)

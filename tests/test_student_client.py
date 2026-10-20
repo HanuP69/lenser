@@ -479,6 +479,17 @@ class TestStudentClient(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seq, 0)
         self.assertTrue(client.pending_reconciliation)
 
+    async def test_legacy_upgrade_with_missing_notes_resets_cursor(self) -> None:
+        profile = StudentProfile(student_id="student_missing_notes", preferred_language="English")
+        state_file = self.output_dir / "lec_missing_student_missing_notes_state.json"
+        state_file.write_text(json.dumps({"last_sequence_number": 100}), encoding="utf-8")
+
+        client = StudentClient("ws://localhost:8765", "lec_missing", profile, self.output_dir)
+        self.assertEqual(client.last_sequence_number, 0)
+        self.assertTrue(client.pending_reconciliation)
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertEqual(data.get("last_sequence_number"), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

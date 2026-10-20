@@ -142,6 +142,30 @@ class TestReplayEngine(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(target_run1[0].event_id, target_run2[0].event_id)
 
+    async def test_repeated_legacy_records_with_identical_content_receive_distinct_ids(self) -> None:
+        duplicate_path = Path(self.temp_dir.name) / "duplicate_legacy.jsonl"
+        legacy_data = {
+            "session_id": "legacy_sess",
+            "timestamp_epoch": 1700000000.0,
+            "source_type": "transcript",
+            "content": "identical content"
+        }
+        duplicate_path.write_text(json.dumps(legacy_data) + "\n" + json.dumps(legacy_data) + "\n", encoding="utf-8")
+
+        engine1 = ReplayEngine(duplicate_path, speed=0.0)
+        run1: list[TimelineEntry] = []
+        await engine1.replay(on_entry=run1.append, publish_to_timeline_stream=False)
+
+        self.assertEqual(len(run1), 2)
+        self.assertNotEqual(run1[0].event_id, run1[1].event_id)
+
+        engine2 = ReplayEngine(duplicate_path, speed=0.0)
+        run2: list[TimelineEntry] = []
+        await engine2.replay(on_entry=run2.append, publish_to_timeline_stream=False)
+
+        self.assertEqual(run1[0].event_id, run2[0].event_id)
+        self.assertEqual(run1[1].event_id, run2[1].event_id)
+
 
 if __name__ == "__main__":
     unittest.main()

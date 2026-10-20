@@ -168,10 +168,37 @@ class PostgresStorage:
         try:
             async with self.transaction() as conn:
                 async with conn.cursor() as cur:
-                    sql = f"ALTER TABLE embeddings ADD COLUMN IF NOT EXISTS embedding vector({vector_dimensions});"
-                    await cur.execute(sql)
+                    await cur.execute("""
+                        SELECT atttypmod FROM pg_attribute
+                        WHERE attrelid = 'embeddings'::regclass AND attname = 'embedding';
+                    """)
+                    row = await cur.fetchone()
+                    if row and row.get("atttypmod") is not None and row["atttypmod"] > 0:
+                        current_dim = row["atttypmod"]
+                        if current_dim != vector_dimensions:
+                            logger.warning(
+                                "vector dimension changed from %d to %d; altering column",
+                                current_dim, vector_dimensions
+                            )
+                            await cur.execute(f"ALTER TABLE embeddings ALTER COLUMN embedding TYPE vector({vector_dimensions});")
+                    else:
+                        sql = f"ALTER TABLE embeddings ADD COLUMN IF NOT EXISTS embedding vector({vector_dimensions});"
+                        await cur.execute(sql)
         except Exception as vector_col_error:
             logger.debug("vector column skipped: %s", vector_col_error)
+
+    async def delete_embeddings_not_in(self, session_id: str, valid_source_ids: list[str]) -> int:
+        if not self.postgres_available:
+            return 0
+        if not valid_source_ids:
+            return 0
+        async with self.transaction() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM embeddings WHERE session_id = %s AND NOT (source_id = ANY(%s));",
+                    (session_id, valid_source_ids)
+                )
+                return cur.rowcount
 
     async def insert_timeline_event(self, entry: TimelineEntry | dict[str, Any]) -> bool:
         if isinstance(entry, TimelineEntry):

@@ -82,6 +82,8 @@ class Settings(BaseSettings):
     gateway_max_message_bytes: int = Field(default=33554432)
     gateway_messages_per_second: float = Field(default=20.0)
     gateway_max_sessions: int = Field(default=8)
+    gateway_capture_id_capacity: int = Field(default=5000)
+    gateway_capture_id_ttl_seconds: float = Field(default=600.0)
 
     thread_pool_max_workers: int = Field(default=4)
     process_pool_max_workers: int = Field(default=2)

@@ -127,8 +127,23 @@ class GatewayServer:
         self.subscriber_writers: dict[str, dict[Any, asyncio.Task]] = {}
         self.fanout_tasks: dict[str, asyncio.Task] = {}
         self.server: Any = None
-        self.recent_capture_ids: set[str] = set()
-        self._recent_capture_queue: list[tuple[float, str]] = []
+        self.accepted_capture_ids: set[str] = set()
+        self.in_flight_captures: dict[str, asyncio.Event] = {}
+        self._accepted_capture_queue: list[tuple[float, str]] = []
+
+    def _mark_capture_accepted(self, capture_id: str) -> None:
+        self.accepted_capture_ids.add(capture_id)
+        self._accepted_capture_queue.append((time.monotonic(), capture_id))
+        capacity = getattr(self.settings, "gateway_capture_id_capacity", 5000)
+        ttl = getattr(self.settings, "gateway_capture_id_ttl_seconds", 600.0)
+        if len(self._accepted_capture_queue) > capacity:
+            cutoff = time.monotonic() - ttl
+            while self._accepted_capture_queue and self._accepted_capture_queue[0][0] < cutoff:
+                _, old_id = self._accepted_capture_queue.pop(0)
+                self.accepted_capture_ids.discard(old_id)
+            if len(self._accepted_capture_queue) > capacity:
+                _, old_id = self._accepted_capture_queue.pop(0)
+                self.accepted_capture_ids.discard(old_id)
 
     async def broadcast_note_segment(self, session_id: str, note_data: dict[str, Any]) -> None:
         if session_id in self.catching_up:
@@ -256,53 +271,67 @@ class GatewayServer:
     async def handle_message(self, runtime: SessionRuntime, message: dict[str, Any]) -> dict[str, Any]:
         runtime.last_active = time.monotonic()
         capture_id = message.get("capture_id")
-        if isinstance(capture_id, str) and capture_id:
-            if capture_id in self.recent_capture_ids:
+        is_tracked_capture = isinstance(capture_id, str) and bool(capture_id)
+        if is_tracked_capture:
+            if capture_id in self.accepted_capture_ids:
                 return {"status": "acknowledged", "duplicate": True}
-            self.recent_capture_ids.add(capture_id)
-            self._recent_capture_queue.append((time.monotonic(), capture_id))
-            if len(self._recent_capture_queue) > 5000:
-                cutoff = time.monotonic() - 600.0
-                while self._recent_capture_queue and self._recent_capture_queue[0][0] < cutoff:
-                    _, old_id = self._recent_capture_queue.pop(0)
-                    self.recent_capture_ids.discard(old_id)
-                if len(self._recent_capture_queue) > 5000:
-                    _, old_id = self._recent_capture_queue.pop(0)
-                    self.recent_capture_ids.discard(old_id)
+            while capture_id in self.in_flight_captures:
+                waiter = self.in_flight_captures[capture_id]
+                try:
+                    await asyncio.wait_for(waiter.wait(), timeout=15.0)
+                except Exception:
+                    break
+                if capture_id in self.accepted_capture_ids:
+                    return {"status": "acknowledged", "duplicate": True}
+            if capture_id in self.accepted_capture_ids:
+                return {"status": "acknowledged", "duplicate": True}
+            in_flight_event = asyncio.Event()
+            self.in_flight_captures[capture_id] = in_flight_event
 
-        capture_epoch = resolve_capture_epoch(message, runtime.clock)
-        message_type = message.get("type")
-        if message_type == "audio":
-            wav_bytes = decode_base64_field(message, "wav_b64")
-            await runtime.audio_agent.ingest_wav_bytes(wav_bytes, capture_epoch)
-            return {"status": "acknowledged"}
-        if message_type == "screen":
-            png_bytes = decode_base64_field(message, "png_b64")
-            sig = inspect.signature(runtime.screen_agent.ingest_png_bytes)
-            if "enforce_gate" in sig.parameters:
-                await runtime.screen_agent.ingest_png_bytes(png_bytes, capture_epoch, enforce_gate=True)
-            else:
-                await runtime.screen_agent.ingest_png_bytes(png_bytes, capture_epoch)
-            return {"status": "acknowledged"}
-        if message_type == "event":
-            source_type = message.get("source_type")
-            if source_type not in EVENT_SOURCE_TYPES:
-                raise ValueError("unknown source_type")
-            payload = message.get("payload")
-            if not isinstance(payload, dict):
-                raise ValueError("payload must be an object")
-            string_payload: dict[str, str] = {}
-            for key, value in payload.items():
-                if isinstance(value, (dict, list)):
-                    string_payload[str(key)] = json.dumps(value)
+        try:
+            capture_epoch = resolve_capture_epoch(message, runtime.clock)
+            message_type = message.get("type")
+            if message_type == "audio":
+                wav_bytes = decode_base64_field(message, "wav_b64")
+                await runtime.audio_agent.ingest_wav_bytes(wav_bytes, capture_epoch)
+                if is_tracked_capture:
+                    self._mark_capture_accepted(capture_id)
+                return {"status": "acknowledged"}
+            if message_type == "screen":
+                png_bytes = decode_base64_field(message, "png_b64")
+                sig = inspect.signature(runtime.screen_agent.ingest_png_bytes)
+                if "enforce_gate" in sig.parameters:
+                    await runtime.screen_agent.ingest_png_bytes(png_bytes, capture_epoch, enforce_gate=True)
                 else:
-                    string_payload[str(key)] = "" if value is None else str(value)
-            string_payload["session_id"] = runtime.session_id
-            event = EVENT_CLASSES[source_type].from_redis_dict(string_payload)
-            stream_name = f"lecturelens:{runtime.session_id}:stream:{source_type}"
-            await self.redis_bus.publish_resilient(stream_name, event)
-            return {"status": "acknowledged"}
-        raise ValueError("unknown message type")
+                    await runtime.screen_agent.ingest_png_bytes(png_bytes, capture_epoch)
+                if is_tracked_capture:
+                    self._mark_capture_accepted(capture_id)
+                return {"status": "acknowledged"}
+            if message_type == "event":
+                source_type = message.get("source_type")
+                if source_type not in EVENT_SOURCE_TYPES:
+                    raise ValueError("unknown source_type")
+                payload = message.get("payload")
+                if not isinstance(payload, dict):
+                    raise ValueError("payload must be an object")
+                string_payload: dict[str, str] = {}
+                for key, value in payload.items():
+                    if isinstance(value, (dict, list)):
+                        string_payload[str(key)] = json.dumps(value)
+                    else:
+                        string_payload[str(key)] = "" if value is None else str(value)
+                string_payload["session_id"] = runtime.session_id
+                event = EVENT_CLASSES[source_type].from_redis_dict(string_payload)
+                stream_name = f"lecturelens:{runtime.session_id}:stream:{source_type}"
+                await self.redis_bus.publish_resilient(stream_name, event)
+                if is_tracked_capture:
+                    self._mark_capture_accepted(capture_id)
+                return {"status": "acknowledged"}
+            raise ValueError("unknown message type")
+        finally:
+            if is_tracked_capture and capture_id in self.in_flight_captures:
+                event_obj = self.in_flight_captures.pop(capture_id)
+                event_obj.set()
 
     async def check_session_exists(self, session_id: str) -> bool:
         if session_id in self.sessions:

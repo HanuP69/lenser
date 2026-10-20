@@ -1,8 +1,10 @@
 import asyncio
 import base64
 import json
+import sqlite3
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
@@ -42,34 +44,156 @@ def encode_message(
     })
 
 
+class CaptureSpool:
+    def __init__(self, spool_path: Path, max_size: int = 500) -> None:
+        self.spool_path = spool_path
+        self.max_size = max_size
+        self.spool_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _init_db(self) -> None:
+        conn = sqlite3.connect(str(self.spool_path), timeout=5.0)
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS pending_captures (
+                    capture_id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def append(self, capture_id: str, payload_text: str) -> None:
+        conn = sqlite3.connect(str(self.spool_path), timeout=5.0)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM pending_captures;")
+            count = int(cur.fetchone()[0])
+            if count >= self.max_size:
+                cur.execute(
+                    "SELECT capture_id FROM pending_captures ORDER BY created_at ASC LIMIT ?;",
+                    (count - self.max_size + 1,)
+                )
+                old_ids = [row[0] for row in cur.fetchall()]
+                if old_ids:
+                    placeholders = ",".join("?" for _ in old_ids)
+                    cur.execute(f"DELETE FROM pending_captures WHERE capture_id IN ({placeholders});", old_ids)
+            cur.execute(
+                "INSERT OR REPLACE INTO pending_captures (capture_id, payload, created_at) VALUES (?, ?, ?);",
+                (capture_id, payload_text, time.time())
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def acknowledge(self, capture_id: str) -> None:
+        conn = sqlite3.connect(str(self.spool_path), timeout=5.0)
+        try:
+            conn.execute("DELETE FROM pending_captures WHERE capture_id = ?;", (capture_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_pending(self, limit: int = 50) -> list[tuple[str, str]]:
+        conn = sqlite3.connect(str(self.spool_path), timeout=5.0)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT capture_id, payload FROM pending_captures ORDER BY created_at ASC LIMIT ?;", (limit,))
+            return cur.fetchall()
+        finally:
+            conn.close()
+
+    def count(self) -> int:
+        conn = sqlite3.connect(str(self.spool_path), timeout=5.0)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM pending_captures;")
+            return int(cur.fetchone()[0])
+        finally:
+            conn.close()
+
+
+async def drain_spool(
+    spool: CaptureSpool,
+    websocket: Any,
+    stop_event: Optional[asyncio.Event] = None
+) -> None:
+    pending = spool.get_pending(limit=25)
+    for cap_id, frame_str in pending:
+        if stop_event is not None and stop_event.is_set():
+            break
+        await send_and_wait(websocket, frame_str, max_retries=2, stop_event=stop_event, timeout=5.0)
+        spool.acknowledge(cap_id)
+
+
+async def wait_with_stop(coro: Any, stop_event: Optional[asyncio.Event] = None, timeout: float = 10.0) -> Any:
+    if stop_event is not None and stop_event.is_set():
+        raise asyncio.CancelledError("Stopped before starting operation")
+    op_task = asyncio.create_task(coro)
+    tasks: list[asyncio.Task] = [op_task]
+    if stop_event is not None:
+        stop_task = asyncio.create_task(stop_event.wait())
+        tasks.append(stop_task)
+    try:
+        done, pending = await asyncio.wait(tasks, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        for p in pending:
+            p.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        if stop_event is not None and stop_event.is_set():
+            raise asyncio.CancelledError("Operation interrupted by stop_event")
+        if op_task not in done:
+            raise TimeoutError("Operation timed out")
+        return op_task.result()
+    except BaseException:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
 async def send_and_wait(
     websocket: Any,
     text_frame: str,
     max_retries: int = 3,
-    initial_backoff: float = 0.5
+    initial_backoff: float = 0.5,
+    stop_event: Optional[asyncio.Event] = None,
+    timeout: float = 10.0
 ) -> None:
     backoff = initial_backoff
     last_reply = None
     for attempt in range(max_retries):
-        await websocket.send(text_frame)
-        reply = await websocket.recv()
-        parsed = json.loads(reply)
-        if parsed.get("status") == "acknowledged":
+        if stop_event is not None and stop_event.is_set():
+            raise asyncio.CancelledError("Stopped during frame send")
+        await wait_with_stop(websocket.send(text_frame), stop_event, timeout=timeout)
+        raw_reply = await wait_with_stop(websocket.recv(), stop_event, timeout=timeout)
+        reply = json.loads(raw_reply)
+        if reply.get("status") == "acknowledged":
             return
-        last_reply = parsed
+        last_reply = reply
         logger.warning(
             "server rejected frame (attempt %d/%d): %s",
             attempt + 1,
             max_retries,
-            parsed
+            reply
         )
         if attempt < max_retries - 1:
-            await asyncio.sleep(backoff)
+            if stop_event is not None:
+                await wait_with_stop(asyncio.sleep(backoff), stop_event, timeout=backoff + 1.0)
+            else:
+                await asyncio.sleep(backoff)
             backoff *= 2.0
     raise RuntimeError(f"server rejected frame after {max_retries} attempts: {last_reply}")
 
 
-async def stream_audio(websocket: Any, settings: Settings, stop_event: asyncio.Event) -> None:
+async def stream_audio(
+    websocket: Any,
+    settings: Settings,
+    stop_event: asyncio.Event,
+    spool: Optional[CaptureSpool] = None
+) -> None:
     source = build_block_source(settings)
     try:
         await run_in_thread_pool(source.start)
@@ -81,30 +205,49 @@ async def stream_audio(websocket: Any, settings: Settings, stop_event: asyncio.E
             silence_gap_seconds=settings.audio_silence_gap_seconds
         )
         started = time.monotonic()
+        if spool is not None:
+            try:
+                await drain_spool(spool, websocket, stop_event)
+            except Exception as drain_err:
+                logger.warning("draining audio spool encountered error: %s", drain_err)
         while not stop_event.is_set():
             block = await run_in_thread_pool(source.read_block, 0.5)
             if block is None:
                 continue
             for chunk in segmenter.push(block, time.monotonic() - started):
                 wav_bytes = convert_numpy_to_wav_bytes(chunk.samples, settings.mic_sample_rate)
+                cap_id = uuid.uuid4().hex
+                msg_text = encode_message("audio", "wav_b64", wav_bytes, time.time(), capture_id=cap_id)
+                if spool is not None:
+                    spool.append(cap_id, msg_text)
                 try:
-                    await send_and_wait(
-                        websocket, encode_message("audio", "wav_b64", wav_bytes, time.time())
-                    )
+                    await send_and_wait(websocket, msg_text, stop_event=stop_event)
+                    if spool is not None:
+                        spool.acknowledge(cap_id)
                 except Exception as stream_err:
                     logger.error("audio streaming error: %s", stream_err)
-                    return
+                    raise
     finally:
         await run_in_thread_pool(source.stop)
 
 
-async def stream_screen(websocket: Any, settings: Settings, stop_event: asyncio.Event) -> None:
+async def stream_screen(
+    websocket: Any,
+    settings: Settings,
+    stop_event: asyncio.Event,
+    spool: Optional[CaptureSpool] = None
+) -> None:
     gate = SlideChangeGate(
         settings.slide_diff_threshold,
         settings.slide_pixel_delta,
         settings.slide_min_interval_seconds,
         embedder=get_shared_vision_embedder()
     )
+    if spool is not None:
+        try:
+            await drain_spool(spool, websocket, stop_event)
+        except Exception as drain_err:
+            logger.warning("draining screen spool encountered error: %s", drain_err)
     while not stop_event.is_set():
         try:
             frame = await run_in_thread_pool(
@@ -114,37 +257,18 @@ async def stream_screen(websocket: Any, settings: Settings, stop_event: asyncio.
             if gate_accepted:
                 captured_at = time.time()
                 png_bytes = await run_in_thread_pool(encode_frame_as_png, frame)
-                await send_and_wait(
-                    websocket, encode_message("screen", "png_b64", png_bytes, captured_at)
-                )
+                cap_id = uuid.uuid4().hex
+                msg_text = encode_message("screen", "png_b64", png_bytes, captured_at, capture_id=cap_id)
+                if spool is not None:
+                    spool.append(cap_id, msg_text)
+                await send_and_wait(websocket, msg_text, stop_event=stop_event)
+                if spool is not None:
+                    spool.acknowledge(cap_id)
         except Exception as error:
             logger.error("screen streaming error: %s", error)
             if "close" in str(error).lower() or getattr(websocket, "closed", False):
                 break
         await asyncio.sleep(settings.screenshot_interval_seconds)
-
-
-async def wait_with_stop(coro: Any, stop_event: asyncio.Event, timeout: float = 10.0) -> Any:
-    if stop_event.is_set():
-        raise asyncio.CancelledError("Stopped before starting operation")
-    stop_task = asyncio.create_task(stop_event.wait())
-    op_task = asyncio.create_task(coro)
-    try:
-        done, pending = await asyncio.wait([op_task, stop_task], timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
-        for p in pending:
-            p.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        if stop_event.is_set():
-            raise asyncio.CancelledError("Operation interrupted by stop_event")
-        if op_task not in done:
-            raise TimeoutError("Operation timed out")
-        return op_task.result()
-    except BaseException:
-        stop_task.cancel()
-        op_task.cancel()
-        await asyncio.gather(stop_task, op_task, return_exceptions=True)
-        raise
 
 
 async def connect_and_auth(
@@ -185,6 +309,10 @@ async def run_remote_client(
     if stop_event is None:
         stop_event = asyncio.Event()
 
+    session_dir = settings.get_session_output_dir(session_id)
+    audio_spool = CaptureSpool(session_dir / "capture_spool_audio.db")
+    screen_spool = CaptureSpool(session_dir / "capture_spool_screen.db")
+
     while not stop_event.is_set():
         tasks: list[asyncio.Task] = []
         contexts: list[Any] = []
@@ -204,14 +332,14 @@ async def run_remote_client(
             contexts.append(audio_ctx)
 
             if use_audio:
-                tasks.append(asyncio.create_task(stream_audio(audio_socket, settings, session_stop_event)))
+                tasks.append(asyncio.create_task(stream_audio(audio_socket, settings, session_stop_event, spool=audio_spool)))
 
             if use_screen:
                 screen_ctx, screen_socket = await connect_and_auth(
                     server_url, settings.gateway_max_message_bytes, api_key, session_id, stop_event
                 )
                 contexts.append(screen_ctx)
-                tasks.append(asyncio.create_task(stream_screen(screen_socket, settings, session_stop_event)))
+                tasks.append(asyncio.create_task(stream_screen(screen_socket, settings, session_stop_event, spool=screen_spool)))
 
             if len(tasks) == 1 and tasks[0] is stop_watcher:
                 return

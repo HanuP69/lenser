@@ -675,6 +675,67 @@ class TestRemoteClientSendAndWait(unittest.IsolatedAsyncioTestCase):
         self.assertIn("server rejected frame", str(ctx.exception))
         self.assertEqual(mock_ws.send.await_count, 2)
 
+    async def test_failed_ingestion_remains_retryable_with_same_capture_id(self) -> None:
+        settings = Settings()
+        bus = FakeBus()
+        server = GatewayServer(settings, bus)
+        runtime = server.get_or_create_session("sess_retry")
+        msg = {
+            "type": "audio",
+            "wav_b64": base64.b64encode(b"dummy_wav_content").decode("ascii"),
+            "timestamp_epoch": time.time(),
+            "capture_id": "cap_retry_123"
+        }
+
+        with mock.patch.object(runtime.audio_agent, "ingest_wav_bytes", side_effect=RuntimeError("transient db error")):
+            with self.assertRaises(RuntimeError):
+                await server.handle_message(runtime, msg)
+
+        self.assertNotIn("cap_retry_123", server.accepted_capture_ids)
+
+        with mock.patch.object(runtime.audio_agent, "ingest_wav_bytes", return_value=None) as mock_ingest:
+            reply2 = await server.handle_message(runtime, msg)
+            self.assertEqual(reply2.get("status"), "acknowledged")
+            self.assertNotIn("duplicate", reply2)
+            mock_ingest.assert_awaited_once()
+
+        self.assertIn("cap_retry_123", server.accepted_capture_ids)
+
+        with mock.patch.object(runtime.audio_agent, "ingest_wav_bytes") as mock_ingest2:
+            reply3 = await server.handle_message(runtime, msg)
+            self.assertEqual(reply3.get("status"), "acknowledged")
+            self.assertTrue(reply3.get("duplicate"))
+            mock_ingest2.assert_not_called()
+
+    async def test_capture_spool_durability_and_drain(self) -> None:
+        from lecturelens.client.remote_client import CaptureSpool, drain_spool
+        with tempfile.TemporaryDirectory() as td:
+            spool_file = Path(td) / "spool.db"
+            spool = CaptureSpool(spool_file, max_size=10)
+            spool.append("c1", '{"capture_id": "c1", "type": "audio"}')
+            spool.append("c2", '{"capture_id": "c2", "type": "screen"}')
+            self.assertEqual(spool.count(), 2)
+
+            mock_ws = mock.AsyncMock()
+            mock_ws.recv.return_value = json.dumps({"status": "acknowledged"})
+            stop_evt = asyncio.Event()
+
+            await drain_spool(spool, mock_ws, stop_evt)
+            self.assertEqual(spool.count(), 0)
+            self.assertEqual(mock_ws.send.await_count, 2)
+
+    async def test_send_and_wait_times_out_on_unresponsive_server(self) -> None:
+        from lecturelens.client.remote_client import send_and_wait
+        mock_ws = mock.AsyncMock()
+
+        async def hung_recv():
+            await asyncio.sleep(10.0)
+            return json.dumps({"status": "acknowledged"})
+
+        mock_ws.recv = hung_recv
+        with self.assertRaises(Exception):
+            await send_and_wait(mock_ws, '{"type": "audio"}', max_retries=1, timeout=0.05)
+
 
 if __name__ == "__main__":
     unittest.main()

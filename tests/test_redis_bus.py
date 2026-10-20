@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 import tempfile
 import time
@@ -530,6 +531,89 @@ class TestRedisBusReliability(unittest.IsolatedAsyncioTestCase):
                         has_composite = True
                         break
             self.assertTrue(has_composite)
+            await bus.close()
+
+    async def test_publish_resilient_does_not_duplicate_when_redis_recovers_before_backoff_expires(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            outbox_file = Path(td) / "outbox.db"
+            bus = RedisBus(Settings().redis_url, outbox_path=outbox_file)
+
+            async def offline_pub(stream, event):
+                raise redis_module.ConnectionError("offline")
+
+            bus.publish = offline_pub
+            chunk = make_chunk("backoff recovery event")
+            chunk.event_id = "rec_backoff_1"
+
+            res1 = await bus.publish_resilient("stream_backoff", chunk)
+            self.assertIsNone(res1)
+            self.assertEqual(len(bus.outbox), 1)
+
+            bus._flush_backoff_seconds = 1000.0
+            bus._last_flush_attempt = time.monotonic()
+
+            direct_pub_calls = []
+
+            async def online_pub(stream, event):
+                direct_pub_calls.append((stream, event))
+                return "1-0"
+
+            bus.publish = online_pub
+
+            res2 = await bus.publish_resilient("stream_backoff", chunk)
+            self.assertIsNone(res2)
+            self.assertEqual(len(direct_pub_calls), 0)
+            self.assertEqual(len(bus.outbox), 1)
+
+            bus._flush_backoff_seconds = 0.0
+            flushed = await bus.flush_outbox()
+            self.assertEqual(flushed, 1)
+            self.assertEqual(len(direct_pub_calls), 1)
+            self.assertEqual(len(bus.outbox), 0)
+            await bus.close()
+
+    async def test_legacy_outbox_migration_with_malformed_json_does_not_delete_legacy_file(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            outbox_file = Path(td) / "outbox.db"
+            legacy_file = Path(td) / "outbox.db.legacy.jsonl"
+            lines = [
+                json.dumps({"stream": "s1", "data": {"event_id": "ok1", "text": "valid"}}),
+                "MALFORMED_JSON_LINE_HERE",
+                json.dumps({"stream": "s1", "data": {"event_id": "ok2", "text": "valid2"}}),
+            ]
+            legacy_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            bus = RedisBus(Settings().redis_url, outbox_path=outbox_file)
+            self.assertTrue(legacy_file.exists())
+            await bus.close()
+
+    async def test_stranded_migration_table_recovery_without_main_table(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            outbox_file = Path(td) / "outbox.db"
+            conn = sqlite3.connect(str(outbox_file))
+            conn.execute("""
+                CREATE TABLE outbox_entries_migrated (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL,
+                    stream_name TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    UNIQUE(stream_name, event_id)
+                );
+            """)
+            conn.execute(
+                "INSERT INTO outbox_entries_migrated (event_id, stream_name, payload, created_at) VALUES (?, ?, ?, ?);",
+                ("mig_1", "s_mig", '{"test": 1}', 100.0)
+            )
+            conn.commit()
+            conn.close()
+
+            bus = RedisBus(Settings().redis_url, outbox_path=outbox_file)
+            cur = bus._db_conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox_entries';")
+            self.assertIsNotNone(cur.fetchone())
+            cur.execute("SELECT COUNT(*) FROM outbox_entries WHERE event_id = 'mig_1';")
+            self.assertEqual(cur.fetchone()[0], 1)
             await bus.close()
 
 

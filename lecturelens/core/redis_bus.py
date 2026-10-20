@@ -98,45 +98,66 @@ class RedisBus:
             except Exception:
                 pass
 
-        legacy_items: list[tuple[str, Any]] = []
+        legacy_items: list[tuple[str, Any, str]] = []
+        parsing_completed = False
         if legacy_source and legacy_source.exists():
+            parsing_ok = True
             try:
                 with open(legacy_source, "r", encoding="utf-8") as f:
                     for line in f:
                         stripped = line.strip()
                         if stripped:
-                            item = json.loads(stripped)
-                            s = item.get("stream")
-                            p = item.get("data")
-                            if s and p:
-                                legacy_items.append((s, p))
+                            try:
+                                item = json.loads(stripped)
+                                s = item.get("stream")
+                                p = item.get("data")
+                                if s and p:
+                                    if isinstance(p, dict) and p.get("event_id"):
+                                        ev_id = str(p["event_id"])
+                                    else:
+                                        payload_str = json.dumps(p, sort_keys=True)
+                                        ev_id = hashlib.sha256(f"{s}:{payload_str}".encode()).hexdigest()[:32]
+                                    legacy_items.append((s, p, ev_id))
+                                else:
+                                    parsing_ok = False
+                            except Exception:
+                                parsing_ok = False
+                parsing_completed = parsing_ok
             except Exception as err:
+                parsing_completed = False
                 logger.warning("reading legacy outbox file failed: %s", err)
 
         self._db_conn = sqlite3.connect(str(self.outbox_path), timeout=10.0, check_same_thread=False)
         self._db_conn.execute("PRAGMA journal_mode = WAL;")
         self._db_conn.execute("PRAGMA busy_timeout = 5000;")
-        self._db_conn.execute("""
-            CREATE TABLE IF NOT EXISTS outbox_entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id TEXT NOT NULL,
-                stream_name TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                created_at REAL NOT NULL,
-                UNIQUE (stream_name, event_id)
-            );
-        """)
         try:
             cur = self._db_conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox_entries';")
+            has_main_table = bool(cur.fetchone())
             cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox_entries_migrated';")
-            if cur.fetchone():
-                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox_entries';")
-                if cur.fetchone():
-                    self._db_conn.execute("DROP TABLE outbox_entries_migrated;")
-                    self._db_conn.commit()
-                else:
-                    self._db_conn.execute("ALTER TABLE outbox_entries_migrated RENAME TO outbox_entries;")
-                    self._db_conn.commit()
+            has_migrated_table = bool(cur.fetchone())
+
+            if has_migrated_table and not has_main_table:
+                self._db_conn.execute("ALTER TABLE outbox_entries_migrated RENAME TO outbox_entries;")
+                self._db_conn.commit()
+            elif has_migrated_table and has_main_table:
+                self._db_conn.execute("""
+                    INSERT OR IGNORE INTO outbox_entries (event_id, stream_name, payload, created_at)
+                    SELECT event_id, stream_name, payload, created_at FROM outbox_entries_migrated;
+                """)
+                self._db_conn.execute("DROP TABLE outbox_entries_migrated;")
+                self._db_conn.commit()
+
+            self._db_conn.execute("""
+                CREATE TABLE IF NOT EXISTS outbox_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL,
+                    stream_name TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    UNIQUE (stream_name, event_id)
+                );
+            """)
 
             cur.execute("PRAGMA index_list(outbox_entries);")
             indexes = cur.fetchall()
@@ -187,23 +208,22 @@ class RedisBus:
         self._db_conn.commit()
 
         if legacy_items:
-            for s, p in legacy_items:
-                if isinstance(p, dict) and p.get("event_id"):
-                    ev_id = str(p["event_id"])
-                else:
-                    payload_str = json.dumps(p, sort_keys=True)
-                    ev_id = hashlib.sha256(f"{s}:{payload_str}".encode()).hexdigest()[:32]
+            for s, p, ev_id in legacy_items:
                 self._db_conn.execute(
                     "INSERT OR IGNORE INTO outbox_entries (event_id, stream_name, payload, created_at) VALUES (?, ?, ?, ?)",
                     (ev_id, s, json.dumps(p), time.time())
                 )
             self._db_conn.commit()
             try:
-                cur = self._db_conn.cursor()
-                cur.execute("SELECT COUNT(*) FROM outbox_entries;")
-                count_row = cur.fetchone()
-                if count_row and count_row[0] >= len(legacy_items):
-                    if legacy_path and legacy_path.exists():
+                if parsing_completed:
+                    cur = self._db_conn.cursor()
+                    all_present = True
+                    for s, _, ev_id in legacy_items:
+                        cur.execute("SELECT 1 FROM outbox_entries WHERE stream_name = ? AND event_id = ? LIMIT 1;", (s, ev_id))
+                        if not cur.fetchone():
+                            all_present = False
+                            break
+                    if all_present and legacy_path and legacy_path.exists():
                         legacy_path.unlink(missing_ok=True)
             except Exception as ver_err:
                 logger.warning("verifying legacy outbox migration failed: %s", ver_err)
@@ -410,8 +430,8 @@ class RedisBus:
             ev_id = f"note_{getattr(event, 'session_id')}_{getattr(event, 'sequence_number')}"
 
         was_queued = False
-        if ev_id:
-            async with self._outbox_lock:
+        async with self._outbox_lock:
+            if ev_id:
                 for s_name, item in self.outbox:
                     if s_name == stream_name:
                         item_id = item.get("event_id") if isinstance(item, dict) else getattr(item, "event_id", "")
@@ -434,6 +454,18 @@ class RedisBus:
                             break
             if not still_queued:
                 return "flushed_from_outbox"
+            return None
+
+        async with self._outbox_lock:
+            has_pending = bool(self.outbox)
+
+        if has_pending:
+            async with self._outbox_lock:
+                try:
+                    self._append_to_outbox(stream_name, event)
+                except Exception as save_err:
+                    raise RuntimeError(f"Buffering to outbox failed: {save_err}") from save_err
+            return None
 
         try:
             return await self.publish(stream_name, event)
