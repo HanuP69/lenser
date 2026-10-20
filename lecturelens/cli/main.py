@@ -334,7 +334,12 @@ async def live_dashboard_loop(
             while True:
                 if flag_exists(session_dir, SHUTDOWN_REQUEST_FLAG_NAME):
                     return
-                monitor.restart_failed_agents()
+                try:
+                    monitor.restart_failed_agents()
+                except Exception as error:
+                    # A failure to respawn an agent must not take down the
+                    # dashboard loop, otherwise the whole session is torn down.
+                    live.update(Panel(f"agent restart error: {error}"))
                 try:
                     snapshot = await collect_snapshot(
                         settings, session_id, bus, monitor.check_health(), line_counter
@@ -475,10 +480,16 @@ def start(
 
     settings.llm_mode = llm_mode
     try:
-        asyncio.run(live_dashboard_loop(settings, session_id, monitor, session_dir))
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Interrupted.[/yellow]")
-    run_shutdown(monitor, session_dir, planned_agents)
+        try:
+            asyncio.run(live_dashboard_loop(settings, session_id, monitor, session_dir))
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Interrupted.[/yellow]")
+    finally:
+        # The shutdown sequence is the only path that writes the stop flags
+        # and terminates the child processes. It must run for *every* exit,
+        # otherwise a failure in the dashboard loop leaves the capture agents
+        # running with no stop flag.
+        run_shutdown(monitor, session_dir, planned_agents)
 
 
 LIVE_HEARTBEAT_MAX_AGE_SECONDS: float = 15.0
@@ -502,6 +513,8 @@ def stop(
     timeout_seconds: float = typer.Option(300.0, "--timeout"),
 ) -> None:
     settings = Settings()
+    if timeout_seconds <= 0:
+        fail("--timeout must be greater than 0 seconds (use --no-wait to return immediately).")
     session_id = resolve_session(settings, session)
     session_dir = ensure_session_exists(settings, session_id)
     clear_flag(session_dir, SESSION_FINISHED_FLAG_NAME)
@@ -509,12 +522,8 @@ def stop(
     console.print(f"Shutdown requested for session {session_id}.")
     if not wait:
         return
-    deadline = (
-        time.monotonic() + timeout_seconds
-        if (timeout_seconds is not None and timeout_seconds > 0)
-        else None
-    )
-    while deadline is None or time.monotonic() < deadline:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
         if flag_exists(session_dir, SESSION_FINISHED_FLAG_NAME):
             console.print("[green]Session stopped.[/green]")
             display_session_output_summary(session_dir, console)
@@ -609,13 +618,18 @@ def reprocess(
             shutil.copy2(p, backup_p)
             backup_files[filename] = (p, backup_p)
 
+    # Redis reachability must be probed *outside* the event loop: check_redis()
+    # spins up its own loop via asyncio.run(), which cannot be called from
+    # inside a running loop.
+    redis_reachable = check_redis(settings)
+
     async def run() -> int:
         from lecturelens.agents.structuring_agent import StructuringAgent
         from lecturelens.router.llm_router import build_router_for_task, load_router_config
 
         bus = None
         redis_client = None
-        if check_redis(settings):
+        if redis_reachable:
             bus = create_redis_bus(settings, component_name="reprocess")
             redis_client = bus.client
         try:
@@ -830,7 +844,7 @@ def student(
         config = load_router_config(settings.router_config_path)
         redis_client = None
         if check_redis(settings):
-            bus = create_redis_bus(settings, component_name=f"student_{student_id}")
+            bus = create_redis_bus(settings, component_name=f"student_{safe_id}")
             redis_client = bus.client
         router = build_router_for_task(
             "structuring",

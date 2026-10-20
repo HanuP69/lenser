@@ -90,25 +90,20 @@ CONFUSION_PATTERNS: tuple[str, ...] = (
 )
 
 AD_PATTERNS: tuple[str, ...] = (
+    # Only unambiguous sponsor markers belong here. Every pattern below used to
+    # be matched against lecture speech as well, and a single match caused the
+    # whole entry to be deleted from the notes. Removed as irreducibly
+    # ambiguous: "use code X" (a CS lecture says "use code CSS"), "audible"
+    # (acoustics), "download the app" (mobile development), "special offer",
+    # "limited time offer" (marketing), "get N% off" (percentages),
+    # "link in the description" (docs), and the VPN/hosting brand names
+    # (a lecture *about* VPNs mentions them by name).
     r"promo\s+codes?",
     r"coupon\s+codes?",
     r"discount\s+codes?",
     r"sponsored\s+by",
     r"brought\s+to\s+you\s+by",
-    r"use\s+code\s+[a-z0-9_-]+",
-    r"special\s+offers?",
-    r"limited\s+time\s+offer",
-    r"(?:link|check\s+the\s+link)\s+in\s+the\s+description",
     r"description\s+box\s+below",
-    r"(?:get|for)\s+\d+%\s+off",
-    r"nordvpn",
-    r"expressvpn",
-    r"surfshark",
-    r"squarespace",
-    r"skillshare",
-    r"audible(?:\.com)?",
-    r"patreon(?:\.com)?",
-    r"download\s+(?:the\s+)?app",
     r"subscribe\s+to\s+my\s+channel",
     r"smash\s+that\s+like\s+button",
     r"hit\s+the\s+bell\s+icon",

@@ -300,8 +300,12 @@ class ScreenAgent:
             build_thumbnail_from_png, png_bytes, self.settings.slide_thumbnail_width
         )
         if enforce_gate:
+            # The gate is a rate limiter and must always use one clock base.
+            # The capture epoch is a wall-clock timestamp used for the event
+            # itself; feeding it into the gate froze slide capture for the
+            # rest of the session.
             gate_accepted = await run_in_thread_pool(
-                self.gate.evaluate, thumbnail, capture_epoch or time.monotonic()
+                self.gate.evaluate, thumbnail, time.monotonic()
             )
             if not gate_accepted:
                 return None

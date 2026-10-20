@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import urllib.request
@@ -8,6 +9,8 @@ import numpy as np
 from lecturelens.core.logging_setup import get_logger
 
 logger = get_logger("lecturelens.drift_filter")
+
+MAX_BATCH_SNAPSHOTS = 16
 
 REFUSAL_SENTENCE_PATTERNS: tuple[re.Pattern, ...] = (
     re.compile(r"^\s*please\s+provide\s+(?:the\s+)?presentation\s+slide", re.IGNORECASE),
@@ -78,6 +81,7 @@ class ContextDriftFilter:
         self.pending_quarantine_entries: list[dict[str, Any]] = []
         self.accepted_count: int = 0
         self.drift_count: int = 0
+        self._batch_snapshots: dict[str, dict[str, Any]] = {}
 
         if session_topic is not None and len(session_topic.strip()) > 0:
             clean_topic = session_topic.strip()
@@ -93,6 +97,7 @@ class ContextDriftFilter:
         self.drift_count = 0
         self.pending_quarantine_entries = []
         self.quarantine_buffer.clear()
+        self._batch_snapshots.clear()
         if self.session_topic is not None and len(self.session_topic.strip()) > 0:
             clean_topic = self.session_topic.strip()
             if len(clean_topic.split()) < 3:
@@ -100,6 +105,35 @@ class ContextDriftFilter:
             initial_vec = self.embed_text(clean_topic)
             if initial_vec is not None:
                 self.running_anchor = initial_vec
+
+    def snapshot_state(self) -> dict[str, Any]:
+        """Capture the mutable filter state so a batch can be re-filtered
+        idempotently after a failed synthesis pass."""
+        return {
+            "running_anchor": None if self.running_anchor is None else self.running_anchor.copy(),
+            "quarantine_buffer": list(self.quarantine_buffer),
+            "pending_quarantine_entries": list(self.pending_quarantine_entries),
+            "accepted_count": self.accepted_count,
+            "drift_count": self.drift_count,
+        }
+
+    def restore_state(self, snapshot: dict[str, Any]) -> None:
+        anchor = snapshot.get("running_anchor")
+        self.running_anchor = None if anchor is None else np.asarray(anchor, dtype=np.float32)
+        self.quarantine_buffer = list(snapshot.get("quarantine_buffer", []))
+        self.pending_quarantine_entries = list(snapshot.get("pending_quarantine_entries", []))
+        self.accepted_count = int(snapshot.get("accepted_count", 0))
+        self.drift_count = int(snapshot.get("drift_count", 0))
+
+    @staticmethod
+    def _batch_identity(entries: Sequence[dict[str, Any]]) -> str:
+        parts: list[str] = []
+        for entry in entries:
+            identifier = entry.get("event_id")
+            if not identifier:
+                identifier = f"{entry.get('timestamp_epoch')}:{entry.get('content', '')}"
+            parts.append(str(identifier))
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -228,12 +262,30 @@ class ContextDriftFilter:
     def filter_batch_entries(self, entries: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         filtered: list[dict[str, Any]] = []
 
+        batch_key = self._batch_identity(entries)
+        if batch_key in self._batch_snapshots:
+            # This batch was already filtered once (a retry after a failed
+            # synthesis pass). Restore the pre-batch state so the running
+            # anchor, the quarantine buffer and the counters are not advanced
+            # a second time, which would fabricate a topic shift and duplicate
+            # quarantined entries.
+            self.restore_state(self._batch_snapshots[batch_key])
+        else:
+            self._batch_snapshots[batch_key] = self.snapshot_state()
+            while len(self._batch_snapshots) > MAX_BATCH_SNAPSHOTS:
+                oldest_key = next(iter(self._batch_snapshots))
+                del self._batch_snapshots[oldest_key]
+
         for entry in entries:
             flags = list(entry.get("importance_flags", []) or [])
-            if "drift" in flags or "ad" in flags:
-                continue
-
             is_important = any(f in flags for f in ("exam_relevant", "definition", "action_item"))
+
+            # A single heuristic flag must never delete lecture content. The
+            # ad/drift markers come from regex and similarity heuristics that
+            # produce false positives on legitimate speech, so an entry is only
+            # dropped when no important marker contradicts the flag.
+            if not is_important and ("drift" in flags or "ad" in flags):
+                continue
 
             content = str(entry.get("content", ""))
             source_type = str(entry.get("source_type", "transcript"))

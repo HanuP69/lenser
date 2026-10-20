@@ -31,7 +31,8 @@ class TestCircuitBreaker(unittest.IsolatedAsyncioTestCase):
             redis_client=self.redis_client,
             provider_name="test_provider",
             max_requests_per_window=2,
-            window_seconds=10
+            window_seconds=10,
+            time_provider=lambda: 1_000_000.0
         )
 
         allowed_first = await limiter.is_allowed()

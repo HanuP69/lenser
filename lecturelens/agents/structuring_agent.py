@@ -34,6 +34,16 @@ FLAG_EXCERPT_LIMIT = 160
 MAX_FLAG_EXCERPTS = 3
 OVERLAP_WINDOW_SECONDS = 20.0
 MAX_OVERLAP_ITEMS = 15
+MAX_BATCH_RETRIES = 3
+MAX_CONSECUTIVE_PASS_FAILURES = 10
+
+
+class StructuringBatchError(RuntimeError):
+    """Raised when a batch could not be synthesised into notes.
+
+    The batch is retried; the byte offset is not advanced until the batch
+    either succeeds or falls back to the raw timeline content.
+    """
 
 
 class StructuringState(TypedDict):
@@ -402,6 +412,9 @@ class StructuringAgent:
 
         self.graph: Any = create_structuring_graph(llm_router)
         self.consecutive_failures: int = 0
+        self.max_batch_retries: int = MAX_BATCH_RETRIES
+        self.max_consecutive_failures: int = MAX_CONSECUTIVE_PASS_FAILURES
+        self._batch_attempts: dict[int, int] = {}
         initial_state_data = self.load_state()
         self.current_overlap: list[dict[str, Any]] = list(initial_state_data.get("overlap_entries", []))
         self.sequence_number: int = int(initial_state_data.get("sequence_number", 0))
@@ -554,6 +567,24 @@ class StructuringAgent:
             section_lines.append("")
         return "\n".join(section_lines) + "\n"
 
+    def build_raw_section(self, batch: SliceBatch) -> str:
+        """Build a section from the raw timeline content.
+
+        Used when the language model keeps returning an empty summary. The
+        lecture material is kept verbatim instead of being dropped.
+        """
+        first_timestamp = float(batch.entries[0].get("timestamp_epoch", 0.0))
+        heading_time = time.strftime("%H:%M:%S", time.localtime(first_timestamp))
+        divider = "\n---\n\n" if (self.notes_path.exists() and self.notes_path.stat().st_size > 0) else ""
+        section_lines: list[str] = [f"{divider}### {heading_time}", ""]
+        for entry in batch.entries:
+            content = str(entry.get("content", "")).strip()
+            if len(content) == 0:
+                continue
+            section_lines.append(content)
+            section_lines.append("")
+        return "\n".join(section_lines) + "\n"
+
     async def process_single_batch(self, batch: SliceBatch, running_context: str) -> str:
         entries = batch.entries
         if self.drift_filter is not None:
@@ -578,30 +609,69 @@ class StructuringAgent:
             "importance_flags": [],
             "overlap_entries": self.current_overlap
         }
-        result_state = await self.graph.ainvoke(initial_state)
+
+        synthesis_error: Optional[BaseException] = None
+        result_state: dict[str, Any] = dict(initial_state)
+        try:
+            result_state = await self.graph.ainvoke(initial_state)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            synthesis_error = error
+
+        section_text = "" if synthesis_error is not None else self.build_notes_section(active_batch, result_state)
+
+        if len(section_text) == 0:
+            # The model produced nothing usable for this slice. Publishing an
+            # empty note would burn a sequence number and writing nothing
+            # would drop the batch, so the batch is retried instead. The
+            # attempt counter bounds the retries: once it is exhausted the raw
+            # timeline content is used so the lecture material is never lost.
+            attempts = self._batch_attempts.get(batch.end_offset, 0) + 1
+            self._batch_attempts[batch.end_offset] = attempts
+            reason = synthesis_error if synthesis_error is not None else "empty summary"
+            if attempts <= self.max_batch_retries:
+                logger.error(
+                    "structuring batch ending at offset %d produced no notes (%s); "
+                    "attempt %d/%d, will retry",
+                    batch.end_offset, reason, attempts, self.max_batch_retries
+                )
+                raise StructuringBatchError(
+                    f"batch ending at offset {batch.end_offset} produced no notes: {reason}"
+                ) from synthesis_error
+            logger.error(
+                "structuring batch ending at offset %d produced no notes after %d attempts; "
+                "falling back to the raw timeline content",
+                batch.end_offset, attempts
+            )
+            section_text = self.build_raw_section(active_batch)
+            result_state = dict(result_state)
+            result_state["summary"] = section_text
+            result_state["key_points"] = []
+            result_state["concept_tags"] = []
+            result_state["definitions"] = []
+            result_state["action_items"] = []
 
         definitions = result_state.get("definitions", []) or []
         key_points = result_state.get("key_points", []) or []
         concept_tags = result_state.get("concept_tags", []) or [d["term"] for d in definitions if "term" in d]
-        action_items = result_state.get("action_items", []) or []
 
         first_timestamp = float(entries[0].get("timestamp_epoch", 0.0))
         last_timestamp = float(entries[-1].get("timestamp_epoch", first_timestamp))
         start_time_str = time.strftime("%H:%M:%S", time.localtime(first_timestamp))
         end_time_str = time.strftime("%H:%M:%S", time.localtime(last_timestamp))
 
-        section_text = self.build_notes_section(active_batch, result_state)
-        if len(section_text) > 0:
-            if self.notes_path.exists() and self.load_notes_marker() >= batch.end_offset:
-                logger.info(
-                    "batch ending at byte %d already written to notes, skipping append", batch.end_offset
-                )
-            else:
-                with open(self.notes_path, "a", encoding="utf-8", newline="\n") as file_handle:
-                    file_handle.write(section_text)
-                self.save_notes_marker(batch.end_offset)
+        if self.notes_path.exists() and self.load_notes_marker() >= batch.end_offset:
+            logger.info(
+                "batch ending at byte %d already written to notes, skipping append", batch.end_offset
+            )
+        else:
+            with open(self.notes_path, "a", encoding="utf-8", newline="\n") as file_handle:
+                file_handle.write(section_text)
+            self.save_notes_marker(batch.end_offset)
 
         self.sequence_number += 1
+        self._batch_attempts.pop(batch.end_offset, None)
 
         slide_references: list[int] = []
         for entry in entries:
@@ -688,6 +758,17 @@ class StructuringAgent:
             self.consecutive_failures += 1
             self.control.set_stat("consecutive_failures", self.consecutive_failures)
             logger.error("structuring pass failed (%d), will retry: %s", self.consecutive_failures, error)
+            if self.consecutive_failures >= self.max_consecutive_failures:
+                # The counter used to be written but never read, so the same
+                # failing call was retried forever. Surface the condition in
+                # the heartbeat instead of retrying silently; the per-batch
+                # retry cap still guarantees forward progress.
+                logger.error(
+                    "structuring pass failed %d times in a row; the failing batch is "
+                    "retried up to %d times before falling back to the raw timeline content",
+                    self.consecutive_failures, self.max_batch_retries
+                )
+                self.control.write_heartbeat("failed")
 
     async def run(self) -> None:
         self.is_running = True
@@ -698,7 +779,12 @@ class StructuringAgent:
         while self.is_running:
             now = time.monotonic()
             if (now - last_heartbeat_time) >= heartbeat_interval:
-                self.control.write_heartbeat("live")
+                if self.consecutive_failures >= self.max_consecutive_failures:
+                    # Keep reporting the failure instead of flipping straight
+                    # back to "live" on the next heartbeat.
+                    self.control.write_heartbeat("failed")
+                else:
+                    self.control.write_heartbeat("live")
                 last_heartbeat_time = now
             if self.control.stop_requested():
                 logger.info("finalize requested, running final structuring pass")

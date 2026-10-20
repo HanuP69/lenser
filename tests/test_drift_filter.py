@@ -155,6 +155,60 @@ class TestContextDriftFilterBehavior(unittest.TestCase):
         kept = self.filter.filter_batch_entries(entries)
         self.assertEqual(len(kept), 4)
 
+    def test_ad_flag_alone_does_not_delete_important_content(self) -> None:
+        """A single heuristic flag used to delete the entry outright. The
+        content is now only dropped when no important marker contradicts it."""
+        self.filter.check_entry("Chapter 4 Quadratic Equation Master Plan")
+        entries = [
+            {
+                "event_id": "important-ad",
+                "content": "the audible range of human hearing is twenty hertz",
+                "importance_flags": ["ad", "definition"],
+                "source_type": "transcript"
+            },
+            {
+                "event_id": "plain-ad",
+                "content": "Buy our revolutionary online communication course now",
+                "importance_flags": ["ad"],
+                "source_type": "slide"
+            }
+        ]
+        kept = self.filter.filter_batch_entries(entries)
+        contents = [entry["content"] for entry in kept]
+        self.assertIn("the audible range of human hearing is twenty hertz", contents)
+        self.assertNotIn("Buy our revolutionary online communication course now", contents)
+
+    def test_refiltering_the_same_batch_is_idempotent(self) -> None:
+        """A retried batch used to advance the running anchor and the counters
+        a second time, which fabricated a topic shift."""
+        self.filter.check_entry("Chapter 4 Quadratic Equation Master Plan")
+        batch = [
+            {
+                "event_id": "a",
+                "content": "Roots and discriminant of quadratic equation",
+                "source_type": "transcript"
+            },
+            {
+                "event_id": "b",
+                "content": "Sum of first n terms of arithmetic progression",
+                "source_type": "transcript"
+            }
+        ]
+        first = self.filter.filter_batch_entries(batch)
+        anchor_after_first = self.filter.running_anchor.copy()
+        accepted_after_first = self.filter.accepted_count
+        drift_after_first = self.filter.drift_count
+
+        second = self.filter.filter_batch_entries(batch)
+
+        self.assertEqual(
+            [entry["event_id"] for entry in first],
+            [entry["event_id"] for entry in second]
+        )
+        self.assertTrue(np.array_equal(anchor_after_first, self.filter.running_anchor))
+        self.assertEqual(accepted_after_first, self.filter.accepted_count)
+        self.assertEqual(drift_after_first, self.filter.drift_count)
+
     def test_topic_shift_across_batch_boundaries(self) -> None:
         self.filter.check_entry("Chapter 4 Quadratic Equation Master Plan")
         batch1 = [

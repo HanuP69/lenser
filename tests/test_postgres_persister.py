@@ -447,6 +447,52 @@ class TestPostgresSchemaFallback(unittest.IsolatedAsyncioTestCase):
         self.assertIn("embedding_model IS NULL", executed[1][0])
         self.assertEqual(executed[1][1], ("sess_abc", "nomic-embed-text"))
 
+    async def test_delete_embeddings_not_in_has_no_undefined_guard_and_handles_empty_set(self) -> None:
+        """The method used to read `self.postgres_available`, which never existed,
+        so every call raised AttributeError and the reconciliation was silently
+        skipped. An empty valid set must delete the whole session."""
+        executed: list[tuple[str, Any]] = []
+
+        class FakeReconcileCursor:
+            def __init__(self) -> None:
+                self.rowcount = 2
+
+            async def execute(self, sql: str, params: Any = None) -> None:
+                executed.append((sql, params))
+
+            async def __aenter__(self) -> "FakeReconcileCursor":
+                return self
+
+            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                pass
+
+        class FakeReconcileConn:
+            def cursor(self) -> FakeReconcileCursor:
+                return FakeReconcileCursor()
+
+            async def __aenter__(self) -> "FakeReconcileConn":
+                return self
+
+            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                pass
+
+            def transaction(self) -> "FakeReconcileConn":
+                return self
+
+        storage = PostgresStorage("postgresql://mock/db")
+        storage._connection = FakeReconcileConn()
+        storage.get_connection = mock.AsyncMock(return_value=FakeReconcileConn())
+
+        count = await storage.delete_embeddings_not_in("sess_abc", ["chunk1", "chunk2"])
+        self.assertEqual(count, 2)
+        self.assertIn("DELETE FROM embeddings", executed[0][0])
+        self.assertEqual(executed[0][1], ("sess_abc", ["chunk1", "chunk2"]))
+
+        empty_count = await storage.delete_embeddings_not_in("sess_abc", [])
+        self.assertEqual(empty_count, 2)
+        self.assertIn("DELETE FROM embeddings WHERE session_id = %s", executed[1][0])
+        self.assertEqual(executed[1][1], ("sess_abc",))
+
     async def test_search_embeddings_strictly_filters_model(self) -> None:
         executed: list[tuple[str, Any]] = []
 

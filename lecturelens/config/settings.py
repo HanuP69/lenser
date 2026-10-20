@@ -90,6 +90,9 @@ class Settings(BaseSettings):
 
     redis_consumer_batch_size: int = Field(default=10)
     redis_consumer_block_ms: int = Field(default=2000)
+    redis_backlog_drain_budget_seconds: float = Field(default=60.0)
+    redis_socket_connect_timeout_seconds: float = Field(default=5.0)
+    redis_socket_timeout_seconds: float = Field(default=30.0)
 
     llm_mode: str = Field(default="local")
     llm_timeout_seconds: float = Field(default=120.0)

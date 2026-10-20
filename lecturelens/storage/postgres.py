@@ -188,16 +188,26 @@ class PostgresStorage:
             logger.debug("vector column skipped: %s", vector_col_error)
 
     async def delete_embeddings_not_in(self, session_id: str, valid_source_ids: list[str]) -> int:
-        if not self.postgres_available:
-            return 0
-        if not valid_source_ids:
-            return 0
+        """Remove embeddings for a session that are not in the valid set.
+
+        An empty ``valid_source_ids`` means "keep nothing for this session", so
+        every embedding row belonging to the session is removed. Rows with a
+        NULL ``source_id`` are removed as well, because ``NULL = ANY(...)``
+        evaluates to NULL and would otherwise survive the filter.
+        """
         async with self.transaction() as conn:
             async with conn.cursor() as cur:
-                await cur.execute(
-                    "DELETE FROM embeddings WHERE session_id = %s AND NOT (source_id = ANY(%s));",
-                    (session_id, valid_source_ids)
-                )
+                if valid_source_ids:
+                    await cur.execute(
+                        "DELETE FROM embeddings WHERE session_id = %s "
+                        "AND (source_id IS NULL OR NOT (source_id = ANY(%s)));",
+                        (session_id, valid_source_ids)
+                    )
+                else:
+                    await cur.execute(
+                        "DELETE FROM embeddings WHERE session_id = %s;",
+                        (session_id,)
+                    )
                 return cur.rowcount
 
     async def insert_timeline_event(self, entry: TimelineEntry | dict[str, Any]) -> bool:

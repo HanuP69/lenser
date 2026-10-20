@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import tempfile
@@ -277,6 +278,63 @@ class TestCliCommands(unittest.TestCase):
     def test_stop_times_out_when_session_never_finishes(self) -> None:
         with self.assertRaises(typer.Exit):
             cli_main.stop(session="lec1", wait=True, timeout_seconds=0.3)
+
+    def test_stop_rejects_non_positive_timeout(self) -> None:
+        """A non-positive timeout used to disable the deadline and hang forever."""
+        with self.assertRaises(typer.Exit):
+            cli_main.stop(session="lec1", wait=True, timeout_seconds=0)
+        with self.assertRaises(typer.Exit):
+            cli_main.stop(session="lec1", wait=True, timeout_seconds=-1.0)
+
+    def test_session_id_with_trailing_newline_is_rejected(self) -> None:
+        """`$` matched before a trailing newline, so "lec1\n" passed validation."""
+        with self.assertRaises(typer.Exit):
+            cli_main.pause(session="lec1\n")
+        with self.assertRaises(typer.Exit):
+            cli_main.pause(session="lec1\n../../etc")
+
+    def test_reprocess_does_not_probe_redis_inside_the_event_loop(self) -> None:
+        """reprocess used to call check_redis() (which runs its own asyncio.run)
+        from inside the coroutine driven by asyncio.run, which always raised
+        RuntimeError and made the command a no-op."""
+        timeline = self.session_dir / "timeline.jsonl"
+        timeline.write_text(
+            json.dumps({
+                "session_id": "lec1",
+                "timestamp_epoch": 100.0,
+                "source_type": "transcript",
+                "content": "binary search halves the search space",
+            }) + "\n",
+            encoding="utf-8",
+        )
+
+        def fake_check_redis(settings: Any) -> bool:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return False
+            raise AssertionError("check_redis() must not be called from inside a running event loop")
+
+        processed: list[int] = []
+
+        class FakeStructuringAgent:
+            def __init__(self, **kwargs: Any) -> None:
+                self.reset_called = False
+
+            def reset_outputs(self) -> None:
+                self.reset_called = True
+
+            async def process_all_pending(self) -> int:
+                processed.append(1)
+                return 3
+
+        with mock.patch.object(cli_main, "check_redis", side_effect=fake_check_redis):
+            with mock.patch("lecturelens.agents.structuring_agent.StructuringAgent", FakeStructuringAgent):
+                with mock.patch("lecturelens.router.llm_router.build_router_for_task", return_value=None):
+                    with mock.patch("lecturelens.router.llm_router.load_router_config", return_value={}):
+                        cli_main.reprocess(session="lec1")
+
+        self.assertEqual(processed, [1])
 
     def test_unknown_or_invalid_sessions_exit_with_error(self) -> None:
         with self.assertRaises(typer.Exit):

@@ -34,6 +34,34 @@ class TestImportance(unittest.TestCase):
         flags = detect_importance_flags(text)
         self.assertEqual(len(flags), 0)
 
+    def test_lecture_content_is_not_flagged_as_an_ad(self) -> None:
+        """These sentences used to match the ad heuristics, and a single "ad"
+        flag caused the whole entry to be deleted from the notes."""
+        lecture_sentences = [
+            "the audible range of human hearing is twenty hertz to twenty kilohertz",
+            "you can use code CSS to style this page",
+            "you use code A here for the array literal",
+            "download the app from the play store before the demo",
+            "the professor mentioned a limited time offer for the course",
+            "you get twenty percent off the final grade if you attend",
+            "this lecture covers the special offers of the market",
+            "the link in the description has the reference documentation",
+        ]
+        for sentence in lecture_sentences:
+            self.assertNotIn(
+                "ad",
+                detect_importance_flags(sentence),
+                f"lecture content must not be flagged as an ad: {sentence!r}"
+            )
+
+    def test_real_sponsor_phrases_are_still_flagged(self) -> None:
+        for sentence in [
+            "use the promo code LECTURE10 for a discount",
+            "this video is sponsored by our friends",
+            "subscribe to my channel and hit the bell icon",
+        ]:
+            self.assertIn("ad", detect_importance_flags(sentence))
+
     def test_hindi_and_hinglish_detection(self) -> None:
         text_exam = "Ye concept bahut important hai aur exam me aayega dhyan do."
         self.assertIn("exam_relevant", detect_importance_flags(text_exam))

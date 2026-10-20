@@ -87,6 +87,25 @@ class TestSlideChangeGate(unittest.TestCase):
                 accepted += 1
         self.assertLessEqual(accepted, 1)
 
+    def test_switching_from_wall_clock_to_monotonic_does_not_freeze_the_gate(self) -> None:
+        """A gateway frame used to feed a wall-clock epoch into the gate while
+        the local path fed a monotonic value. The gate then computed a huge
+        negative interval and rejected every later slide for the session."""
+        gate = self.make_gate()
+        first = thumb(["Intro"])
+        second = thumb(["Intro", "Next point", "More"])
+
+        # Wall-clock epoch first (the gateway path).
+        self.assertTrue(gate.evaluate(first, 1_700_000_000.0))
+
+        # Then the local monotonic path: the slide change must still be seen.
+        accepted = False
+        for offset in range(0, 40):
+            if gate.evaluate(second, 3_000.0 + offset):
+                accepted = True
+                break
+        self.assertTrue(accepted, "the gate must not freeze after a clock base change")
+
     def test_continuous_video_still_gets_captured_after_settle_limit(self) -> None:
         gate = self.make_gate()
         gate.evaluate(thumb(["start"]), 0.0)

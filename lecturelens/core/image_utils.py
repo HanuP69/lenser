@@ -94,10 +94,19 @@ class SlideChangeGate:
         self.last_accept_time: float = 0.0
         self.settle_polls: int = 0
         self.detection_timestamp: float = 0.0
+        self._last_observed_time: Optional[float] = None
 
     def evaluate(self, thumbnail: np.ndarray, now_seconds: float) -> bool:
         previous_poll = self.previous_poll
         self.previous_poll = thumbnail
+
+        if self._last_observed_time is not None and now_seconds < self._last_observed_time:
+            # The caller switched clock base (for example a wall-clock epoch
+            # after a monotonic reading). Rebase onto the new base instead of
+            # computing a negative interval, which would otherwise reject every
+            # later frame for the rest of the session.
+            self.last_accept_time = now_seconds
+        self._last_observed_time = now_seconds
 
         if self.last_accepted is None:
             return self.accept(thumbnail, now_seconds)

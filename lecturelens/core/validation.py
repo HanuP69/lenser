@@ -1,7 +1,7 @@
 import re
 
-SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}$")
-COURSE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\- ]{0,63}$")
+SESSION_ID_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}\Z")
+COURSE_NAME_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.\- ]{0,63}\Z")
 
 VALID_AUDIO_SOURCES: tuple[str, ...] = ("mic", "system", "both")
 VALID_LLM_MODES: tuple[str, ...] = ("local", "hybrid", "cloud")

@@ -8,6 +8,7 @@ from typing import Any, Optional
 from lecturelens.agents.structuring_agent import (
     SliceBatch,
     StructuringAgent,
+    StructuringBatchError,
     extract_json_payload,
     split_entries_into_batches
 )
@@ -121,6 +122,42 @@ class TestStructuringBasics(StructuringTestBase):
         self.assertEqual(segment.sequence_number, 1)
         self.assertIn("binary search", segment.concept_tags)
         self.assertEqual(segment.slide_references, [1])
+
+    async def test_empty_summary_is_retried_then_falls_back_to_raw_content(self) -> None:
+        """An empty summary used to publish an empty note segment, burn a
+        sequence number and advance the offset, losing the batch."""
+        agent = self.make_agent()
+        agent.max_batch_retries = 1
+
+        original_invoke = agent.graph.ainvoke
+
+        async def empty_invoke(state: Any) -> dict:
+            result = await original_invoke(state)
+            return {**result, "summary": ""}
+
+        agent.graph.ainvoke = empty_invoke  # type: ignore[assignment]
+
+        # First attempt: the batch is retried, nothing is published and the
+        # byte offset is not advanced.
+        with self.assertRaises(StructuringBatchError):
+            await agent.process_batch()
+        self.assertEqual(self.bus.published, [])
+        self.assertEqual(agent.sequence_number, 0)
+        self.assertEqual(agent.load_state()["timeline_byte_offset"], 0)
+        self.assertEqual(self.notes_text(), "")
+
+        # Second attempt: the retry budget is exhausted, so the raw timeline
+        # content is used instead of dropping the batch.
+        await agent.process_batch()
+
+        self.assertEqual(len(self.bus.published), 1)
+        stream_name, segment = self.bus.published[0]
+        self.assertIn("stream:notes", stream_name)
+        self.assertEqual(segment.sequence_number, 1)
+        self.assertNotEqual(segment.content.strip(), "")
+        self.assertIn("Today we cover binary search.", segment.content)
+        self.assertIn("Today we cover binary search.", self.notes_text())
+        self.assertGreater(agent.load_state()["timeline_byte_offset"], 0)
 
     async def test_correlated_events_reach_the_llm_as_one_unit(self) -> None:
         await self.make_agent().process_batch()

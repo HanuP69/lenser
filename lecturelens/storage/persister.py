@@ -152,8 +152,8 @@ class PostgresPersister:
 async def main() -> None:
     settings = Settings()
     if not settings.postgres_url:
-        logger.warning("postgres_url not configured, persister exiting")
-        return
+        logger.error("postgres_url not configured; persister cannot run")
+        raise SystemExit(1)
     namespace = parse_runtime_arguments()
     session_id = namespace.session or settings.session_name or "default_session"
     session_dir = settings.get_session_output_dir(session_id)
@@ -162,10 +162,12 @@ async def main() -> None:
     try:
         await storage.init_schema()
     except Exception as pg_err:
-        logger.warning("postgres unavailable for persister (%s), persister exiting", pg_err)
+        logger.error("postgres unavailable for persister (%s); exiting with failure", pg_err)
         await storage.close()
         await redis_bus.close()
-        return
+        # A non-zero exit is required: the agent supervisor treats exit code 0 as
+        # "STOPPED" and would never restart the persister.
+        raise SystemExit(1)
     persister = PostgresPersister(settings, redis_bus, storage)
     control = AgentControl(session_dir, "persister", stop_flag_name=PERSISTER_STOP_FLAG_NAME)
     control.write_heartbeat("live")

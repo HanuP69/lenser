@@ -15,7 +15,7 @@ from lecturelens.core.event_loop import ensure_event_loop_policy, run_async
 from lecturelens.core.fileio import atomic_write_text
 from lecturelens.core.logging_setup import get_logger
 from lecturelens.core.redis_bus import RedisBus
-from lecturelens.core.validation import is_valid_session_id
+from lecturelens.core.validation import is_valid_session_id, sanitize_file_stem
 
 logger = get_logger("lecturelens.runtime")
 
@@ -152,7 +152,10 @@ def create_redis_bus(
     if outbox_path is not None:
         resolved_outbox = outbox_path
     else:
-        comp = component_name or "default"
+        # The component name reaches this function from user input (for
+        # example "--student-id"). It is sanitised so the outbox file can
+        # never be written outside the output directory.
+        comp = sanitize_file_stem(component_name or "default")
         resolved_outbox = settings.output_dir / f"redis_outbox_{comp}.db"
     return RedisBus(
         settings.redis_url,
@@ -160,7 +163,10 @@ def create_redis_bus(
         reclaim_idle_ms=getattr(settings, "reclaim_idle_ms", 30000),
         retry_ttl_seconds=getattr(settings, "retry_key_ttl_seconds", getattr(settings, "redis_retry_ttl_seconds", 86400)),
         outbox_max_size=getattr(settings, "redis_outbox_max_size", getattr(settings, "outbox_max_size", 1000)),
-        outbox_path=resolved_outbox
+        outbox_path=resolved_outbox,
+        backlog_drain_budget_seconds=getattr(settings, "redis_backlog_drain_budget_seconds", 60.0),
+        socket_connect_timeout=getattr(settings, "redis_socket_connect_timeout_seconds", 5.0),
+        socket_timeout=getattr(settings, "redis_socket_timeout_seconds", 30.0)
     )
 
 

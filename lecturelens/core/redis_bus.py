@@ -56,10 +56,18 @@ class RedisBus:
         reclaim_interval_seconds: float = 15.0,
         retry_ttl_seconds: int = 86400,
         outbox_max_size: int = 1000,
-        outbox_path: Optional[Path] = None
+        outbox_path: Optional[Path] = None,
+        backlog_drain_budget_seconds: float = 60.0,
+        socket_connect_timeout: float = 5.0,
+        socket_timeout: float = 30.0
     ) -> None:
         self.redis_url: str = redis_url
-        self.client: redis.Redis = redis.from_url(redis_url, decode_responses=True)
+        self.client: redis.Redis = redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_connect_timeout=socket_connect_timeout,
+            socket_timeout=socket_timeout
+        )
         self.stream_max_length: int = stream_max_length
         self.max_delivery_attempts: int = max_delivery_attempts
         self.reclaim_idle_ms: int = reclaim_idle_ms
@@ -67,6 +75,7 @@ class RedisBus:
         self.retry_ttl_seconds: int = retry_ttl_seconds
         self.outbox_max_size: int = outbox_max_size
         self.outbox_path: Optional[Path] = Path(outbox_path) if outbox_path else None
+        self.backlog_drain_budget_seconds: float = backlog_drain_budget_seconds
         self.outbox: list[tuple[str, Any]] = []
         self._outbox_row_ids: list[int] = []
         self._outbox_lock: asyncio.Lock = asyncio.Lock()
@@ -636,6 +645,7 @@ class RedisBus:
         backoff_seconds = 0.5
         backlog_drained = False
         backlog_cursor = "0"
+        backlog_drain_started = time.monotonic()
         last_reclaim_time = 0.0
         group_ready = False
         self.ensure_background_worker()
@@ -646,6 +656,21 @@ class RedisBus:
                     group_ready = True
 
                 if not backlog_drained:
+                    if (
+                        self.backlog_drain_budget_seconds > 0
+                        and (time.monotonic() - backlog_drain_started)
+                        >= self.backlog_drain_budget_seconds
+                    ):
+                        # The backlog drain is bounded so a huge pending list
+                        # cannot stall the shutdown sequence. The messages stay
+                        # unacknowledged in the pending entries list and are
+                        # replayed on the next start, so nothing is lost.
+                        logger.warning(
+                            "backlog drain budget of %.0fs exhausted for %s; "
+                            "leaving remaining messages pending",
+                            self.backlog_drain_budget_seconds, stream_name
+                        )
+                        return
                     messages = await self.read_group_messages(
                         stream_name, group_name, consumer_name, backlog_cursor, batch_size, None
                     )

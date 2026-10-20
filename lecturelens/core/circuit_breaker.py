@@ -1,5 +1,5 @@
 import time
-from typing import Any
+from typing import Any, Callable, Optional
 
 import redis.asyncio as redis
 
@@ -10,15 +10,19 @@ class RedisRateLimiter:
         redis_client: redis.Redis,
         provider_name: str,
         max_requests_per_window: int = 60,
-        window_seconds: int = 60
+        window_seconds: int = 60,
+        time_provider: Optional[Callable[[], float]] = None
     ) -> None:
         self.redis_client: redis.Redis = redis_client
         self.provider_name: str = provider_name
         self.max_requests_per_window: int = max_requests_per_window
         self.window_seconds: int = window_seconds
+        # Injectable so the window bucket can be pinned in tests; a test that
+        # straddles a window boundary is otherwise flaky.
+        self.time_provider: Callable[[], float] = time_provider or time.time
 
     def generate_window_key(self) -> str:
-        current_time_epoch = int(time.time())
+        current_time_epoch = int(self.time_provider())
         window_bucket = current_time_epoch // self.window_seconds
         key_name = f"lecturelens:ratelimit:{self.provider_name}:{window_bucket}"
         return key_name
