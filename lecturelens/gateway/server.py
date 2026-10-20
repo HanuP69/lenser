@@ -127,6 +127,8 @@ class GatewayServer:
         self.subscriber_writers: dict[str, dict[Any, asyncio.Task]] = {}
         self.fanout_tasks: dict[str, asyncio.Task] = {}
         self.server: Any = None
+        self.recent_capture_ids: set[str] = set()
+        self._recent_capture_queue: list[tuple[float, str]] = []
 
     async def broadcast_note_segment(self, session_id: str, note_data: dict[str, Any]) -> None:
         if session_id in self.catching_up:
@@ -253,6 +255,21 @@ class GatewayServer:
 
     async def handle_message(self, runtime: SessionRuntime, message: dict[str, Any]) -> dict[str, Any]:
         runtime.last_active = time.monotonic()
+        capture_id = message.get("capture_id")
+        if isinstance(capture_id, str) and capture_id:
+            if capture_id in self.recent_capture_ids:
+                return {"status": "acknowledged", "duplicate": True}
+            self.recent_capture_ids.add(capture_id)
+            self._recent_capture_queue.append((time.monotonic(), capture_id))
+            if len(self._recent_capture_queue) > 5000:
+                cutoff = time.monotonic() - 600.0
+                while self._recent_capture_queue and self._recent_capture_queue[0][0] < cutoff:
+                    _, old_id = self._recent_capture_queue.pop(0)
+                    self.recent_capture_ids.discard(old_id)
+                if len(self._recent_capture_queue) > 5000:
+                    _, old_id = self._recent_capture_queue.pop(0)
+                    self.recent_capture_ids.discard(old_id)
+
         capture_epoch = resolve_capture_epoch(message, runtime.clock)
         message_type = message.get("type")
         if message_type == "audio":

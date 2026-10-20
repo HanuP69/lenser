@@ -448,6 +448,37 @@ class TestStudentClient(unittest.IsolatedAsyncioTestCase):
         client.pending_reconciliation = True
         self.assertEqual(client.load_persisted_sequence(), 0)
 
+    async def test_legacy_upgrade_preserves_existing_notes_and_populates_ledger(self) -> None:
+        profile = StudentProfile(student_id="student_legacy", preferred_language="English")
+        state_file = self.output_dir / "lec_legacy_student_legacy_state.json"
+        state_file.write_text(json.dumps({"last_sequence_number": 7}), encoding="utf-8")
+        notes_file = self.output_dir / "lec_legacy_personalized_notes.md"
+        notes_file.write_text("Preserved legacy notes content\n", encoding="utf-8")
+
+        client = StudentClient("ws://localhost:8765", "lec_legacy", profile, self.output_dir)
+        self.assertTrue(notes_file.exists())
+        self.assertEqual(client.last_sequence_number, 7)
+        self.assertFalse(client.pending_reconciliation)
+
+        conn = sqlite3.connect(str(client.ledger_file))
+        cur = conn.cursor()
+        cur.execute("SELECT sequence_number, content FROM applied_segments;")
+        rows = cur.fetchall()
+        conn.close()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], 7)
+        self.assertEqual(rows[0][1], "Preserved legacy notes content")
+
+    async def test_corrupt_ledger_marks_unverified_and_resets_cursor(self) -> None:
+        profile = StudentProfile(student_id="student_corrupt", preferred_language="English")
+        client = StudentClient("ws://localhost:8765", "lec_corrupt", profile, self.output_dir)
+        client.state_file.write_text(json.dumps({"last_sequence_number": 42}), encoding="utf-8")
+
+        client.ledger_file.write_bytes(b"corrupted sqlite file header")
+        seq = client.load_persisted_sequence()
+        self.assertEqual(seq, 0)
+        self.assertTrue(client.pending_reconciliation)
+
 
 if __name__ == "__main__":
     unittest.main()

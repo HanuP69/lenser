@@ -157,7 +157,7 @@ async def main() -> None:
     namespace = parse_runtime_arguments()
     session_id = namespace.session or settings.session_name or "default_session"
     session_dir = settings.get_session_output_dir(session_id)
-    redis_bus = create_redis_bus(settings)
+    redis_bus = create_redis_bus(settings, component_name="persister")
     storage = PostgresStorage(settings.postgres_url, query_limit=getattr(settings, "postgres_query_limit", 1000))
     try:
         await storage.init_schema()

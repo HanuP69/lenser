@@ -128,6 +128,16 @@ class RedisBus:
         """)
         try:
             cur = self._db_conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox_entries_migrated';")
+            if cur.fetchone():
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox_entries';")
+                if cur.fetchone():
+                    self._db_conn.execute("DROP TABLE outbox_entries_migrated;")
+                    self._db_conn.commit()
+                else:
+                    self._db_conn.execute("ALTER TABLE outbox_entries_migrated RENAME TO outbox_entries;")
+                    self._db_conn.commit()
+
             cur.execute("PRAGMA index_list(outbox_entries);")
             indexes = cur.fetchall()
             needs_migration = False
@@ -142,7 +152,7 @@ class RedisBus:
                         break
             if needs_migration:
                 self._db_conn.execute("""
-                    CREATE TABLE outbox_entries_migrated (
+                    CREATE TABLE IF NOT EXISTS outbox_entries_migrated (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         event_id TEXT NOT NULL,
                         stream_name TEXT NOT NULL,
@@ -158,8 +168,22 @@ class RedisBus:
                 self._db_conn.execute("DROP TABLE outbox_entries;")
                 self._db_conn.execute("ALTER TABLE outbox_entries_migrated RENAME TO outbox_entries;")
                 self._db_conn.commit()
+
+            cur.execute("PRAGMA index_list(outbox_entries);")
+            indexes = cur.fetchall()
+            has_composite_unique = False
+            for idx_row in indexes:
+                if idx_row[2]:
+                    cur.execute(f"PRAGMA index_info('{idx_row[1]}');")
+                    indexed_cols = sorted([c[2] for c in cur.fetchall()])
+                    if indexed_cols == ["event_id", "stream_name"]:
+                        has_composite_unique = True
+                        break
+            if not has_composite_unique:
+                raise RuntimeError("outbox schema lacks required UNIQUE(stream_name, event_id) constraint")
         except Exception as mig_err:
-            logger.debug("outbox schema check skipped: %s", mig_err)
+            logger.error("outbox schema initialization/migration failed: %s", mig_err)
+            raise RuntimeError(f"outbox schema initialization/migration failed: {mig_err}") from mig_err
         self._db_conn.commit()
 
         if legacy_items:
@@ -204,20 +228,6 @@ class RedisBus:
             logger.warning("loading persistent outbox failed: %s", err)
 
     def _append_to_outbox(self, stream_name: str, event: Any) -> None:
-        if self._db_conn is not None:
-            try:
-                cur = self._db_conn.cursor()
-                cur.execute("SELECT COUNT(*) FROM outbox_entries;")
-                count_row = cur.fetchone()
-                total_in_db = int(count_row[0]) if count_row else 0
-            except Exception:
-                total_in_db = len(self.outbox)
-        else:
-            total_in_db = len(self.outbox)
-
-        if total_in_db >= self.outbox_max_size:
-            raise RuntimeError(f"Persistent outbox capacity exceeded ({self.outbox_max_size})")
-
         if isinstance(event, BaseModel):
             event_data = event_to_redis_fields(event)
         elif isinstance(event, dict):
@@ -228,25 +238,83 @@ class RedisBus:
         if isinstance(event_data, dict):
             event_id = str(event_data.get("event_id") or "")
             if not event_id:
-                event_id = uuid.uuid4().hex
+                if hasattr(event, "session_id") and hasattr(event, "sequence_number"):
+                    event_id = f"note_{getattr(event, 'session_id')}_{getattr(event, 'sequence_number')}"
+                else:
+                    event_id = uuid.uuid4().hex
                 event_data["event_id"] = event_id
         else:
             event_id = uuid.uuid4().hex
 
+        existing_idx = None
+        for i, (s_name, ev_payload) in enumerate(self.outbox):
+            if s_name == stream_name:
+                ev_payload_id = str(ev_payload.get("event_id") if isinstance(ev_payload, dict) else getattr(ev_payload, "event_id", ""))
+                if ev_payload_id and ev_payload_id == event_id:
+                    existing_idx = i
+                    break
+
+        existing_row_id = None
+        if self._db_conn is not None:
+            try:
+                cur = self._db_conn.cursor()
+                cur.execute(
+                    "SELECT id FROM outbox_entries WHERE stream_name = ? AND event_id = ?;",
+                    (stream_name, event_id)
+                )
+                row = cur.fetchone()
+                if row:
+                    existing_row_id = row[0]
+            except Exception:
+                pass
+
+        is_duplicate = (existing_idx is not None) or (existing_row_id is not None)
+
+        if not is_duplicate:
+            if self._db_conn is not None:
+                try:
+                    cur = self._db_conn.cursor()
+                    cur.execute("SELECT COUNT(*) FROM outbox_entries;")
+                    count_row = cur.fetchone()
+                    total_in_db = int(count_row[0]) if count_row else 0
+                except Exception:
+                    total_in_db = len(self.outbox)
+            else:
+                total_in_db = len(self.outbox)
+
+            if total_in_db >= self.outbox_max_size:
+                raise RuntimeError(f"Persistent outbox capacity exceeded ({self.outbox_max_size})")
+
         payload_str = json.dumps(event_data)
+        assigned_row_id = None
         if self._db_conn is not None:
             try:
                 cursor = self._db_conn.cursor()
-                cursor.execute(
-                    "INSERT OR REPLACE INTO outbox_entries (event_id, stream_name, payload, created_at) VALUES (?, ?, ?, ?)",
-                    (event_id, stream_name, payload_str, time.time())
-                )
+                if existing_row_id is not None:
+                    cursor.execute(
+                        "UPDATE outbox_entries SET payload = ?, created_at = ? WHERE id = ?",
+                        (payload_str, time.time(), existing_row_id)
+                    )
+                    assigned_row_id = existing_row_id
+                else:
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO outbox_entries (event_id, stream_name, payload, created_at) VALUES (?, ?, ?, ?)",
+                        (event_id, stream_name, payload_str, time.time())
+                    )
+                    assigned_row_id = cursor.lastrowid
                 self._db_conn.commit()
-                self._outbox_row_ids.append(cursor.lastrowid)
             except Exception as err:
                 logger.error("saving persistent outbox failed: %s", err)
                 raise RuntimeError(f"Persisting to outbox failed: {err}") from err
-        self.outbox.append((stream_name, event_data))
+
+        if existing_idx is not None:
+            self.outbox[existing_idx] = (stream_name, event_data)
+            if assigned_row_id is not None and existing_idx < len(self._outbox_row_ids):
+                self._outbox_row_ids[existing_idx] = assigned_row_id
+        else:
+            self.outbox.append((stream_name, event_data))
+            if assigned_row_id is not None:
+                self._outbox_row_ids.append(assigned_row_id)
 
     def has_pending_items(self) -> bool:
         if self._db_conn is not None:
@@ -287,11 +355,11 @@ class RedisBus:
 
     async def flush_outbox(self) -> int:
         async with self._outbox_lock:
+            self._last_flush_attempt = time.monotonic()
             if not self.outbox and self._db_conn is not None:
                 self._load_outbox()
             if not self.outbox:
                 return 0
-            self._last_flush_attempt = time.monotonic()
             flushed = 0
             fail_idx = None
             for idx, (stream_name, event) in enumerate(list(self.outbox)):
@@ -337,9 +405,36 @@ class RedisBus:
 
     async def publish_resilient(self, stream_name: str, event: BaseModel) -> Optional[str]:
         self.start_background_worker()
+        ev_id = getattr(event, "event_id", None)
+        if not ev_id and hasattr(event, "session_id") and hasattr(event, "sequence_number"):
+            ev_id = f"note_{getattr(event, 'session_id')}_{getattr(event, 'sequence_number')}"
+
+        was_queued = False
+        if ev_id:
+            async with self._outbox_lock:
+                for s_name, item in self.outbox:
+                    if s_name == stream_name:
+                        item_id = item.get("event_id") if isinstance(item, dict) else getattr(item, "event_id", "")
+                        if item_id == ev_id:
+                            was_queued = True
+                            break
+
         now = time.monotonic()
         if now - self._last_flush_attempt >= self._flush_backoff_seconds:
             await self.flush_outbox()
+
+        if was_queued and ev_id:
+            still_queued = False
+            async with self._outbox_lock:
+                for s_name, item in self.outbox:
+                    if s_name == stream_name:
+                        item_id = item.get("event_id") if isinstance(item, dict) else getattr(item, "event_id", "")
+                        if item_id == ev_id:
+                            still_queued = True
+                            break
+            if not still_queued:
+                return "flushed_from_outbox"
+
         try:
             return await self.publish(stream_name, event)
         except (redis.RedisError, OSError) as error:

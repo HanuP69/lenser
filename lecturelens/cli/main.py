@@ -85,7 +85,7 @@ def ensure_session_exists(settings: Settings, session_id: str) -> Path:
 
 def check_redis(settings: Settings) -> bool:
     async def ping() -> bool:
-        bus = create_redis_bus(settings)
+        bus = create_redis_bus(settings, component_name="ping")
         try:
             return await bus.ping()
         finally:
@@ -548,7 +548,7 @@ def status(session: Optional[str] = typer.Option(None, "--session")) -> None:
     session_dir = ensure_session_exists(settings, session_id)
 
     async def snapshot() -> Group:
-        bus = create_redis_bus(settings)
+        bus = create_redis_bus(settings, component_name="status")
         try:
             counter = LineCounter(session_dir / "timeline.jsonl")
             return await collect_snapshot(settings, session_id, bus, {}, counter)
@@ -616,7 +616,7 @@ def reprocess(
         bus = None
         redis_client = None
         if check_redis(settings):
-            bus = create_redis_bus(settings)
+            bus = create_redis_bus(settings, component_name="reprocess")
             redis_client = bus.client
         try:
             router = build_router_for_task(
@@ -660,7 +660,7 @@ def ask(
         from lecturelens.knowledge.qa_engine import QAEngine
         from lecturelens.router.llm_router import build_router_for_task, load_router_config
 
-        bus = create_redis_bus(settings)
+        bus = create_redis_bus(settings, component_name="qa_cli")
         try:
             router = None
             try:
@@ -830,7 +830,7 @@ def student(
         config = load_router_config(settings.router_config_path)
         redis_client = None
         if check_redis(settings):
-            bus = create_redis_bus(settings)
+            bus = create_redis_bus(settings, component_name=f"student_{student_id}")
             redis_client = bus.client
         router = build_router_for_task(
             "structuring",
@@ -863,16 +863,20 @@ def student(
     )
 
     console.print(f"[green]Connecting student client '{student_id}' to {resolved_server} (session: {session}, language: {language})...[/green]")
+    async def _run_student() -> None:
+        try:
+            await client.run()
+        finally:
+            if bus is not None:
+                try:
+                    await bus.close()
+                except Exception:
+                    pass
+
     try:
-        asyncio.run(client.run())
+        asyncio.run(_run_student())
     except KeyboardInterrupt:
         console.print("[yellow]Student client stopped.[/yellow]")
-    finally:
-        if bus is not None:
-            try:
-                asyncio.run(bus.close())
-            except Exception:
-                pass
 
 
 @app.command()
@@ -887,7 +891,7 @@ def persister(
     from lecturelens.storage.postgres import PostgresStorage
 
     async def run() -> None:
-        redis_bus = create_redis_bus(settings)
+        redis_bus = create_redis_bus(settings, component_name="persister")
         storage = create_postgres_storage(settings)
         await storage.init_schema()
         persister_worker = PostgresPersister(settings, redis_bus, storage)

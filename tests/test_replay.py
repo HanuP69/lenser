@@ -110,6 +110,38 @@ class TestReplayEngine(unittest.IsolatedAsyncioTestCase):
         count = await engine.replay()
         self.assertEqual(count, 0)
 
+    async def test_legacy_timeline_entry_without_event_id_generates_deterministic_id(self) -> None:
+        legacy_path = Path(self.temp_dir.name) / "legacy_timeline.jsonl"
+        legacy_data = {
+            "session_id": "legacy_sess",
+            "timestamp_epoch": 1700000000.0,
+            "source_type": "transcript",
+            "content": "legacy talk content",
+            "elapsed_seconds": 1.0
+        }
+        legacy_path.write_text(json.dumps(legacy_data) + "\n", encoding="utf-8")
+
+        engine1 = ReplayEngine(legacy_path, speed=0.0)
+        run1: list[TimelineEntry] = []
+        await engine1.replay(on_entry=run1.append, publish_to_timeline_stream=False)
+
+        engine2 = ReplayEngine(legacy_path, speed=0.0)
+        run2: list[TimelineEntry] = []
+        await engine2.replay(on_entry=run2.append, publish_to_timeline_stream=False)
+
+        self.assertEqual(len(run1), 1)
+        self.assertEqual(len(run2), 1)
+        self.assertTrue(run1[0].event_id.startswith("legacy_"))
+        self.assertEqual(run1[0].event_id, run2[0].event_id)
+
+        target_run1: list[TimelineEntry] = []
+        await engine1.replay(target_session_id="new_dest", on_entry=target_run1.append, publish_to_timeline_stream=False)
+
+        target_run2: list[TimelineEntry] = []
+        await engine2.replay(target_session_id="new_dest", on_entry=target_run2.append, publish_to_timeline_stream=False)
+
+        self.assertEqual(target_run1[0].event_id, target_run2[0].event_id)
+
 
 if __name__ == "__main__":
     unittest.main()

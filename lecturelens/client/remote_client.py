@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import time
+import uuid
 from typing import Any, Optional
 
 import numpy as np
@@ -25,12 +26,20 @@ def encode_message(
     message_type: str,
     field_name: str,
     payload: bytes,
-    capture_epoch: Optional[float] = None
+    capture_epoch: Optional[float] = None,
+    capture_id: Optional[str] = None
 ) -> str:
     if capture_epoch is None:
         capture_epoch = time.time()
+    if capture_id is None:
+        capture_id = uuid.uuid4().hex
     encoded = base64.b64encode(payload).decode("ascii")
-    return json.dumps({"type": message_type, field_name: encoded, "timestamp_epoch": capture_epoch})
+    return json.dumps({
+        "type": message_type,
+        field_name: encoded,
+        "timestamp_epoch": capture_epoch,
+        "capture_id": capture_id
+    })
 
 
 async def send_and_wait(
@@ -62,16 +71,16 @@ async def send_and_wait(
 
 async def stream_audio(websocket: Any, settings: Settings, stop_event: asyncio.Event) -> None:
     source = build_block_source(settings)
-    await run_in_thread_pool(source.start)
-    segmenter = SpeechSegmenter(
-        sample_rate=settings.mic_sample_rate,
-        energy_threshold=settings.vad_energy_threshold,
-        min_chunk_seconds=settings.mic_chunk_duration_seconds,
-        max_chunk_seconds=settings.audio_max_chunk_seconds,
-        silence_gap_seconds=settings.audio_silence_gap_seconds
-    )
-    started = time.monotonic()
     try:
+        await run_in_thread_pool(source.start)
+        segmenter = SpeechSegmenter(
+            sample_rate=settings.mic_sample_rate,
+            energy_threshold=settings.vad_energy_threshold,
+            min_chunk_seconds=settings.mic_chunk_duration_seconds,
+            max_chunk_seconds=settings.audio_max_chunk_seconds,
+            silence_gap_seconds=settings.audio_silence_gap_seconds
+        )
+        started = time.monotonic()
         while not stop_event.is_set():
             block = await run_in_thread_pool(source.read_block, 0.5)
             if block is None:
@@ -208,6 +217,8 @@ async def run_remote_client(
                 return
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             session_stop_event.set()
+            if not stop_event.is_set():
+                await asyncio.sleep(1.0)
         except PermissionError:
             raise
         except asyncio.CancelledError:

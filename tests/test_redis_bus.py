@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -447,6 +448,89 @@ class TestRedisBusReliability(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(bus._closing)
             self.assertIsNone(bus._retry_task)
             self.assertIsNone(bus._db_conn)
+
+    async def test_buffering_same_event_twice_deduplicates_without_duplicate_row_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            outbox_file = Path(td) / "outbox.db"
+            bus = RedisBus(Settings().redis_url, outbox_path=outbox_file)
+
+            async def offline_pub(stream, event):
+                raise redis_module.ConnectionError("offline")
+
+            bus.publish = offline_pub
+            chunk = make_chunk("idempotent event")
+            chunk.event_id = "test_dup_event_1"
+
+            await bus.publish_resilient("stream_dedup", chunk)
+            await bus.publish_resilient("stream_dedup", chunk)
+
+            self.assertEqual(len(bus.outbox), 1)
+            self.assertEqual(len(bus._outbox_row_ids), 1)
+
+            cur = bus._db_conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM outbox_entries WHERE stream_name = ? AND event_id = ?", ("stream_dedup", "test_dup_event_1"))
+            self.assertEqual(cur.fetchone()[0], 1)
+
+            published_events = []
+
+            async def online_pub(stream, event):
+                published_events.append((stream, event))
+                return "1-0"
+
+            bus.publish = online_pub
+            flushed = await bus.flush_outbox()
+            self.assertEqual(flushed, 1)
+            self.assertEqual(len(published_events), 1)
+            self.assertEqual(len(bus.outbox), 0)
+            self.assertEqual(len(bus._outbox_row_ids), 0)
+
+            cur.execute("SELECT COUNT(*) FROM outbox_entries")
+            self.assertEqual(cur.fetchone()[0], 0)
+            await bus.close()
+
+    async def test_outbox_migration_recovers_from_stranded_migrated_table_and_validates_composite_index(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            outbox_file = Path(td) / "outbox.db"
+            conn = sqlite3.connect(str(outbox_file))
+            conn.execute("""
+                CREATE TABLE outbox_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT UNIQUE,
+                    stream_name TEXT,
+                    payload TEXT,
+                    created_at REAL
+                );
+            """)
+            conn.execute("""
+                CREATE TABLE outbox_entries_migrated (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT,
+                    stream_name TEXT,
+                    payload TEXT,
+                    created_at REAL,
+                    UNIQUE(stream_name, event_id)
+                );
+            """)
+            conn.commit()
+            conn.close()
+
+            bus = RedisBus(Settings().redis_url, outbox_path=outbox_file)
+            self.assertIsNotNone(bus._db_conn)
+            cur = bus._db_conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox_entries_migrated';")
+            self.assertIsNone(cur.fetchone())
+            cur.execute("PRAGMA index_list(outbox_entries);")
+            indexes = cur.fetchall()
+            has_composite = False
+            for idx in indexes:
+                if idx[2]:
+                    cur.execute(f"PRAGMA index_info('{idx[1]}');")
+                    cols = sorted([c[2] for c in cur.fetchall()])
+                    if cols == ["event_id", "stream_name"]:
+                        has_composite = True
+                        break
+            self.assertTrue(has_composite)
+            await bus.close()
 
 
 if __name__ == "__main__":

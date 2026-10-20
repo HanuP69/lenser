@@ -1,3 +1,4 @@
+import hashlib
 import json
 import uuid
 from typing import Any, Optional
@@ -280,8 +281,11 @@ class TimelineEntry(BaseModel):
 
     @classmethod
     def from_jsonl_dict(cls, data: dict) -> "TimelineEntry":
-        if "event_id" not in data:
-            data["event_id"] = str(uuid.uuid4())
+        if not data.get("event_id"):
+            content_hash = hashlib.sha256(
+                f"{data.get('session_id')}:{data.get('timestamp_epoch')}:{data.get('source_type')}:{data.get('content')}".encode()
+            ).hexdigest()[:32]
+            data["event_id"] = f"legacy_{content_hash}"
         return cls(**data)
 
     def to_redis_dict(self) -> dict[str, str]:

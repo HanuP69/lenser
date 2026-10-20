@@ -140,6 +140,7 @@ class StudentClient:
         self.rewriter = PersonalizationEngine(profile, llm_router)
         self.state_file = output_dir / f"{session_id}_{profile.student_id}_state.json"
         self.ledger_file = output_dir / f"{session_id}_{profile.student_id}_ledger.db"
+        self._ledger_was_new = not self.ledger_file.exists()
         self._init_ledger()
         self.notes_file = output_dir / f"{session_id}_personalized_notes.md"
         reconciled = self.reconcile_notes_from_ledger()
@@ -153,14 +154,42 @@ class StudentClient:
         if not hasattr(self, "ledger_file") or not self.ledger_file.exists():
             self.pending_reconciliation = False
             return True
+        conn = None
         try:
             conn = sqlite3.connect(str(self.ledger_file), timeout=5.0)
             cur = conn.cursor()
             cur.execute("SELECT sequence_number, content FROM applied_segments ORDER BY sequence_number ASC;")
             rows = cur.fetchall()
+            cur.close()
             conn.close()
+            conn = None
             if not rows:
-                if self.notes_file.exists():
+                is_legacy_upgrade = (
+                    self.state_file.exists()
+                    and self.notes_file.exists()
+                    and getattr(self, "_ledger_was_new", False)
+                )
+                if is_legacy_upgrade:
+                    legacy_seq = 0
+                    try:
+                        with open(self.state_file, "r", encoding="utf-8") as handle:
+                            legacy_seq = int(json.load(handle).get("last_sequence_number", 0))
+                    except Exception:
+                        pass
+                    if legacy_seq > 0:
+                        legacy_text = self.notes_file.read_text(encoding="utf-8")
+                        if legacy_text.strip():
+                            conn = sqlite3.connect(str(self.ledger_file), timeout=5.0)
+                            conn.execute(
+                                "INSERT OR IGNORE INTO applied_segments (sequence_number, session_id, heading, content, created_at) VALUES (?, ?, ?, ?, ?)",
+                                (legacy_seq, self.session_id, "Legacy Notes", legacy_text.strip(), time.time()),
+                            )
+                            conn.commit()
+                            conn.close()
+                            conn = None
+                    self.pending_reconciliation = False
+                    return True
+                elif self.notes_file.exists():
                     try:
                         self.notes_file.unlink()
                     except Exception:
@@ -191,9 +220,16 @@ class StudentClient:
             logger.warning("failed to reconcile notes from ledger: %s", err)
             self.pending_reconciliation = True
             return False
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def _init_ledger(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        conn = None
         try:
             conn = sqlite3.connect(str(self.ledger_file), timeout=10.0)
             conn.execute("""
@@ -206,9 +242,14 @@ class StudentClient:
                 );
             """)
             conn.commit()
-            conn.close()
         except Exception as err:
             logger.warning("failed to initialize student ledger: %s", err)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def load_persisted_sequence(self) -> int:
         persisted = 0
@@ -222,23 +263,31 @@ class StudentClient:
 
         ledger_max: Optional[int] = None
         if hasattr(self, "ledger_file") and self.ledger_file.exists():
+            conn = None
             try:
                 conn = sqlite3.connect(str(self.ledger_file), timeout=5.0)
                 cur = conn.cursor()
                 cur.execute("SELECT MAX(sequence_number) FROM applied_segments;")
                 row = cur.fetchone()
-                conn.close()
                 if row and row[0] is not None:
                     ledger_max = int(row[0])
                 else:
                     ledger_max = 0
-            except Exception:
-                pass
+            except Exception as err:
+                logger.error("reading student ledger failed, marking unverified: %s", err)
+                self.pending_reconciliation = True
+                return 0
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
 
         if getattr(self, "pending_reconciliation", False):
             if ledger_max is not None:
                 return min(persisted, ledger_max)
-            return persisted
+            return 0
 
         if ledger_max is not None:
             return max(persisted, ledger_max)
@@ -254,6 +303,7 @@ class StudentClient:
 
     async def _apply_segment(self, segment: GeneralNoteSegment) -> str:
         personalized_content = await self.rewriter.rewrite_segment(segment)
+        conn = None
         try:
             conn = sqlite3.connect(str(self.ledger_file), timeout=10.0)
             cur = conn.cursor()
@@ -262,10 +312,15 @@ class StudentClient:
                 (segment.sequence_number, segment.session_id, segment.heading, personalized_content, time.time())
             )
             conn.commit()
-            conn.close()
         except Exception as ledger_err:
             logger.error("saving to student ledger failed: %s", ledger_err)
             raise RuntimeError(f"saving to student ledger failed: {ledger_err}") from ledger_err
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
         if not self.reconcile_notes_from_ledger():
             self.pending_reconciliation = True
