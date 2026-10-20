@@ -1,5 +1,6 @@
 import asyncio
 import io
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -243,6 +244,30 @@ class TestVisionEmbedderAndGate(unittest.TestCase):
         small2 = np.ones((4, 4), dtype=np.uint8) * 200
         sim_small = compute_spatial_block_similarity(small1, small2)
         self.assertAlmostEqual(sim_small, 0.0)
+
+    def test_vision_model_download_is_checksum_verified(self) -> None:
+        """The ONNX model is executed in-process, so an unverified download
+        was a supply-chain hole."""
+        import hashlib
+        import tempfile
+
+        from lecturelens.core import vision_embedder
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "squeezenet.onnx"
+            embedder = vision_embedder.VisionEmbedder(model_path=str(model_path), auto_download=False)
+
+            payload = b"not-the-real-model" * 1000
+            model_path.write_bytes(payload)
+            self.assertFalse(embedder._verify_checksum(model_path))
+
+            real_digest = hashlib.sha256(payload).hexdigest()
+            with mock.patch.dict(os.environ, {"LECTURELENS_VISION_MODEL_SHA256": real_digest}):
+                self.assertTrue(embedder._verify_checksum(model_path))
+
+            pinned = vision_embedder.EXPECTED_MODEL_SHA256
+            self.assertEqual(len(pinned), 64)
+            self.assertTrue(all(character in "0123456789abcdef" for character in pinned))
 
     def test_slide_change_gate_with_mock_embedder_filters_motion(self) -> None:
         from lecturelens.core.image_utils import SlideChangeGate

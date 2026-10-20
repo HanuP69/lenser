@@ -1,3 +1,4 @@
+import hashlib
 import os
 from pathlib import Path
 import threading
@@ -12,6 +13,24 @@ logger = get_logger("lecturelens.vision_embedder")
 
 DEFAULT_MODEL_URL = "https://github.com/onnx/models/raw/main/validated/vision/classification/squeezenet/model/squeezenet1.1-7.onnx"
 MIN_MODEL_BYTES = 4_000_000
+# Pinned digest of the model referenced by DEFAULT_MODEL_URL. The file is
+# executed by onnxruntime in-process, so an unverified download would be a
+# supply-chain hole.
+EXPECTED_MODEL_SHA256 = "1eeff551a67ae8d565ca33b572fc4b66e3ef357b0eb2863bb9ff47a918cc4088"
+
+
+def expected_model_sha256() -> str:
+    """The pinned digest, overridable for users who mirror the model."""
+    override = os.environ.get("LECTURELENS_VISION_MODEL_SHA256", "").strip().lower()
+    return override or EXPECTED_MODEL_SHA256
+
+
+def sha256_of_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 _SHARED_VISION_EMBEDDER: Optional["VisionEmbedder"] = None
 _EMBEDDER_LOCK: threading.Lock = threading.Lock()
@@ -49,7 +68,12 @@ class VisionEmbedder:
         if self.model_path.exists():
             try:
                 if self.model_path.stat().st_size >= MIN_MODEL_BYTES:
-                    return True
+                    if self._verify_checksum(self.model_path):
+                        return True
+                    logger.warning(
+                        "cached vision model %s failed the checksum check; re-downloading",
+                        self.model_path
+                    )
                 self.model_path.unlink(missing_ok=True)
             except OSError:
                 pass
@@ -63,22 +87,37 @@ class VisionEmbedder:
                 DEFAULT_MODEL_URL,
                 headers={"User-Agent": "LectureLens/1.0"}
             )
-            with urllib.request.urlopen(req, timeout=10.0) as resp:
+            with urllib.request.urlopen(req, timeout=60.0) as resp:
                 with open(temp_path, "wb") as out_file:
                     while True:
                         chunk = resp.read(65536)
                         if not chunk:
                             break
                         out_file.write(chunk)
-            if temp_path.stat().st_size >= MIN_MODEL_BYTES:
-                temp_path.replace(self.model_path)
-                return True
-            temp_path.unlink(missing_ok=True)
-            logger.warning("Downloaded model file is too small or truncated")
-            return False
+            if temp_path.stat().st_size < MIN_MODEL_BYTES:
+                temp_path.unlink(missing_ok=True)
+                logger.warning("Downloaded model file is too small or truncated")
+                return False
+            if not self._verify_checksum(temp_path):
+                temp_path.unlink(missing_ok=True)
+                logger.error("Downloaded model file failed the checksum check and was discarded")
+                return False
+            temp_path.replace(self.model_path)
+            return True
         except Exception as error:
             logger.warning("Failed to download vision embedder model: %s", error)
             return False
+
+    def _verify_checksum(self, path: Path) -> bool:
+        expected = expected_model_sha256()
+        try:
+            actual = sha256_of_file(path)
+        except OSError as error:
+            logger.warning("could not read %s for verification: %s", path, error)
+            return False
+        if actual != expected:
+            return False
+        return True
 
     def _initialize_session(self) -> None:
         try:

@@ -178,6 +178,36 @@ def create_postgres_storage(settings: Settings) -> Any:
     )
 
 
+GATEWAY_API_KEY_FILENAME = "gateway_api_key.txt"
+
+
+def write_gateway_api_key(session_dir: Path, api_key: str) -> None:
+    """Persist the effective gateway API key for local clients.
+
+    The gateway generates an ephemeral key when none is configured, so the
+    key has to be discoverable by the student client running on the same
+    machine.
+    """
+    path = session_dir / GATEWAY_API_KEY_FILENAME
+    try:
+        session_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(path, api_key)
+        os.chmod(path, 0o600)
+    except OSError as error:
+        logger.warning("could not persist the gateway api key: %s", error)
+
+
+def read_gateway_api_key(session_dir: Path) -> Optional[str]:
+    path = session_dir / GATEWAY_API_KEY_FILENAME
+    if not path.exists():
+        return None
+    try:
+        key = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return key or None
+
+
 def build_runtime_context(
     namespace: argparse.Namespace,
     agent_name: Optional[str] = None

@@ -40,6 +40,9 @@ class FakeWebSocket:
         self.incoming = list(frames)
         self.sent: list[dict] = []
         self.closed = False
+        # Mirrors the handshake header a browser would send. None means a
+        # non-browser client, which sends no Origin at all.
+        self.origin: Optional[str] = None
 
     async def recv(self) -> str:
         if len(self.incoming) == 0:
@@ -91,8 +94,44 @@ class TestGatewaySecurity(GatewayTestBase):
         settings.output_dir = self.settings.output_dir
         settings.gateway_host = "0.0.0.0"
         settings.gateway_api_key = None
+        settings.gateway_require_api_key = False
         with self.assertRaises(GatewayConfigurationError):
             GatewayServer(settings, self.bus)
+
+    def test_gateway_generates_a_key_when_none_is_configured(self) -> None:
+        """The gateway used to accept every connection when no API key was
+        configured, which let any local process and any web page read the
+        notes and inject events."""
+        settings = Settings()
+        settings.output_dir = self.settings.output_dir
+        settings.gateway_host = "127.0.0.1"
+        settings.gateway_api_key = None
+        gateway = GatewayServer(settings, self.bus)
+        self.assertTrue(gateway.api_key)
+        self.assertGreaterEqual(len(gateway.api_key), 32)
+
+    async def test_handshake_from_an_unknown_origin_is_rejected(self) -> None:
+        """Browsers do not apply the same-origin policy to WebSockets, so a
+        page on any site could open ws://127.0.0.1:8765."""
+        socket = FakeWebSocket([hello(api_key="secret")])
+        socket.origin = "https://evil.example"
+        await self.gateway.handle_connection(socket)
+        self.assertEqual(socket.sent[0]["status"], "unauthorized")
+        self.assertTrue(socket.closed)
+
+    async def test_handshake_without_an_origin_is_allowed(self) -> None:
+        socket = FakeWebSocket([hello(api_key="secret")])
+        socket.origin = None
+        await self.gateway.handle_connection(socket)
+        self.assertEqual(socket.sent[0]["status"], "authenticated")
+
+    async def test_handshake_from_an_allowed_origin_is_accepted(self) -> None:
+        self.settings.gateway_allowed_origins = ["https://dashboard.example"]
+        gateway = GatewayServer(self.settings, self.bus)
+        socket = FakeWebSocket([hello(api_key="secret")])
+        socket.origin = "https://dashboard.example"
+        await gateway.handle_connection(socket)
+        self.assertEqual(socket.sent[0]["status"], "authenticated")
 
     def test_constant_time_key_compare(self) -> None:
         self.assertTrue(keys_match("abc", "abc"))

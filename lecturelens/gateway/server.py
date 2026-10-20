@@ -4,11 +4,12 @@ import binascii
 import hmac
 import inspect
 import json
+import secrets
 import sys
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from lecturelens.core.event_loop import ensure_event_loop_policy
 
@@ -22,7 +23,8 @@ from lecturelens.core.agent_runtime import (
     create_postgres_storage,
     create_redis_bus,
     execute_agent_main,
-    parse_runtime_arguments
+    parse_runtime_arguments,
+    write_gateway_api_key
 )
 from lecturelens.core.clock import SessionClock
 from lecturelens.core.concurrency import configure_pools, shutdown_pools
@@ -85,6 +87,43 @@ def keys_match(provided_key: str, expected_key: str) -> bool:
     return hmac.compare_digest(provided_key.encode("utf-8"), expected_key.encode("utf-8"))
 
 
+def extract_origin(websocket: Any) -> Optional[str]:
+    """Read the Origin header from a WebSocket handshake.
+
+    Supports both the modern ``websockets.asyncio`` connection object and the
+    legacy protocol object.
+    """
+    request = getattr(websocket, "request", None)
+    if request is not None:
+        headers = getattr(request, "headers", None)
+        if headers is not None:
+            origin = headers.get("Origin")
+            if origin:
+                return str(origin)
+    origin = getattr(websocket, "origin", None)
+    if origin:
+        return str(origin)
+    request_headers = getattr(websocket, "request_headers", None)
+    if request_headers is not None:
+        origin = request_headers.get("Origin")
+        if origin:
+            return str(origin)
+    return None
+
+
+def is_origin_allowed(origin: Optional[str], allowed_origins: Sequence[str]) -> bool:
+    """Decide whether a handshake Origin may be accepted.
+
+    A missing Origin means a non-browser client (the CLI, the Python client
+    or a remote capture agent), which is allowed. A present Origin means a
+    browser, and browsers neither enforce the same-origin policy for
+    WebSockets nor can be trusted, so the origin has to be listed explicitly.
+    """
+    if origin is None or origin == "":
+        return True
+    return origin in list(allowed_origins or [])
+
+
 def resolve_capture_epoch(message: dict[str, Any], clock: SessionClock) -> Optional[float]:
     raw_value = message.get("timestamp_epoch")
     if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
@@ -115,7 +154,20 @@ class GatewayServer:
         storage: Any = None,
         instance_id: Optional[str] = None
     ) -> None:
-        validate_gateway_binding(settings.gateway_host, settings.gateway_api_key)
+        configured_key = settings.gateway_api_key
+        self.api_key: str = ""
+        if isinstance(configured_key, str) and len(configured_key.strip()) > 0:
+            self.api_key = configured_key
+        elif getattr(settings, "gateway_require_api_key", True):
+            # Without a key every local process could read the lecture notes
+            # and inject audio, screen frames and events. Generate one so the
+            # gateway is never open by default.
+            self.api_key = secrets.token_urlsafe(32)
+            logger.warning(
+                "no LECTURELENS_GATEWAY_API_KEY configured; generated an ephemeral "
+                "gateway API key. Set the variable explicitly so clients can connect."
+            )
+        validate_gateway_binding(settings.gateway_host, self.api_key)
         self.settings: Settings = settings
         self.redis_bus: RedisBus = redis_bus
         self.llm_router: Any = llm_router
@@ -258,7 +310,7 @@ class GatewayServer:
     def authenticate(self, hello_message: dict[str, Any]) -> str:
         if hello_message.get("type") != "hello":
             raise PermissionError("expected hello message")
-        expected_key = self.settings.gateway_api_key
+        expected_key = self.api_key
         if expected_key:
             provided_key = hello_message.get("api_key")
             if not isinstance(provided_key, str) or not keys_match(provided_key, expected_key):
@@ -267,6 +319,19 @@ class GatewayServer:
         if not isinstance(session_id, str) or not is_valid_session_id(session_id):
             raise PermissionError("invalid session id")
         return session_id
+
+    def check_origin(self, websocket: Any) -> None:
+        """Reject browser handshakes from an unknown origin.
+
+        A web page can open ws://127.0.0.1:8765 even though the page itself
+        is served from another site, because browsers do not apply the
+        same-origin policy to WebSockets. Any handshake that carries an
+        Origin header therefore has to match the configured allowlist.
+        """
+        origin = extract_origin(websocket)
+        allowed = getattr(self.settings, "gateway_allowed_origins", []) or []
+        if not is_origin_allowed(origin, allowed):
+            raise PermissionError(f"origin not allowed: {origin}")
 
     async def handle_message(self, runtime: SessionRuntime, message: dict[str, Any]) -> dict[str, Any]:
         runtime.last_active = time.monotonic()
@@ -372,6 +437,12 @@ class GatewayServer:
         client_queue: Optional[asyncio.Queue] = None
         is_subscriber = False
         try:
+            try:
+                self.check_origin(websocket)
+            except PermissionError as error:
+                await self.send_json(websocket, {"status": "unauthorized", "error": str(error)})
+                await websocket.close()
+                return
             first_frame = await asyncio.wait_for(websocket.recv(), timeout=10.0)
             try:
                 hello_message = json.loads(first_frame)
@@ -621,6 +692,7 @@ async def main() -> None:
 
     gateway = GatewayServer(settings, redis_bus, router, storage=storage)
     try:
+        write_gateway_api_key(session_dir, gateway.api_key)
         await gateway.start()
         await gateway.serve_forever(should_stop=control.stop_requested)
     finally:

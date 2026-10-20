@@ -46,6 +46,7 @@ from lecturelens.core.agent_runtime import (
     create_postgres_storage,
     create_redis_bus,
     flag_exists,
+    read_gateway_api_key,
     read_heartbeats,
     set_flag
 )
@@ -829,6 +830,10 @@ def student(
         preferred_language=language,
         detail_level=detail
     )
+    if not api_key:
+        # The gateway generates an ephemeral key when none is configured and
+        # writes it next to the session, so a local client can pick it up.
+        api_key = read_gateway_api_key(settings.get_session_output_dir(session))
     student_output_dir = (settings.output_dir / safe_id).resolve()
     try:
         student_output_dir.relative_to(settings.output_dir.resolve())
@@ -950,6 +955,8 @@ def client(
     settings.monitor_index = monitor_index
     client_host = "127.0.0.1" if settings.gateway_host in ("0.0.0.0", "::") else settings.gateway_host
     resolved_server = server or f"ws://{client_host}:{settings.gateway_port}"
+    if not api_key:
+        api_key = read_gateway_api_key(settings.get_session_output_dir(session))
 
     async def run() -> None:
         stop_event = asyncio.Event()

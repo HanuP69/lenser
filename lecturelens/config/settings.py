@@ -79,6 +79,8 @@ class Settings(BaseSettings):
     gateway_host: str = Field(default="127.0.0.1")
     gateway_port: int = Field(default=8765)
     gateway_api_key: Optional[str] = Field(default=None)
+    gateway_require_api_key: bool = Field(default=True)
+    gateway_allowed_origins: list[str] = Field(default_factory=list)
     gateway_max_message_bytes: int = Field(default=33554432)
     gateway_messages_per_second: float = Field(default=20.0)
     gateway_max_sessions: int = Field(default=8)
