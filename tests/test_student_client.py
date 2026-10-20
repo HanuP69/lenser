@@ -384,6 +384,41 @@ class TestStudentClient(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(client.notes_file.exists())
         self.assertIn("Durable content", client.notes_file.read_text(encoding="utf-8"))
 
+    async def test_empty_ledger_clears_stale_markdown_file(self) -> None:
+        profile = StudentProfile(student_id="student_stale", preferred_language="English")
+        stale_file = self.output_dir / "lec_stale_personalized_notes.md"
+        stale_file.write_text("Stale notes from previous run\n", encoding="utf-8")
+        self.assertTrue(stale_file.exists())
+
+        client = StudentClient("ws://localhost:8765", "lec_stale", profile, self.output_dir)
+        self.assertFalse(stale_file.exists())
+
+    async def test_apply_segment_raises_and_preserves_cursor_on_reconciliation_failure(self) -> None:
+        profile = StudentProfile(student_id="student_fail", preferred_language="English")
+        client = StudentClient("ws://localhost:8765", "lec_fail", profile, self.output_dir)
+        self.assertEqual(client.last_sequence_number, 0)
+
+        seg = GeneralNoteSegment(
+            session_id="lec_fail",
+            sequence_number=1,
+            timestamp_epoch=1700000010.0,
+            start_time="00:01:00",
+            end_time="00:02:00",
+            heading="Section 1",
+            content="Important content",
+            key_points=[],
+            concept_tags=[]
+        )
+
+        with mock.patch.object(client, "reconcile_notes_from_ledger", return_value=False):
+            with self.assertRaises(RuntimeError) as ctx:
+                await client._apply_segment(seg)
+            self.assertIn("reconciling notes markdown file failed", str(ctx.exception))
+
+        self.assertEqual(client.last_sequence_number, 0)
+        self.assertTrue(client.pending_reconciliation)
+        self.assertEqual(client.load_persisted_sequence(), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

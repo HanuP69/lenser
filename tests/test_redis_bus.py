@@ -368,6 +368,44 @@ class TestRedisBusReliability(unittest.IsolatedAsyncioTestCase):
             finally:
                 await bus_post_recovery.close()
 
+    async def test_legacy_migration_idempotent_if_process_crashes_before_unlinking(self) -> None:
+        import json
+        with tempfile.TemporaryDirectory() as td:
+            outbox_file = Path(td) / "outbox.db"
+            legacy_file = outbox_file.with_suffix(".legacy_migration")
+            legacy_entry = {"stream": "stream_legacy", "data": {"session_id": "s1", "text": "legacy item"}}
+            legacy_file.write_text(json.dumps(legacy_entry) + "\n", encoding="utf-8")
+
+            bus1 = RedisBus(Settings().redis_url, outbox_path=outbox_file)
+            self.assertEqual(len(bus1.outbox), 1)
+            await bus1.close()
+
+            legacy_file.write_text(json.dumps(legacy_entry) + "\n", encoding="utf-8")
+            bus2 = RedisBus(Settings().redis_url, outbox_path=outbox_file)
+            self.assertEqual(len(bus2.outbox), 1)
+            self.assertFalse(legacy_file.exists())
+            await bus2.close()
+
+    async def test_outbox_starts_background_worker_when_pending_items_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            outbox_file = Path(td) / "outbox.db"
+            bus1 = RedisBus(Settings().redis_url, outbox_path=outbox_file)
+
+            async def fail_pub(s, e):
+                raise redis_module.ConnectionError("offline")
+
+            bus1.publish = fail_pub
+            chunk = make_chunk("pending event")
+            await bus1.publish_resilient("stream_worker", chunk)
+            await bus1.close()
+
+            bus2 = RedisBus(Settings().redis_url, outbox_path=outbox_file)
+            self.assertEqual(len(bus2.outbox), 1)
+            bus2.ensure_background_worker()
+            self.assertIsNotNone(bus2._retry_task)
+            self.assertFalse(bus2._retry_task.done())
+            await bus2.close()
+
 
 if __name__ == "__main__":
     unittest.main()

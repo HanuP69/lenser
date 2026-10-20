@@ -527,6 +527,39 @@ class TestPostgresSchemaFallback(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(dedup_idx, 0)
         self.assertGreater(index_idx, dedup_idx)
 
+    async def test_init_schema_raises_runtime_error_when_embeddings_migration_fails(self) -> None:
+        class FailingMigrateCursor:
+            async def execute(self, sql: str, params: Any = None) -> None:
+                if "idx_embeddings_session_source" in sql:
+                    raise RuntimeError("simulated index creation failure")
+
+            async def __aenter__(self) -> "FailingMigrateCursor":
+                return self
+
+            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                pass
+
+        class FailingMigrateConn:
+            def cursor(self) -> FailingMigrateCursor:
+                return FailingMigrateCursor()
+
+            async def __aenter__(self) -> "FailingMigrateConn":
+                return self
+
+            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                pass
+
+            def transaction(self) -> "FailingMigrateConn":
+                return self
+
+        storage = PostgresStorage("postgresql://mock/db")
+        storage._connection = FailingMigrateConn()
+        storage.get_connection = mock.AsyncMock(return_value=FailingMigrateConn())
+
+        with self.assertRaises(RuntimeError) as ctx:
+            await storage.init_schema()
+        self.assertIn("failed to initialize embeddings schema", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

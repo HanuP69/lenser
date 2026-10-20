@@ -287,6 +287,17 @@ class TestSyncEndToEnd(SyncTestBase):
         lines = agent.timeline_path.read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(lines), 1)
 
+    def test_written_event_ids_bounded_by_fingerprint_history_limit(self) -> None:
+        agent = SyncAgent(self.settings, self.bus, SessionClock(), "test_sync_bound_session")
+        agent.fingerprint_history_limit = 5
+        for i in range(10):
+            agent.remember_event_id(f"evt_{i}")
+        self.assertEqual(len(agent.written_event_ids), 5)
+        self.assertNotIn("evt_0", agent.written_event_ids)
+        self.assertNotIn("evt_4", agent.written_event_ids)
+        self.assertIn("evt_5", agent.written_event_ids)
+        self.assertIn("evt_9", agent.written_event_ids)
+
 
 if __name__ == "__main__":
     unittest.main()

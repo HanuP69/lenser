@@ -77,6 +77,7 @@ class SyncAgent:
         self.written_fingerprints: set[str] = set()
         self.written_event_ids: set[str] = set()
         self.fingerprint_order: deque = deque()
+        self.event_id_order: deque = deque()
         self.duplicates_skipped: int = 0
         self.recent_anchors: list[AnchorRecord] = []
         self.buffer_lock: asyncio.Lock = asyncio.Lock()
@@ -102,7 +103,7 @@ class SyncAgent:
                 continue
             self.remember_fingerprint(entry_fingerprint(restored))
             if restored.event_id:
-                self.written_event_ids.add(restored.event_id)
+                self.remember_event_id(restored.event_id)
 
     def remember_fingerprint(self, fingerprint: str) -> None:
         if fingerprint in self.written_fingerprints:
@@ -111,6 +112,16 @@ class SyncAgent:
         self.fingerprint_order.append(fingerprint)
         while len(self.fingerprint_order) > self.fingerprint_history_limit:
             self.written_fingerprints.discard(self.fingerprint_order.popleft())
+
+    def remember_event_id(self, event_id: Optional[str]) -> None:
+        if not event_id:
+            return
+        if event_id in self.written_event_ids:
+            return
+        self.written_event_ids.add(event_id)
+        self.event_id_order.append(event_id)
+        while len(self.event_id_order) > self.fingerprint_history_limit:
+            self.written_event_ids.discard(self.event_id_order.popleft())
 
     def build_stream_name(self, source_type: str) -> str:
         return f"lecturelens:{self.session_id}:stream:{source_type}"
@@ -397,7 +408,7 @@ class SyncAgent:
             for buffered in ready:
                 self.remember_fingerprint(entry_fingerprint(buffered.entry))
                 if buffered.entry.event_id:
-                    self.written_event_ids.add(buffered.entry.event_id)
+                    self.remember_event_id(buffered.entry.event_id)
                 if buffered.message_id is not None:
                     self.pending_message_ids.discard((buffered.stream_name or "", buffered.message_id))
                 await self.acknowledge(buffered.stream_name, buffered.group_name, buffered.message_id)

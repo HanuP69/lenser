@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import inspect
 import json
 from pathlib import Path
@@ -77,6 +78,7 @@ class RedisBus:
         if self.outbox_path:
             self._init_db()
             self._load_outbox()
+            self.ensure_background_worker()
 
     def _init_db(self) -> None:
         if not self.outbox_path:
@@ -127,7 +129,11 @@ class RedisBus:
 
         if legacy_items:
             for s, p in legacy_items:
-                ev_id = uuid.uuid4().hex
+                if isinstance(p, dict) and p.get("event_id"):
+                    ev_id = str(p["event_id"])
+                else:
+                    payload_str = json.dumps(p, sort_keys=True)
+                    ev_id = hashlib.sha256(f"{s}:{payload_str}".encode()).hexdigest()[:32]
                 self._db_conn.execute(
                     "INSERT OR IGNORE INTO outbox_entries (event_id, stream_name, payload, created_at) VALUES (?, ?, ?, ?)",
                     (ev_id, s, json.dumps(p), time.time())
@@ -209,7 +215,14 @@ class RedisBus:
 
     def start_background_worker(self) -> None:
         if self._retry_task is None or self._retry_task.done():
-            self._retry_task = asyncio.create_task(self._retry_worker_loop())
+            try:
+                self._retry_task = asyncio.create_task(self._retry_worker_loop())
+            except RuntimeError:
+                pass
+
+    def ensure_background_worker(self) -> None:
+        if self.outbox and (self._retry_task is None or self._retry_task.done()):
+            self.start_background_worker()
 
     async def _retry_worker_loop(self) -> None:
         while True:
@@ -255,6 +268,7 @@ class RedisBus:
             return flushed
 
     async def publish(self, stream_name: str, event: BaseModel | dict[str, Any]) -> str:
+        self.ensure_background_worker()
         if isinstance(event, BaseModel):
             event_data = event_to_redis_fields(event)
         elif isinstance(event, dict):
@@ -445,6 +459,7 @@ class RedisBus:
         backlog_cursor = "0"
         last_reclaim_time = 0.0
         group_ready = False
+        self.ensure_background_worker()
         while True:
             try:
                 if not group_ready:

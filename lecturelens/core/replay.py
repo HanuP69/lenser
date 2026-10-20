@@ -3,6 +3,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Any, Callable, Optional
+import uuid
 
 from lecturelens.core.redis_bus import RedisBus
 from lecturelens.schemas.events import SlideCaptured, TimelineEntry, TranscriptChunk
@@ -71,7 +72,11 @@ class ReplayEngine:
             last_timestamp = current_timestamp
 
             session_id = target_session_id or entry.session_id
-            replayed_entry = entry.model_copy(update={"session_id": session_id})
+            if target_session_id is not None and target_session_id != entry.session_id:
+                new_event_id = uuid.uuid4().hex
+                replayed_entry = entry.model_copy(update={"session_id": session_id, "event_id": new_event_id})
+            else:
+                replayed_entry = entry.model_copy(update={"session_id": session_id})
 
             if on_entry is not None:
                 result = on_entry(replayed_entry)
@@ -91,6 +96,7 @@ class ReplayEngine:
                         meta = replayed_entry.metadata or {}
                         chunk = TranscriptChunk(
                             session_id=session_id,
+                            event_id=replayed_entry.event_id,
                             chunk_index=int(meta.get("chunk_index", 0) or 0),
                             timestamp_epoch=replayed_entry.timestamp_epoch,
                             start_seconds=float(meta.get("start_seconds", replayed_entry.elapsed_seconds or 0.0) or 0.0),
@@ -113,6 +119,7 @@ class ReplayEngine:
                         meta = replayed_entry.metadata or {}
                         slide = SlideCaptured(
                             session_id=session_id,
+                            event_id=replayed_entry.event_id,
                             slide_number=int(meta.get("slide_number", 1) or 1),
                             timestamp_epoch=replayed_entry.timestamp_epoch,
                             image_file_path=str(meta.get("image_file_path", "") or ""),

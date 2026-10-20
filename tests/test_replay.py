@@ -43,8 +43,24 @@ class TestReplayEngine(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(count, 4)
         self.assertEqual(len(received), 4)
         self.assertEqual(received[0].session_id, "new_target")
-        self.assertEqual(received[0].event_id, "evt_0")
-        self.assertEqual(received[3].event_id, "evt_3")
+        self.assertNotEqual(received[0].event_id, "evt_0")
+        self.assertNotEqual(received[3].event_id, "evt_3")
+
+        same_session_received: list[TimelineEntry] = []
+        await engine.replay(target_session_id="source_sess", on_entry=same_session_received.append, publish_to_timeline_stream=False)
+        self.assertEqual(same_session_received[0].event_id, "evt_0")
+        self.assertEqual(same_session_received[3].event_id, "evt_3")
+
+    async def test_replay_cross_session_source_streams_share_new_event_id(self) -> None:
+        self.write_sample_timeline(2)
+        mock_bus = mock.AsyncMock()
+        engine = ReplayEngine(self.timeline_path, redis_bus=mock_bus, speed=0.0)
+        await engine.replay(target_session_id="dest_sess", publish_to_timeline_stream=True, publish_to_source_streams=True)
+        self.assertGreaterEqual(mock_bus.publish_resilient.await_count, 4)
+        timeline_entry = mock_bus.publish_resilient.call_args_list[0][0][1]
+        source_chunk = mock_bus.publish_resilient.call_args_list[1][0][1]
+        self.assertEqual(timeline_entry.event_id, source_chunk.event_id)
+        self.assertNotEqual(timeline_entry.event_id, "evt_0")
 
     async def test_replay_publishes_to_redis_stream(self) -> None:
         self.write_sample_timeline(2)

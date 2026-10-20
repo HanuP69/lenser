@@ -141,16 +141,18 @@ class StudentClient:
         self.state_file = output_dir / f"{session_id}_{profile.student_id}_state.json"
         self.ledger_file = output_dir / f"{session_id}_{profile.student_id}_ledger.db"
         self._init_ledger()
-        self.last_sequence_number = self.load_persisted_sequence()
         self.notes_file = output_dir / f"{session_id}_personalized_notes.md"
-        self.reconcile_notes_from_ledger()
+        reconciled = self.reconcile_notes_from_ledger()
+        self.pending_reconciliation = not reconciled
+        self.last_sequence_number = self.load_persisted_sequence()
         self.received_segments: list[GeneralNoteSegment] = []
         self.pending_segments: dict[int, GeneralNoteSegment] = {}
         self.is_running = False
 
-    def reconcile_notes_from_ledger(self) -> None:
+    def reconcile_notes_from_ledger(self) -> bool:
         if not hasattr(self, "ledger_file") or not self.ledger_file.exists():
-            return
+            self.pending_reconciliation = False
+            return True
         try:
             conn = sqlite3.connect(str(self.ledger_file), timeout=5.0)
             cur = conn.cursor()
@@ -158,7 +160,14 @@ class StudentClient:
             rows = cur.fetchall()
             conn.close()
             if not rows:
-                return
+                if self.notes_file.exists():
+                    try:
+                        self.notes_file.unlink()
+                    except Exception:
+                        with open(self.notes_file, "w", encoding="utf-8") as handle:
+                            handle.write("")
+                self.pending_reconciliation = False
+                return True
             segments_text = []
             for _, content in rows:
                 if content and content.strip():
@@ -176,8 +185,12 @@ class StudentClient:
                     except Exception:
                         pass
                 tmp_file.replace(self.notes_file)
+            self.pending_reconciliation = False
+            return True
         except Exception as err:
             logger.warning("failed to reconcile notes from ledger: %s", err)
+            self.pending_reconciliation = True
+            return False
 
     def _init_ledger(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -206,6 +219,8 @@ class StudentClient:
                     persisted = int(data.get("last_sequence_number", 0))
             except Exception:
                 pass
+        if getattr(self, "pending_reconciliation", False):
+            return persisted
         if hasattr(self, "ledger_file") and self.ledger_file.exists():
             try:
                 conn = sqlite3.connect(str(self.ledger_file), timeout=5.0)
@@ -242,8 +257,11 @@ class StudentClient:
             logger.error("saving to student ledger failed: %s", ledger_err)
             raise RuntimeError(f"saving to student ledger failed: {ledger_err}") from ledger_err
 
-        self.reconcile_notes_from_ledger()
+        if not self.reconcile_notes_from_ledger():
+            self.pending_reconciliation = True
+            raise RuntimeError("reconciling notes markdown file failed")
 
+        self.pending_reconciliation = False
         self.received_segments.append(segment)
         self.last_sequence_number = max(self.last_sequence_number, segment.sequence_number)
         self.save_persisted_sequence()
@@ -263,7 +281,7 @@ class StudentClient:
         websocket: Optional[Any] = None
     ) -> str:
         seq = segment.sequence_number
-        if seq <= self.last_sequence_number:
+        if seq <= self.last_sequence_number and not getattr(self, "pending_reconciliation", False):
             return ""
 
         if seq > self.last_sequence_number + 1:

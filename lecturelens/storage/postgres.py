@@ -162,7 +162,8 @@ class PostgresStorage:
                     """)
                     await cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_session_source ON embeddings (session_id, source_id);")
         except Exception as schema_err:
-            logger.debug("embeddings schema update skipped: %s", schema_err)
+            logger.error("failed to initialize embeddings schema: %s", schema_err)
+            raise RuntimeError(f"failed to initialize embeddings schema: {schema_err}") from schema_err
 
         try:
             async with self.transaction() as conn:

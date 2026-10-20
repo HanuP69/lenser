@@ -956,7 +956,12 @@ def replay(
         fail(f"No timeline.jsonl found in {session_dir}")
 
     async def run() -> tuple[int, int, int]:
-        bus = create_redis_bus(settings, component_name="replay")
+        outbox_file = session_dir / "redis_outbox_replay.db"
+        bus = create_redis_bus(
+            settings,
+            outbox_path=outbox_file,
+            component_name=f"replay_{session_id}"
+        )
         try:
             engine = ReplayEngine(timeline_path, redis_bus=bus, speed=speed)
             total = await engine.replay(target_session_id=target_session or session_id)

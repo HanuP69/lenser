@@ -402,7 +402,8 @@ class TestCliCommands(unittest.TestCase):
             cli_main.replay(session="lec1", speed=2.0, target_session="target_lec")
             mock_bus_factory.assert_called_once()
             _, kwargs = mock_bus_factory.call_args
-            self.assertEqual(kwargs.get("component_name"), "replay")
+            self.assertEqual(kwargs.get("component_name"), "replay_lec1")
+            self.assertEqual(kwargs.get("outbox_path"), self.session_dir / "redis_outbox_replay.db")
             mock_replay.assert_awaited_once_with(target_session_id="target_lec")
 
 
