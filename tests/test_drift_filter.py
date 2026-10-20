@@ -216,6 +216,20 @@ class TestContextDriftFilterBehavior(unittest.TestCase):
         self.assertEqual(self.filter.accepted_count, 0)
         self.assertEqual(len(self.filter.pending_quarantine_entries), 0)
 
+    def test_quarantine_flushed_in_order_before_important_entry(self) -> None:
+        self.filter.check_entry("Chapter 4 Quadratic Equation Master Plan")
+        entries = [
+            {"content": "Welcome to chapter 5 arithmetic progressions", "source_type": "transcript", "importance_flags": []},
+            {"content": "Arithmetic progressions common difference and nth term", "source_type": "transcript", "importance_flags": []},
+            {"content": "Exam will cover all problems next week", "source_type": "transcript", "importance_flags": ["exam_relevant"]}
+        ]
+        kept = self.filter.filter_batch_entries(entries)
+        self.assertEqual(len(kept), 3)
+        self.assertEqual(kept[0]["content"], "Welcome to chapter 5 arithmetic progressions")
+        self.assertEqual(kept[1]["content"], "Arithmetic progressions common difference and nth term")
+        self.assertEqual(kept[2]["content"], "Exam will cover all problems next week")
+        self.assertEqual(len(self.filter.pending_quarantine_entries), 0)
+
 
 class TestRecordedTimelineFiltering(unittest.TestCase):
     def test_yt_test_timeline_filtering(self) -> None:

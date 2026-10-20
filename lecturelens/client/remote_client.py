@@ -121,19 +121,6 @@ async def run_remote_client(
                 extra_sockets: list[Any] = []
                 session_stop_event = asyncio.Event()
 
-                if use_audio:
-                    tasks.append(asyncio.create_task(stream_audio(audio_socket, settings, session_stop_event)))
-
-                if use_screen:
-                    extra_context = connect(server_url, max_size=settings.gateway_max_message_bytes)
-                    extra_socket = await extra_context.__aenter__()
-                    extra_sockets.append(extra_context)
-                    await extra_socket.send(json.dumps({"type": "hello", "api_key": api_key, "session_id": session_id}))
-                    reply = json.loads(await extra_socket.recv())
-                    if reply.get("status") != "authenticated":
-                        raise PermissionError(str(reply))
-                    tasks.append(asyncio.create_task(stream_screen(extra_socket, settings, session_stop_event)))
-
                 async def watch_stop() -> None:
                     await stop_event.wait()
                     session_stop_event.set()
@@ -142,6 +129,19 @@ async def run_remote_client(
                 tasks.append(stop_watcher)
 
                 try:
+                    if use_audio:
+                        tasks.append(asyncio.create_task(stream_audio(audio_socket, settings, session_stop_event)))
+
+                    if use_screen:
+                        extra_context = connect(server_url, max_size=settings.gateway_max_message_bytes)
+                        extra_socket = await extra_context.__aenter__()
+                        extra_sockets.append(extra_context)
+                        await extra_socket.send(json.dumps({"type": "hello", "api_key": api_key, "session_id": session_id}))
+                        reply = json.loads(await extra_socket.recv())
+                        if reply.get("status") != "authenticated":
+                            raise PermissionError(str(reply))
+                        tasks.append(asyncio.create_task(stream_screen(extra_socket, settings, session_stop_event)))
+
                     if len(tasks) == 1 and tasks[0] is stop_watcher:
                         return
                     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

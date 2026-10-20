@@ -143,7 +143,12 @@ class GatewayServer:
                 try:
                     q.put_nowait(payload)
                 except asyncio.QueueFull:
-                    logger.warning("subscriber queue full for %s, dropping slow frame", session_id)
+                    logger.warning("subscriber queue full for %s, closing slow subscriber socket to trigger replay", session_id)
+                    dead_sockets.append(ws)
+                    try:
+                        asyncio.create_task(ws.close(code=1008, reason="subscriber queue overflow"))
+                    except Exception:
+                        pass
                 except Exception:
                     dead_sockets.append(ws)
             for dead in dead_sockets:

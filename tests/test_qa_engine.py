@@ -1,8 +1,10 @@
+import asyncio
 import hashlib
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from langchain_core.messages import AIMessage
 
@@ -123,6 +125,42 @@ class TestQAEngine(unittest.IsolatedAsyncioTestCase):
         results = await engine.retrieve("anything")
         self.assertEqual(results, [])
         self.assertFalse(called)
+
+    async def test_embedding_model_change_recreates_collection(self) -> None:
+        await self.engine.build_index()
+        self.assertGreater(self.engine.collection.count(), 0)
+        engine2 = QAEngine(
+            self.session_dir,
+            "http://localhost:11434",
+            self.router,
+            embedding_model="new_custom_embedder"
+        )
+        self.assertEqual(engine2.collection.count(), 0)
+
+    async def test_missing_postgres_chunks_retried_from_chroma(self) -> None:
+        await self.engine.build_index()
+        self.assertGreater(self.engine.collection.count(), 0)
+        inserted_records = []
+        mock_storage = mock.MagicMock()
+        mock_storage._lock = asyncio.Lock()
+        fake_cursor = mock.AsyncMock()
+        fake_cursor.fetchall = mock.AsyncMock(return_value=[])
+        fake_cursor.__aenter__ = mock.AsyncMock(return_value=fake_cursor)
+        fake_cursor.__aexit__ = mock.AsyncMock(return_value=None)
+        fake_conn = mock.MagicMock()
+        fake_conn.cursor = mock.MagicMock(return_value=fake_cursor)
+        mock_storage.get_connection = mock.AsyncMock(return_value=fake_conn)
+
+        async def record_insert(session_id, source_type, source_id, chunk_text, vector):
+            inserted_records.append((source_id, chunk_text, vector))
+            return True
+
+        mock_storage.insert_embedding = mock.AsyncMock(side_effect=record_insert)
+        self.engine.storage = mock_storage
+        self.embedded_texts.clear()
+        await self.engine.build_index()
+        self.assertEqual(len(self.embedded_texts), 0)
+        self.assertGreater(len(inserted_records), 0)
 
 
 if __name__ == "__main__":

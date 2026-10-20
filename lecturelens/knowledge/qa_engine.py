@@ -67,7 +67,25 @@ class QAEngine:
         self.timeline_path: Path = self.session_dir / "timeline.jsonl"
         self.notes_path: Path = self.session_dir / "notes.md"
         self.chroma_client: Any = chromadb.PersistentClient(path=str(self.session_dir / "chroma_db"))
+        meta_file = self.session_dir / "chroma_db" / "index_meta.json"
+        if meta_file.exists():
+            try:
+                with open(meta_file, "r", encoding="utf-8") as mf:
+                    stored_meta = json.load(mf)
+                if stored_meta.get("embedding_model") != self.embedding_model:
+                    try:
+                        self.chroma_client.delete_collection("lecture_chunks")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         self.collection: Any = self.chroma_client.get_or_create_collection(name="lecture_chunks")
+        try:
+            meta_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(meta_file, "w", encoding="utf-8") as mf:
+                json.dump({"embedding_model": self.embedding_model}, mf)
+        except Exception:
+            pass
 
     async def generate_embeddings(self, texts: list[str]) -> list[list[float]]:
         embeddings: list[list[float]] = []
@@ -197,6 +215,29 @@ class QAEngine:
             seen_new.add(chunk.chunk_id)
             new_chunks.append(chunk)
 
+        pg_missing_chunks: list[IndexedChunk] = []
+        if self.storage is not None and hasattr(self.storage, "insert_embedding"):
+            already_in_chroma = [c for c in wanted_chunks if c.chunk_id in existing_ids]
+            if already_in_chroma:
+                existing_in_pg: set[str] = set()
+                if hasattr(self.storage, "get_connection") and hasattr(self.storage, "_lock"):
+                    try:
+                        async with self.storage._lock:
+                            conn = await self.storage.get_connection()
+                            async with conn.cursor() as cur:
+                                await cur.execute(
+                                    "SELECT source_id FROM embeddings WHERE session_id = %s;",
+                                    (self.session_dir.name,)
+                                )
+                                rows = await cur.fetchall()
+                                for r in rows:
+                                    existing_in_pg.add(str(r["source_id"]))
+                    except Exception as pg_check_err:
+                        logger.debug("checking postgres indexed chunks failed: %s", pg_check_err)
+                for c in already_in_chroma:
+                    if c.chunk_id not in existing_in_pg:
+                        pg_missing_chunks.append(c)
+
         if len(new_chunks) > 0:
             texts: list[str] = []
             for chunk in new_chunks:
@@ -222,6 +263,31 @@ class QAEngine:
             self.collection.upsert(
                 ids=ids, embeddings=vectors, documents=texts, metadatas=metadatas
             )
+
+        if len(pg_missing_chunks) > 0 and self.storage is not None and hasattr(self.storage, "insert_embedding"):
+            try:
+                chroma_data = self.collection.get(
+                    ids=[c.chunk_id for c in pg_missing_chunks],
+                    include=["embeddings"]
+                )
+                chroma_id_to_vec = {}
+                for cid, cvec in zip(chroma_data.get("ids", []), chroma_data.get("embeddings", [])):
+                    chroma_id_to_vec[cid] = cvec
+                for chunk in pg_missing_chunks:
+                    vec = chroma_id_to_vec.get(chunk.chunk_id)
+                    if vec is not None:
+                        try:
+                            await self.storage.insert_embedding(
+                                session_id=self.session_dir.name,
+                                source_type=chunk.source,
+                                source_id=chunk.chunk_id,
+                                chunk_text=chunk.text,
+                                vector=vec
+                            )
+                        except Exception as retry_err:
+                            logger.debug("retrying embedding to postgres failed: %s", retry_err)
+            except Exception as fetch_err:
+                logger.debug("fetching chroma vectors for postgres retry failed: %s", fetch_err)
         return int(self.collection.count())
 
     async def retrieve(self, question: str) -> list[tuple[str, str]]:

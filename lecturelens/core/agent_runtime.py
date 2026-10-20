@@ -144,12 +144,22 @@ def parse_runtime_arguments(argument_list: Optional[list[str]] = None) -> argpar
     return namespace
 
 
-def create_redis_bus(settings: Settings) -> RedisBus:
+def create_redis_bus(settings: Settings, outbox_path: Optional[Path] = None) -> RedisBus:
+    resolved_outbox = outbox_path or (settings.output_dir / "redis_outbox.jsonl")
     return RedisBus(
         settings.redis_url,
         stream_max_length=getattr(settings, "stream_max_length", 200000),
         reclaim_idle_ms=getattr(settings, "reclaim_idle_ms", 30000),
-        retry_ttl_seconds=getattr(settings, "retry_key_ttl_seconds", getattr(settings, "redis_retry_ttl_seconds", 86400))
+        retry_ttl_seconds=getattr(settings, "retry_key_ttl_seconds", getattr(settings, "redis_retry_ttl_seconds", 86400)),
+        outbox_path=resolved_outbox
+    )
+
+
+def create_postgres_storage(settings: Settings) -> Any:
+    from lecturelens.storage.postgres import PostgresStorage
+    return PostgresStorage(
+        settings.postgres_url,
+        query_limit=getattr(settings, "postgres_query_limit", 1000)
     )
 
 
@@ -166,7 +176,7 @@ def build_runtime_context(namespace: argparse.Namespace) -> RuntimeContext:
 
     session_dir = settings.create_session_directories(session_id)
     session_clock = SessionClock.load_or_create(session_dir / "clock.json")
-    redis_bus = create_redis_bus(settings)
+    redis_bus = create_redis_bus(settings, outbox_path=session_dir / "redis_outbox.jsonl")
     configure_pools(settings.thread_pool_max_workers, settings.process_pool_max_workers)
     return RuntimeContext(
         settings=settings,

@@ -152,6 +152,14 @@ class TestStructuringBasics(StructuringTestBase):
         restarted = self.make_agent()
         self.assertEqual(restarted.sequence_number, 2)
 
+    async def test_returned_running_context_respects_max_characters(self) -> None:
+        self.settings.context_max_characters = 10
+        agent = self.make_agent()
+        batches = agent.read_pending_batches()
+        returned_context = await agent.process_single_batch(batches[0], "initial context string")
+        self.assertLessEqual(len(returned_context), 10)
+        self.assertEqual(len(agent.load_state()["running_context"]), len(returned_context))
+
 
 class TestStructuringRestartAndIdempotency(StructuringTestBase):
     async def test_restart_does_not_duplicate_notes(self) -> None:

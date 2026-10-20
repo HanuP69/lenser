@@ -643,6 +643,9 @@ class StructuringAgent:
         self.current_overlap = next_overlap
 
         new_context = str(result_state.get("running_context", running_context))
+        max_context = getattr(self.settings, "context_max_characters", 4000)
+        if max_context > 0 and len(new_context) > max_context:
+            new_context = new_context[-max_context:]
         self.save_state(new_context, batch.end_offset, next_overlap)
         return new_context
 

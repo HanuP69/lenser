@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import json
+from pathlib import Path
 import time
 from typing import Any, Awaitable, Callable, Optional
 
@@ -51,7 +52,8 @@ class RedisBus:
         reclaim_idle_ms: int = 30000,
         reclaim_interval_seconds: float = 15.0,
         retry_ttl_seconds: int = 86400,
-        outbox_max_size: int = 1000
+        outbox_max_size: int = 1000,
+        outbox_path: Optional[Path] = None
     ) -> None:
         self.redis_url: str = redis_url
         self.client: redis.Redis = redis.from_url(redis_url, decode_responses=True)
@@ -61,16 +63,50 @@ class RedisBus:
         self.reclaim_interval_seconds: float = reclaim_interval_seconds
         self.retry_ttl_seconds: int = retry_ttl_seconds
         self.outbox_max_size: int = outbox_max_size
-        self.outbox: list[tuple[str, BaseModel]] = []
+        self.outbox_path: Optional[Path] = Path(outbox_path) if outbox_path else None
+        self.outbox: list[tuple[str, Any]] = []
         self._outbox_lock: asyncio.Lock = asyncio.Lock()
         self.failure_counts: dict[str, int] = {}
+        if self.outbox_path and self.outbox_path.exists():
+            self._load_outbox()
+
+    def _load_outbox(self) -> None:
+        if not self.outbox_path or not self.outbox_path.exists():
+            return
+        try:
+            with open(self.outbox_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if stripped:
+                        item = json.loads(stripped)
+                        stream_name = item.get("stream")
+                        payload = item.get("data")
+                        if stream_name and payload:
+                            self.outbox.append((stream_name, payload))
+        except Exception as err:
+            logger.warning("loading persistent outbox failed: %s", err)
+
+    def _save_outbox(self) -> None:
+        if not self.outbox_path:
+            return
+        try:
+            self.outbox_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = self.outbox_path.with_suffix(".tmp")
+            with open(temp_path, "w", encoding="utf-8") as f:
+                for stream_name, event in self.outbox:
+                    data = event_to_redis_fields(event) if isinstance(event, BaseModel) else event
+                    line = json.dumps({"stream": stream_name, "data": data})
+                    f.write(line + "\n")
+            temp_path.replace(self.outbox_path)
+        except Exception as err:
+            logger.warning("saving persistent outbox failed: %s", err)
 
     async def flush_outbox(self) -> int:
         async with self._outbox_lock:
             if not self.outbox:
                 return 0
             flushed = 0
-            remaining: list[tuple[str, BaseModel]] = []
+            remaining: list[tuple[str, Any]] = []
             for stream_name, event in self.outbox:
                 try:
                     await self.publish(stream_name, event)
@@ -78,12 +114,18 @@ class RedisBus:
                 except Exception:
                     remaining.append((stream_name, event))
             self.outbox = remaining
+            self._save_outbox()
             if flushed > 0:
                 logger.info("flushed %d events from outbox (%d remaining)", flushed, len(self.outbox))
             return flushed
 
-    async def publish(self, stream_name: str, event: BaseModel) -> str:
-        event_data = event_to_redis_fields(event)
+    async def publish(self, stream_name: str, event: BaseModel | dict[str, Any]) -> str:
+        if isinstance(event, BaseModel):
+            event_data = event_to_redis_fields(event)
+        elif isinstance(event, dict):
+            event_data = {str(k): str(v) for k, v in event.items()}
+        else:
+            event_data = event_to_redis_fields(event)
         entry_id: str = await self.client.xadd(
             stream_name,
             event_data,
@@ -97,14 +139,10 @@ class RedisBus:
         try:
             return await self.publish(stream_name, event)
         except (redis.RedisError, OSError) as error:
-            logger.warning("publish failed for %s: %s, buffering in outbox", stream_name, error)
+            logger.warning("publish failed for %s: %s, buffering in persistent outbox", stream_name, error)
             async with self._outbox_lock:
-                if len(self.outbox) < self.outbox_max_size:
-                    self.outbox.append((stream_name, event))
-                else:
-                    logger.error("outbox full (%d items), dropping oldest event", self.outbox_max_size)
-                    self.outbox.pop(0)
-                    self.outbox.append((stream_name, event))
+                self.outbox.append((stream_name, event))
+                self._save_outbox()
             return None
 
     async def ensure_consumer_group(self, stream_name: str, group_name: str) -> None:

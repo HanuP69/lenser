@@ -1,6 +1,8 @@
 import asyncio
+import tempfile
 import time
 import unittest
+from pathlib import Path
 
 import redis.asyncio as redis_module
 
@@ -185,6 +187,36 @@ class TestRedisBusReliability(unittest.IsolatedAsyncioTestCase):
         result = await bus.publish_resilient("lecturelens:test_buffer:stream", make_chunk("a"))
         self.assertIsNone(result)
         await bus.close()
+
+    async def test_persistent_outbox_saves_and_reloads_on_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            outbox_file = Path(td) / "outbox.jsonl"
+            bus1 = RedisBus(Settings().redis_url, outbox_path=outbox_file)
+
+            async def failing_publish(stream_name, event):
+                raise redis_module.ConnectionError("offline")
+
+            bus1.publish = failing_publish
+            res = await bus1.publish_resilient("stream1", make_chunk("event 1"))
+            self.assertIsNone(res)
+            self.assertTrue(outbox_file.exists())
+            await bus1.close()
+
+            bus2 = RedisBus(Settings().redis_url, outbox_path=outbox_file)
+            self.assertEqual(len(bus2.outbox), 1)
+            self.assertEqual(bus2.outbox[0][0], "stream1")
+
+            published_events = []
+            async def ok_publish(stream_name, event):
+                published_events.append((stream_name, event))
+                return "1-0"
+
+            bus2.publish = ok_publish
+            flushed = await bus2.flush_outbox()
+            self.assertEqual(flushed, 1)
+            self.assertEqual(len(bus2.outbox), 0)
+            self.assertEqual(len(published_events), 1)
+            await bus2.close()
 
     async def test_consume_survives_read_errors_with_backoff(self) -> None:
         original_read = self.bus.read_group_messages

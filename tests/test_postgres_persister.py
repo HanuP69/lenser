@@ -358,6 +358,51 @@ class TestPostgresSchemaFallback(unittest.IsolatedAsyncioTestCase):
         await storage.init_schema()
         self.assertTrue(any("CREATE TABLE IF NOT EXISTS timeline_events" in s for s in executed_sqls))
 
+    async def test_get_timeline_events_descending_orders_and_reverses(self) -> None:
+        executed_queries: list[tuple[str, Any]] = []
+
+        class FakeTimelineCursor:
+            def __init__(self) -> None:
+                self.results = [
+                    {"event_id": "e2", "timestamp_epoch": 200.0, "content": "Second"},
+                    {"event_id": "e1", "timestamp_epoch": 100.0, "content": "First"}
+                ]
+
+            async def execute(self, sql: str, params: Any = None) -> None:
+                executed_queries.append((sql, params))
+
+            async def fetchall(self) -> list[dict[str, Any]]:
+                return list(self.results)
+
+            async def __aenter__(self) -> "FakeTimelineCursor":
+                return self
+
+            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                pass
+
+        class FakeTimelineConn:
+            def cursor(self) -> FakeTimelineCursor:
+                return FakeTimelineCursor()
+
+            async def __aenter__(self) -> "FakeTimelineConn":
+                return self
+
+            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                pass
+
+        storage = PostgresStorage("postgresql://mock/db")
+        storage._connection = FakeTimelineConn()
+        storage.get_connection = mock.AsyncMock(return_value=FakeTimelineConn())
+
+        events = await storage.get_timeline_events("sess_123", limit=2, descending=True)
+        self.assertEqual(len(executed_queries), 1)
+        sql, params = executed_queries[0]
+        self.assertIn("ORDER BY timestamp_epoch DESC", sql)
+        self.assertEqual(params, ("sess_123", 2))
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0]["event_id"], "e1")
+        self.assertEqual(events[1]["event_id"], "e2")
+
 
 if __name__ == "__main__":
     unittest.main()

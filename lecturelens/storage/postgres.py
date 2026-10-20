@@ -127,7 +127,7 @@ class PostgresStorage:
             self._connection = await psycopg.AsyncConnection.connect(
                 self.connection_url,
                 row_factory=dict_row,
-                autocommit=False
+                autocommit=True
             )
         return self._connection
 
@@ -288,14 +288,16 @@ class PostgresStorage:
     async def get_timeline_events(
         self,
         session_id: str,
-        limit: Optional[int] = None
+        limit: Optional[int] = None,
+        descending: bool = False
     ) -> list[dict[str, Any]]:
-        query = """
+        order = "DESC" if descending else "ASC"
+        query = f"""
         SELECT event_id, session_id, source_type, timestamp_epoch, elapsed_seconds,
                correlation_id, content, metadata, importance_flags, created_at
         FROM timeline_events
         WHERE session_id = %s
-        ORDER BY timestamp_epoch ASC
+        ORDER BY timestamp_epoch {order}
         LIMIT %s;
         """
         fetch_limit = limit if limit is not None else self.query_limit
@@ -303,7 +305,10 @@ class PostgresStorage:
             conn = await self.get_connection()
             async with conn.cursor() as cur:
                 await cur.execute(query, (session_id, fetch_limit))
-                return await cur.fetchall()
+                rows = await cur.fetchall()
+                if descending:
+                    rows = list(reversed(rows))
+                return rows
 
     async def get_general_notes_since(
         self,

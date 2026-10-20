@@ -233,9 +233,7 @@ class ContextDriftFilter:
             if "drift" in flags or "ad" in flags:
                 continue
 
-            if any(f in flags for f in ("exam_relevant", "definition", "action_item")):
-                filtered.append(entry)
-                continue
+            is_important = any(f in flags for f in ("exam_relevant", "definition", "action_item"))
 
             content = str(entry.get("content", ""))
             source_type = str(entry.get("source_type", "transcript"))
@@ -244,6 +242,11 @@ class ContextDriftFilter:
             if shift_occurred:
                 filtered.extend(self.pending_quarantine_entries)
                 self.pending_quarantine_entries.clear()
+                filtered.append(entry)
+            elif is_important:
+                if self.pending_quarantine_entries:
+                    filtered.extend(self.pending_quarantine_entries)
+                    self.pending_quarantine_entries.clear()
                 filtered.append(entry)
             elif is_drift:
                 self.pending_quarantine_entries.append(entry)

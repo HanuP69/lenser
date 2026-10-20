@@ -43,6 +43,8 @@ from lecturelens.core.agent_runtime import (
     SYNC_STOP_FLAG_NAME,
     clear_all_flags,
     clear_flag,
+    create_postgres_storage,
+    create_redis_bus,
     flag_exists,
     read_heartbeats,
     set_flag
@@ -83,7 +85,7 @@ def ensure_session_exists(settings: Settings, session_id: str) -> Path:
 
 def check_redis(settings: Settings) -> bool:
     async def ping() -> bool:
-        bus = RedisBus(settings.redis_url)
+        bus = create_redis_bus(settings)
         try:
             return await bus.ping()
         finally:
@@ -108,8 +110,7 @@ def check_postgres(settings: Settings) -> bool:
     if not settings.postgres_url:
         return False
     async def ping() -> bool:
-        from lecturelens.storage.postgres import PostgresStorage
-        storage = PostgresStorage(settings.postgres_url)
+        storage = create_postgres_storage(settings)
         try:
             conn = await storage.get_connection()
             async with conn.cursor() as cur:
@@ -547,7 +548,7 @@ def status(session: Optional[str] = typer.Option(None, "--session")) -> None:
     session_dir = ensure_session_exists(settings, session_id)
 
     async def snapshot() -> Group:
-        bus = RedisBus(settings.redis_url)
+        bus = create_redis_bus(settings)
         try:
             counter = LineCounter(session_dir / "timeline.jsonl")
             return await collect_snapshot(settings, session_id, bus, {}, counter)
@@ -615,7 +616,7 @@ def reprocess(
         bus = None
         redis_client = None
         if check_redis(settings):
-            bus = RedisBus(settings.redis_url)
+            bus = create_redis_bus(settings)
             redis_client = bus.client
         try:
             router = build_router_for_task(
@@ -659,7 +660,7 @@ def ask(
         from lecturelens.knowledge.qa_engine import QAEngine
         from lecturelens.router.llm_router import build_router_for_task, load_router_config
 
-        bus = RedisBus(settings.redis_url)
+        bus = create_redis_bus(settings)
         try:
             router = None
             try:
@@ -672,8 +673,7 @@ def ask(
             storage = None
             if settings.postgres_url:
                 try:
-                    from lecturelens.storage.postgres import PostgresStorage
-                    storage = PostgresStorage(settings.postgres_url)
+                    storage = create_postgres_storage(settings)
                 except Exception:
                     storage = None
 
@@ -696,7 +696,7 @@ def ask(
                 notes_segments: list[dict[str, Any]] = []
                 if storage is not None:
                     try:
-                        timeline_events = await storage.get_timeline_events(session_id, limit=40)
+                        timeline_events = await storage.get_timeline_events(session_id, limit=40, descending=True)
                         notes_segments = await storage.get_general_notes_since(session_id, after_sequence_number=0)
                     except Exception:
                         pass
@@ -772,7 +772,7 @@ def review(
         session_val = session if isinstance(session, str) else None
 
         async def fetch():
-            storage = PostgresStorage(settings.postgres_url)
+            storage = create_postgres_storage(settings)
             try:
                 if course_val:
                     return await storage.get_concepts_for_course(course_val)
@@ -829,7 +829,7 @@ def student(
         config = load_router_config(settings.router_config_path)
         redis_client = None
         if check_redis(settings):
-            bus = RedisBus(settings.redis_url)
+            bus = create_redis_bus(settings)
             redis_client = bus.client
         router = build_router_for_task(
             "structuring",
@@ -880,8 +880,8 @@ def persister(
     from lecturelens.storage.postgres import PostgresStorage
 
     async def run() -> None:
-        redis_bus = RedisBus(settings.redis_url)
-        storage = PostgresStorage(settings.postgres_url)
+        redis_bus = create_redis_bus(settings)
+        storage = create_postgres_storage(settings)
         await storage.init_schema()
         persister_worker = PostgresPersister(settings, redis_bus, storage)
         console.print(f"[green]Persister listening on streams for session {session_id}...[/green]")
@@ -956,7 +956,7 @@ def replay(
         fail(f"No timeline.jsonl found in {session_dir}")
 
     async def run() -> int:
-        bus = RedisBus(settings.redis_url)
+        bus = create_redis_bus(settings)
         try:
             engine = ReplayEngine(timeline_path, redis_bus=bus, speed=speed)
             return await engine.replay(target_session_id=target_session or session_id)
