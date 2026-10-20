@@ -59,9 +59,13 @@ async def stream_audio(websocket: Any, settings: Settings, stop_event: asyncio.E
                 continue
             for chunk in segmenter.push(block, time.monotonic() - started):
                 wav_bytes = convert_numpy_to_wav_bytes(chunk.samples, settings.mic_sample_rate)
-                await send_and_wait(
-                    websocket, encode_message("audio", "wav_b64", wav_bytes, time.time())
-                )
+                try:
+                    await send_and_wait(
+                        websocket, encode_message("audio", "wav_b64", wav_bytes, time.time())
+                    )
+                except Exception as stream_err:
+                    logger.warning("audio streaming connection closed: %s", stream_err)
+                    return
     finally:
         await run_in_thread_pool(source.stop)
 
@@ -87,6 +91,8 @@ async def stream_screen(websocket: Any, settings: Settings, stop_event: asyncio.
                 )
         except Exception as error:
             logger.error("screen streaming error: %s", error)
+            if "close" in str(error).lower() or getattr(websocket, "closed", False):
+                break
         await asyncio.sleep(settings.screenshot_interval_seconds)
 
 
@@ -102,36 +108,48 @@ async def run_remote_client(
     if stop_event is None:
         stop_event = asyncio.Event()
     from websockets import connect
-    async with connect(server_url, max_size=settings.gateway_max_message_bytes) as audio_socket:
-        await audio_socket.send(json.dumps({"type": "hello", "api_key": api_key, "session_id": session_id}))
-        hello_reply = json.loads(await audio_socket.recv())
-        if hello_reply.get("status") != "authenticated":
-            raise PermissionError(str(hello_reply))
 
-        tasks: list[asyncio.Task] = []
-        extra_sockets: list[Any] = []
-        if use_audio:
-            tasks.append(asyncio.create_task(stream_audio(audio_socket, settings, stop_event)))
-
-        if use_screen:
-            extra_context = connect(server_url, max_size=settings.gateway_max_message_bytes)
-            extra_socket = await extra_context.__aenter__()
-            extra_sockets.append(extra_context)
-            await extra_socket.send(json.dumps({"type": "hello", "api_key": api_key, "session_id": session_id}))
-            reply = json.loads(await extra_socket.recv())
-            if reply.get("status") != "authenticated":
-                raise PermissionError(str(reply))
-            tasks.append(asyncio.create_task(stream_screen(extra_socket, settings, stop_event)))
-
+    while not stop_event.is_set():
         try:
-            if len(tasks) == 0:
-                return
-            await asyncio.gather(*tasks)
-        finally:
-            stop_event.set()
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            for extra_context in extra_sockets:
-                await extra_context.__aexit__(None, None, None)
+            async with connect(server_url, max_size=settings.gateway_max_message_bytes) as audio_socket:
+                await audio_socket.send(json.dumps({"type": "hello", "api_key": api_key, "session_id": session_id}))
+                hello_reply = json.loads(await audio_socket.recv())
+                if hello_reply.get("status") != "authenticated":
+                    raise PermissionError(str(hello_reply))
+
+                tasks: list[asyncio.Task] = []
+                extra_sockets: list[Any] = []
+                session_stop_event = asyncio.Event()
+
+                if use_audio:
+                    tasks.append(asyncio.create_task(stream_audio(audio_socket, settings, session_stop_event)))
+
+                if use_screen:
+                    extra_context = connect(server_url, max_size=settings.gateway_max_message_bytes)
+                    extra_socket = await extra_context.__aenter__()
+                    extra_sockets.append(extra_context)
+                    await extra_socket.send(json.dumps({"type": "hello", "api_key": api_key, "session_id": session_id}))
+                    reply = json.loads(await extra_socket.recv())
+                    if reply.get("status") != "authenticated":
+                        raise PermissionError(str(reply))
+                    tasks.append(asyncio.create_task(stream_screen(extra_socket, settings, session_stop_event)))
+
+                try:
+                    if len(tasks) == 0:
+                        return
+                    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                    session_stop_event.set()
+                finally:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    for extra_context in extra_sockets:
+                        await extra_context.__aexit__(None, None, None)
+        except PermissionError:
+            raise
+        except Exception as conn_error:
+            if stop_event.is_set():
+                break
+            logger.warning("remote client connection lost (%s), reconnecting in 2s...", conn_error)
+            await asyncio.sleep(2.0)

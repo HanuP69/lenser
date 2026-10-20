@@ -2,7 +2,7 @@ from lecturelens.config.defaults import DEFAULT_EMBEDDING_MODEL, DEFAULT_LOCAL_M
 from pathlib import Path
 from typing import Optional
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings
 
 from lecturelens.core.validation import sanitize_file_stem
@@ -99,10 +99,17 @@ class Settings(BaseSettings):
     openrouter_api_key: Optional[str] = Field(default=None)
     google_api_key: Optional[str] = Field(default=None)
     enable_drift_filter: bool = Field(default=True)
+    drift_threshold: Optional[float] = Field(default=None)
     drift_similarity_threshold: float = Field(default=0.50)
     drift_consecutive_shift: int = Field(default=3)
     drift_min_content_words: int = Field(default=8)
     drift_embed_model: str = Field(default="nomic-embed-text")
+
+    @model_validator(mode="after")
+    def sync_drift_threshold(self) -> "Settings":
+        if self.drift_threshold is not None:
+            self.drift_similarity_threshold = self.drift_threshold
+        return self
 
     def get_session_output_dir(self, session_id: str) -> Path:
         session_dir = self.output_dir / session_id

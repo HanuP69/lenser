@@ -29,7 +29,15 @@ def compute_spatial_block_similarity(
     block_h = height // grid_rows
     block_w = width // grid_cols
     if block_h == 0 or block_w == 0:
-        return 1.0
+        b1 = first_gray.astype(np.float32).flatten()
+        b2 = second_gray.astype(np.float32).flatten()
+        norm1 = float(np.linalg.norm(b1))
+        norm2 = float(np.linalg.norm(b2))
+        if norm1 == 0.0 and norm2 == 0.0:
+            return 1.0
+        if norm1 == 0.0 or norm2 == 0.0:
+            return 0.0
+        return float(np.dot(b1, b2) / (norm1 * norm2))
     similarities: list[float] = []
     for r in range(grid_rows):
         for c in range(grid_cols):

@@ -144,6 +144,15 @@ def build_agent_environment(
         environment["LECTURELENS_COURSE_NAME"] = course
     if settings.postgres_url:
         environment["LECTURELENS_POSTGRES_URL"] = settings.postgres_url
+    if getattr(settings, "redis_url", None):
+        environment["LECTURELENS_REDIS_URL"] = str(settings.redis_url)
+    if getattr(settings, "ollama_url", None):
+        environment["LECTURELENS_OLLAMA_URL"] = str(settings.ollama_url)
+    if getattr(settings, "enable_drift_filter", None) is not None:
+        environment["LECTURELENS_ENABLE_DRIFT_FILTER"] = str(settings.enable_drift_filter).lower()
+    if getattr(settings, "drift_similarity_threshold", None) is not None:
+        environment["LECTURELENS_DRIFT_SIMILARITY_THRESHOLD"] = str(settings.drift_similarity_threshold)
+        environment["LECTURELENS_DRIFT_THRESHOLD"] = str(settings.drift_similarity_threshold)
     if getattr(settings, "local_model", None):
         environment["LECTURELENS_LOCAL_MODEL"] = str(settings.local_model)
         environment["LECTURELENS_OLLAMA_MODEL"] = str(settings.local_model)
@@ -161,6 +170,9 @@ def build_agent_environment(
         environment["LECTURELENS_GOOGLE_API_KEY"] = str(settings.google_api_key)
     if getattr(settings, "openrouter_api_key", None):
         environment["LECTURELENS_OPENROUTER_API_KEY"] = str(settings.openrouter_api_key)
+    for plural_key in ("GOOGLE_API_KEYS", "GEMINI_API_KEYS", "OPENROUTER_API_KEYS", "UNOROUTER_API_KEYS"):
+        if plural_key in os.environ and f"LECTURELENS_{plural_key}" not in environment:
+            environment[f"LECTURELENS_{plural_key}"] = os.environ[plural_key]
     if "UNOROUTER_API_KEY" in os.environ and "LECTURELENS_UNOROUTER_API_KEY" not in environment:
         environment["LECTURELENS_UNOROUTER_API_KEY"] = os.environ["UNOROUTER_API_KEY"]
     if "UNOROUTER_API_KEYS" in os.environ and "LECTURELENS_UNOROUTER_API_KEYS" not in environment:

@@ -212,6 +212,16 @@ class GatewayServer:
             return
         runtime.audio_agent.stop()
         runtime.screen_agent.stop()
+        fanout = self.fanout_tasks.pop(session_id, None)
+        if fanout is not None and not fanout.done():
+            fanout.cancel()
+        self.subscribers.pop(session_id, None)
+        writers = self.subscriber_writers.pop(session_id, None)
+        if writers:
+            for wtask in writers.values():
+                if not wtask.done():
+                    wtask.cancel()
+        self.catching_up.pop(session_id, None)
         logger.info("released idle gateway session %s", session_id)
 
     def authenticate(self, hello_message: dict[str, Any]) -> str:

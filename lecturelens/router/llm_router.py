@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any, Optional
 
@@ -162,11 +163,32 @@ class RotatingChatModel(Runnable):
         self.current_index: int = 0
         self.key_count: int = len(models)
         self.lock: asyncio.Lock = asyncio.Lock()
+        self.sync_lock: threading.Lock = threading.Lock()
 
     def invoke(self, input: Any, config: Optional[dict[str, Any]] = None, **kwargs: Any) -> Any:
-        idx = self.current_index % len(self.models)
-        self.current_index = (self.current_index + 1) % len(self.models)
-        return self.models[idx].invoke(input, config=config, **kwargs)
+        with self.sync_lock:
+            idx = self.current_index % len(self.models)
+            self.current_index = (self.current_index + 1) % len(self.models)
+
+        last_error: Optional[Exception] = None
+        for attempt in range(len(self.models)):
+            active_idx = (idx + attempt) % len(self.models)
+            active_model = self.models[active_idx]
+            try:
+                return active_model.invoke(input, config=config, **kwargs)
+            except Exception as invocation_error:
+                last_error = invocation_error
+                error_str = str(invocation_error).lower()
+                status_code = getattr(invocation_error, "status_code", None)
+                if status_code in (429, 500, 502, 503, 504) or "rate limit" in error_str or "quota" in error_str:
+                    logger.warning(
+                        "key index %d hit rate limit/error (%s), rotating to next key (attempt %d/%d)",
+                        active_idx, invocation_error, attempt + 1, len(self.models)
+                    )
+                    continue
+                raise
+        if last_error is not None:
+            raise last_error
 
     async def ainvoke(self, input: Any, config: Optional[dict[str, Any]] = None, **kwargs: Any) -> Any:
         async with self.lock:
@@ -202,7 +224,7 @@ def create_base_chat_model(
     provider_config: dict[str, Any],
     ollama_url: Optional[str] = None
 ) -> Optional[Any]:
-    resolved_ollama_url = ollama_url or os.environ.get("LECTURELENS_OLLAMA_URL", "http://localhost:11434")
+    resolved_ollama_url = ollama_url or os.environ.get("LECTURELENS_OLLAMA_URL", "http://127.0.0.1:11434")
     provider_type = provider_config.get("type", "")
     model_name = provider_config.get("model", "")
 
@@ -357,7 +379,7 @@ def build_router_for_task(
     llm_mode: str = "local",
     timeout_seconds: Optional[float] = None
 ) -> Any:
-    resolved_ollama_url = ollama_url or os.environ.get("LECTURELENS_OLLAMA_URL", "http://localhost:11434")
+    resolved_ollama_url = ollama_url or os.environ.get("LECTURELENS_OLLAMA_URL", "http://127.0.0.1:11434")
     providers_config = router_config.get("providers", {})
     task_routing = router_config.get("task_routing", {})
     provider_chain_names = list(task_routing.get(task_type, []))

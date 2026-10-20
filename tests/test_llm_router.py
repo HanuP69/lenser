@@ -293,6 +293,14 @@ class TestMessages(unittest.TestCase):
                     raise err
                 return AIMessage(content=f"from_{self.tag}")
 
+            def invoke(self, messages: Any, **kwargs: Any) -> Any:
+                self.call_count += 1
+                if self.fail_429:
+                    err = Exception("429 Too Many Requests: rate limit exceeded")
+                    setattr(err, "status_code", 429)
+                    raise err
+                return AIMessage(content=f"from_{self.tag}")
+
         m1 = DummyCallModel("m1")
         m2 = DummyCallModel("m2")
         rotating = RotatingChatOpenAI([m1, m2], ["k1", "k2"])
@@ -314,6 +322,12 @@ class TestMessages(unittest.TestCase):
         self.assertEqual(res_recovered.content, "from_fallback_m2")
         self.assertEqual(failing_m1.call_count, 1)
         self.assertEqual(fallback_m2.call_count, 1)
+
+        failing_m1_sync = DummyCallModel("failing_m1_sync", fail_429=True)
+        fallback_m2_sync = DummyCallModel("fallback_m2_sync")
+        rotating_sync = RotatingChatOpenAI([failing_m1_sync, fallback_m2_sync], ["k1", "k2"])
+        res_sync = rotating_sync.invoke([HumanMessage(content="hi")])
+        self.assertEqual(res_sync.content, "from_fallback_m2_sync")
 
 
 if __name__ == "__main__":

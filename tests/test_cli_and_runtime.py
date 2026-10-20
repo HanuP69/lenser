@@ -234,10 +234,24 @@ class TestCliCommands(unittest.TestCase):
 
     def test_environment_passes_unorouter_api_key(self) -> None:
         settings = Settings()
-        with mock.patch.dict(os.environ, {"UNOROUTER_API_KEY": "test_uno_key"}):
+        with mock.patch.dict(os.environ, {
+            "UNOROUTER_API_KEY": "test_uno_key",
+            "GOOGLE_API_KEYS": "k1,k2",
+            "OPENROUTER_API_KEYS": "ok1,ok2"
+        }):
             environment = cli_main.build_agent_environment(settings, "lec1", "system", 1, "hybrid", None)
             self.assertEqual(environment["UNOROUTER_API_KEY"], "test_uno_key")
             self.assertEqual(environment["LECTURELENS_UNOROUTER_API_KEY"], "test_uno_key")
+            self.assertEqual(environment["LECTURELENS_GOOGLE_API_KEYS"], "k1,k2")
+            self.assertEqual(environment["LECTURELENS_OPENROUTER_API_KEYS"], "ok1,ok2")
+            self.assertIn("LECTURELENS_REDIS_URL", environment)
+            self.assertIn("LECTURELENS_OLLAMA_URL", environment)
+            self.assertIn("LECTURELENS_DRIFT_THRESHOLD", environment)
+
+    def test_settings_syncs_drift_threshold(self) -> None:
+        with mock.patch.dict(os.environ, {"LECTURELENS_DRIFT_THRESHOLD": "0.65"}):
+            s = Settings()
+            self.assertEqual(s.drift_similarity_threshold, 0.65)
 
     def test_module_names(self) -> None:
         self.assertEqual(cli_main.module_for_agent("gateway"), "lecturelens.gateway.server")

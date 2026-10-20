@@ -151,6 +151,18 @@ class TestGatewaySecurity(GatewayTestBase):
         self.assertNotIn("older", self.gateway.sessions)
         self.assertIn("newer", self.gateway.sessions)
 
+    async def test_release_session_cleans_up_fanout_tasks(self) -> None:
+        runtime = self.gateway.get_or_create_session("cleanup_room")
+        dummy_task = asyncio.create_task(asyncio.sleep(10.0))
+        self.gateway.fanout_tasks["cleanup_room"] = dummy_task
+        self.gateway.subscribers["cleanup_room"] = set()
+        self.gateway.release_session("cleanup_room")
+        await asyncio.sleep(0)
+        self.assertNotIn("cleanup_room", self.gateway.sessions)
+        self.assertNotIn("cleanup_room", self.gateway.fanout_tasks)
+        self.assertNotIn("cleanup_room", self.gateway.subscribers)
+        self.assertTrue(dummy_task.cancelled() or dummy_task.done())
+
     def test_capture_epoch_is_accepted_only_when_plausible(self) -> None:
         from lecturelens.core.clock import SessionClock
         from lecturelens.gateway.server import resolve_capture_epoch

@@ -1,6 +1,9 @@
+import os
 from pathlib import Path
+import threading
 from typing import Any, Optional
 import urllib.request
+import uuid
 import numpy as np
 
 from lecturelens.core.logging_setup import get_logger
@@ -11,12 +14,15 @@ DEFAULT_MODEL_URL = "https://github.com/onnx/models/raw/main/validated/vision/cl
 MIN_MODEL_BYTES = 4_000_000
 
 _SHARED_VISION_EMBEDDER: Optional["VisionEmbedder"] = None
+_EMBEDDER_LOCK: threading.Lock = threading.Lock()
 
 
 def get_shared_vision_embedder() -> "VisionEmbedder":
     global _SHARED_VISION_EMBEDDER
     if _SHARED_VISION_EMBEDDER is None:
-        _SHARED_VISION_EMBEDDER = VisionEmbedder()
+        with _EMBEDDER_LOCK:
+            if _SHARED_VISION_EMBEDDER is None:
+                _SHARED_VISION_EMBEDDER = VisionEmbedder()
     return _SHARED_VISION_EMBEDDER
 
 
@@ -51,7 +57,8 @@ class VisionEmbedder:
             return False
         try:
             self.model_path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path = self.model_path.with_suffix(".tmp")
+            unique_id = uuid.uuid4().hex[:8]
+            temp_path = self.model_path.with_name(f"{self.model_path.stem}_{unique_id}.tmp")
             req = urllib.request.Request(
                 DEFAULT_MODEL_URL,
                 headers={"User-Agent": "LectureLens/1.0"}
@@ -135,7 +142,7 @@ class VisionEmbedder:
             tensor = self.preprocess(image_array)
             raw_output = self.session.run(None, {self.input_name: tensor})[0].flatten()
             norm = np.linalg.norm(raw_output)
-            if norm == 0.0:
+            if norm <= 1e-9:
                 return raw_output
             return raw_output / norm
         except Exception as error:

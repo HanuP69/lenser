@@ -75,6 +75,7 @@ class ContextDriftFilter:
 
         self.running_anchor: Optional[np.ndarray] = None
         self.quarantine_buffer: list[tuple[str, np.ndarray]] = []
+        self.pending_quarantine_entries: list[dict[str, Any]] = []
         self.accepted_count: int = 0
         self.drift_count: int = 0
 
@@ -91,7 +92,8 @@ class ContextDriftFilter:
             "running_anchor": self.running_anchor.tolist() if self.running_anchor is not None else None,
             "accepted_count": self.accepted_count,
             "drift_count": self.drift_count,
-            "session_topic": self.session_topic
+            "session_topic": self.session_topic,
+            "pending_quarantine_entries": self.pending_quarantine_entries
         }
 
     def load_dict(self, data: dict[str, Any]) -> None:
@@ -104,6 +106,8 @@ class ContextDriftFilter:
         self.drift_count = int(data.get("drift_count", self.drift_count))
         if "session_topic" in data:
             self.session_topic = data.get("session_topic")
+        if "pending_quarantine_entries" in data and isinstance(data["pending_quarantine_entries"], list):
+            self.pending_quarantine_entries = list(data["pending_quarantine_entries"])
 
     def embed_text(self, text: str) -> Optional[np.ndarray]:
         clean_text = text.strip()
@@ -180,6 +184,8 @@ class ContextDriftFilter:
             return False, similarity, False
 
         self.quarantine_buffer.append((clean, vector))
+        if len(self.quarantine_buffer) > 20:
+            self.quarantine_buffer.pop(0)
         if len(self.quarantine_buffer) >= self.sustain_consecutive:
             recent_vectors = [v for _, v in self.quarantine_buffer[-self.sustain_consecutive:]]
             consistent = True
@@ -207,7 +213,6 @@ class ContextDriftFilter:
 
     def filter_batch_entries(self, entries: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         filtered: list[dict[str, Any]] = []
-        pending_quarantine: list[dict[str, Any]] = []
 
         for entry in entries:
             flags = list(entry.get("importance_flags", []) or [])
@@ -223,13 +228,15 @@ class ContextDriftFilter:
             is_drift, score, shift_occurred = self.check_entry_with_shift(content, source_type=source_type)
 
             if shift_occurred:
-                filtered.extend(pending_quarantine)
-                pending_quarantine.clear()
+                filtered.extend(self.pending_quarantine_entries)
+                self.pending_quarantine_entries.clear()
                 filtered.append(entry)
             elif is_drift:
-                pending_quarantine.append(entry)
+                self.pending_quarantine_entries.append(entry)
+                if len(self.pending_quarantine_entries) > 20:
+                    self.pending_quarantine_entries.pop(0)
             else:
-                pending_quarantine.clear()
+                self.pending_quarantine_entries.clear()
                 filtered.append(entry)
 
         return filtered

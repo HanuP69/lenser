@@ -155,6 +155,24 @@ class TestContextDriftFilterBehavior(unittest.TestCase):
         kept = self.filter.filter_batch_entries(entries)
         self.assertEqual(len(kept), 4)
 
+    def test_topic_shift_across_batch_boundaries(self) -> None:
+        self.filter.check_entry("Chapter 4 Quadratic Equation Master Plan")
+        batch1 = [
+            {"content": "Welcome to chapter 5 arithmetic progressions", "source_type": "transcript"},
+            {"content": "Arithmetic progressions common difference and nth term", "source_type": "transcript"}
+        ]
+        kept1 = self.filter.filter_batch_entries(batch1)
+        self.assertEqual(len(kept1), 0)
+
+        batch2 = [
+            {"content": "Sum of first n terms of arithmetic progression", "source_type": "transcript"},
+            {"content": "Next example of arithmetic progression", "source_type": "transcript"}
+        ]
+        kept2 = self.filter.filter_batch_entries(batch2)
+        self.assertEqual(len(kept2), 4)
+        self.assertEqual(kept2[0]["content"], "Welcome to chapter 5 arithmetic progressions")
+        self.assertEqual(kept2[3]["content"], "Next example of arithmetic progression")
+
     def test_code_not_refusal_false_positive(self) -> None:
         self.assertFalse(is_refusal_text("result = data[name]"))
         self.assertFalse(is_refusal_text("mapping = {'k': [name]}"))

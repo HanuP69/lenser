@@ -89,3 +89,12 @@ class TestImportanceFalsePositives(unittest.TestCase):
         self.assertIn("exam_relevant", detect_importance_flags("The test will cover graph algorithms."))
         self.assertIn("exam_relevant", detect_importance_flags("There is a test next Monday."))
         self.assertIn("exam_relevant", detect_importance_flags("Get ready for a surprise test."))
+
+    def test_academic_math_terms_not_falsely_flagged(self) -> None:
+        self.assertEqual(detect_importance_flags("The critical point of the function is x=2."), [])
+        self.assertEqual(detect_importance_flags("An essential property of vector spaces is linearity."), [])
+        self.assertEqual(detect_importance_flags("This means that x is greater than zero."), [])
+
+    def test_action_item_detection(self) -> None:
+        flags = detect_importance_flags("The homework assignment is due on Friday.")
+        self.assertIn("action_item", flags)

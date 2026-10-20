@@ -1,8 +1,14 @@
 import re
 
 EXAM_RELEVANT_PATTERNS: tuple[str, ...] = (
-    r"important",
-    r"remember",
+    r"(?:very\s+|super\s+|most\s+|really\s+)?important\s+(?:for|in|on)\s+(?:the\s+)?(?:exam|test|quiz|midterm|final|grade|paper)",
+    r"(?:this\s+is\s+|note\s+this\s+|mark\s+this\s+as\s+)(?:very\s+)?important",
+    r"important\s+(?:to\s+note|takeaway|concept\s+for|question|topic\s+for)",
+    r"bahut\s+important",
+    r"important\s+hai",
+    r"remember\s+this",
+    r"remember\s+(?:for\s+(?:the\s+)?exam|well)",
+    r"(?:must|always)\s+remember",
     r"key points?",
     r"key takeaways?",
     r"exams?",
@@ -16,8 +22,8 @@ EXAM_RELEVANT_PATTERNS: tuple[str, ...] = (
     r"final (?:exam|test|project|paper)",
     r"make sure you know",
     r"pay attention",
-    r"critical",
-    r"essential",
+    r"critical\s+(?:for\s+(?:the\s+)?exam|to\s+remember|concept\s+to\s+know|for\s+your\s+grade)",
+    r"essential\s+(?:for\s+(?:the\s+)?exam|to\s+remember|to\s+know\s+for)",
     r"must know",
     r"will be graded",
     r"note this down",
@@ -34,7 +40,9 @@ DEFINITION_PATTERNS: tuple[str, ...] = (
     r"definitions?",
     r"we define",
     r"is defined as",
-    r"means that",
+    r"(?:term|definition)\s+means\s+that",
+    r"by\s+definition\s+means",
+    r"specifically\s+means\s+that",
     r"refers to",
     r"is called",
     r"known as",
@@ -106,6 +114,14 @@ AD_PATTERNS: tuple[str, ...] = (
     r"hit\s+the\s+bell\s+icon",
 )
 
+ACTION_ITEM_PATTERNS: tuple[str, ...] = (
+    r"homework\s+(?:is|due|assignment)",
+    r"assignment\s+(?:is|due|#\d+)",
+    r"submit\s+(?:by|before|your)",
+    r"due\s+(?:by|before|on|next|tomorrow|friday|monday)",
+    r"project\s+submission",
+)
+
 
 def compile_pattern_group(patterns: tuple[str, ...]) -> re.Pattern:
     alternatives: list[str] = []
@@ -120,6 +136,7 @@ DEFINITION_REGEX: re.Pattern = compile_pattern_group(DEFINITION_PATTERNS)
 EXAMPLE_REGEX: re.Pattern = compile_pattern_group(EXAMPLE_PATTERNS)
 CONFUSION_REGEX: re.Pattern = compile_pattern_group(CONFUSION_PATTERNS)
 AD_REGEX: re.Pattern = compile_pattern_group(AD_PATTERNS)
+ACTION_ITEM_REGEX: re.Pattern = compile_pattern_group(ACTION_ITEM_PATTERNS)
 
 
 def detect_importance_flags(text: str) -> list[str]:
@@ -136,5 +153,7 @@ def detect_importance_flags(text: str) -> list[str]:
         flags.append("confusion")
     if AD_REGEX.search(normalized_text) is not None:
         flags.append("ad")
+    if ACTION_ITEM_REGEX.search(normalized_text) is not None:
+        flags.append("action_item")
 
     return flags

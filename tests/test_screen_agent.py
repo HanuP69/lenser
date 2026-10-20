@@ -220,6 +220,11 @@ class TestVisionEmbedderAndGate(unittest.TestCase):
         sim = compute_spatial_block_similarity(arr1, arr2)
         self.assertAlmostEqual(sim, 1.0)
 
+        small1 = np.zeros((4, 4), dtype=np.uint8)
+        small2 = np.ones((4, 4), dtype=np.uint8) * 200
+        sim_small = compute_spatial_block_similarity(small1, small2)
+        self.assertAlmostEqual(sim_small, 0.0)
+
     def test_slide_change_gate_with_mock_embedder_filters_motion(self) -> None:
         from lecturelens.core.image_utils import SlideChangeGate
         class MockEmbedder:
