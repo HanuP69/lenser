@@ -116,8 +116,9 @@ ADD_VECTOR_COLUMN_SQL = "ALTER TABLE embeddings ADD COLUMN IF NOT EXISTS embeddi
 
 
 class PostgresStorage:
-    def __init__(self, connection_url: str) -> None:
+    def __init__(self, connection_url: str, query_limit: int = 1000) -> None:
         self.connection_url = connection_url
+        self.query_limit = query_limit
         self._connection: Optional[psycopg.AsyncConnection[dict_row]] = None
         self._lock: asyncio.Lock = asyncio.Lock()
 
@@ -138,23 +139,25 @@ class PostgresStorage:
                 yield conn
 
     async def init_schema(self, vector_dimensions: int = 768) -> None:
-        async with self.transaction() as conn:
-            try:
+        try:
+            async with self.transaction() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(CREATE_VECTOR_EXTENSION_SQL)
-            except Exception as vector_error:
-                logger.info("pgvector extension not installed or available: %s", vector_error)
+        except Exception as vector_error:
+            logger.info("pgvector extension not installed or available: %s", vector_error)
 
+        async with self.transaction() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(CREATE_TABLES_SQL)
                 await cur.execute(MIGRATE_CONCEPTS_SQL)
 
-            try:
+        try:
+            async with self.transaction() as conn:
                 async with conn.cursor() as cur:
                     sql = f"ALTER TABLE embeddings ADD COLUMN IF NOT EXISTS embedding vector({vector_dimensions});"
                     await cur.execute(sql)
-            except Exception as vector_col_error:
-                logger.debug("vector column skipped: %s", vector_col_error)
+        except Exception as vector_col_error:
+            logger.debug("vector column skipped: %s", vector_col_error)
 
     async def insert_timeline_event(self, entry: TimelineEntry | dict[str, Any]) -> bool:
         if isinstance(entry, TimelineEntry):
@@ -285,7 +288,7 @@ class PostgresStorage:
     async def get_timeline_events(
         self,
         session_id: str,
-        limit: int = 1000
+        limit: Optional[int] = None
     ) -> list[dict[str, Any]]:
         query = """
         SELECT event_id, session_id, source_type, timestamp_epoch, elapsed_seconds,
@@ -295,10 +298,12 @@ class PostgresStorage:
         ORDER BY timestamp_epoch ASC
         LIMIT %s;
         """
-        conn = await self.get_connection()
-        async with conn.cursor() as cur:
-            await cur.execute(query, (session_id, limit))
-            return await cur.fetchall()
+        fetch_limit = limit if limit is not None else self.query_limit
+        async with self._lock:
+            conn = await self.get_connection()
+            async with conn.cursor() as cur:
+                await cur.execute(query, (session_id, fetch_limit))
+                return await cur.fetchall()
 
     async def get_general_notes_since(
         self,
@@ -313,10 +318,11 @@ class PostgresStorage:
         WHERE session_id = %s AND sequence_number > %s
         ORDER BY sequence_number ASC;
         """
-        conn = await self.get_connection()
-        async with conn.cursor() as cur:
-            await cur.execute(query, (session_id, after_sequence_number))
-            return await cur.fetchall()
+        async with self._lock:
+            conn = await self.get_connection()
+            async with conn.cursor() as cur:
+                await cur.execute(query, (session_id, after_sequence_number))
+                return await cur.fetchall()
 
     async def session_exists(self, session_id: str) -> bool:
         query = """
@@ -325,10 +331,11 @@ class PostgresStorage:
         SELECT 1 FROM general_notes WHERE session_id = %s
         LIMIT 1;
         """
-        conn = await self.get_connection()
-        async with conn.cursor() as cur:
-            await cur.execute(query, (session_id, session_id))
-            return (await cur.fetchone()) is not None
+        async with self._lock:
+            conn = await self.get_connection()
+            async with conn.cursor() as cur:
+                await cur.execute(query, (session_id, session_id))
+                return (await cur.fetchone()) is not None
 
     async def insert_embedding(
         self,
@@ -338,8 +345,7 @@ class PostgresStorage:
         chunk_text: str,
         vector: Optional[list[float]] = None
     ) -> bool:
-        conn = await self.get_connection()
-        async with conn.transaction():
+        async with self.transaction() as conn:
             async with conn.cursor() as cur:
                 if vector is not None:
                     query = """
@@ -368,15 +374,16 @@ class PostgresStorage:
         ORDER BY distance ASC
         LIMIT %s;
         """
-        conn = await self.get_connection()
-        async with conn.cursor() as cur:
-            try:
-                await cur.execute(query, (query_vector, session_id, top_k))
-                return await cur.fetchall()
-            except Exception as err:
-                await conn.rollback()
-                logger.warning("vector search unavailable in postgres: %s", err)
-                return []
+        async with self._lock:
+            conn = await self.get_connection()
+            async with conn.cursor() as cur:
+                try:
+                    await cur.execute(query, (query_vector, session_id, top_k))
+                    return await cur.fetchall()
+                except Exception as err:
+                    await conn.rollback()
+                    logger.warning("vector search unavailable in postgres: %s", err)
+                    return []
 
     async def get_concepts_for_course(self, course_id: str) -> list[dict[str, Any]]:
         query = """
@@ -386,10 +393,11 @@ class PostgresStorage:
         WHERE course_id = %s
         ORDER BY timestamp_epoch ASC;
         """
-        conn = await self.get_connection()
-        async with conn.cursor() as cur:
-            await cur.execute(query, (course_id,))
-            rows = await cur.fetchall()
+        async with self._lock:
+            conn = await self.get_connection()
+            async with conn.cursor() as cur:
+                await cur.execute(query, (course_id,))
+                rows = await cur.fetchall()
 
         grouped: dict[str, dict[str, Any]] = {}
         for row in rows:
@@ -416,12 +424,14 @@ class PostgresStorage:
         WHERE session_id = %s
         ORDER BY timestamp_epoch ASC;
         """
-        conn = await self.get_connection()
-        async with conn.cursor() as cur:
-            await cur.execute(query, (session_id,))
-            return await cur.fetchall()
+        async with self._lock:
+            conn = await self.get_connection()
+            async with conn.cursor() as cur:
+                await cur.execute(query, (session_id,))
+                return await cur.fetchall()
 
     async def close(self) -> None:
-        if self._connection is not None and not self._connection.closed:
-            await self._connection.close()
-            self._connection = None
+        async with self._lock:
+            if self._connection is not None and not self._connection.closed:
+                await self._connection.close()
+                self._connection = None

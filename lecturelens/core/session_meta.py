@@ -34,12 +34,36 @@ def get_previous_duration_seconds(session_dir: Path) -> float:
         elif run_record.get("started_epoch") and run_record.get("ended_epoch"):
             total_seconds += max(0.0, float(run_record["ended_epoch"]) - float(run_record["started_epoch"]))
         elif run_record.get("started_epoch"):
+            started = float(run_record["started_epoch"])
+            candidates: list[float] = []
+            timeline_path = session_dir / "timeline.jsonl"
+            if timeline_path.exists():
+                try:
+                    candidates.append(timeline_path.stat().st_mtime)
+                    with open(timeline_path, "rb") as tf:
+                        tf.seek(0, 2)
+                        size = tf.tell()
+                        tf.seek(max(0, size - 4096))
+                        lines = tf.read().decode("utf-8", errors="ignore").strip().splitlines()
+                        if lines:
+                            last_entry = json.loads(lines[-1])
+                            if "timestamp_epoch" in last_entry:
+                                candidates.append(float(last_entry["timestamp_epoch"]))
+                except Exception:
+                    pass
+            for sub_path in (session_dir / "notes.md", session_dir / "audio", session_dir / "slides"):
+                if sub_path.exists():
+                    try:
+                        candidates.append(sub_path.stat().st_mtime)
+                    except OSError:
+                        pass
             try:
-                mtime = get_meta_path(session_dir).stat().st_mtime
-                estimated = max(0.0, mtime - float(run_record["started_epoch"]))
-                total_seconds += estimated
+                candidates.append(get_meta_path(session_dir).stat().st_mtime)
             except OSError:
                 pass
+            if candidates:
+                estimated = max(0.0, max(candidates) - started)
+                total_seconds += estimated
     return total_seconds
 
 

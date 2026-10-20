@@ -87,6 +87,20 @@ class ContextDriftFilter:
             if initial_vec is not None:
                 self.running_anchor = initial_vec
 
+    def reset(self) -> None:
+        self.running_anchor = None
+        self.accepted_count = 0
+        self.drift_count = 0
+        self.pending_quarantine_entries = []
+        self.quarantine_buffer.clear()
+        if self.session_topic is not None and len(self.session_topic.strip()) > 0:
+            clean_topic = self.session_topic.strip()
+            if len(clean_topic.split()) < 3:
+                clean_topic = f"Course lecture on academic subject {clean_topic}"
+            initial_vec = self.embed_text(clean_topic)
+            if initial_vec is not None:
+                self.running_anchor = initial_vec
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "running_anchor": self.running_anchor.tolist() if self.running_anchor is not None else None,
@@ -146,27 +160,27 @@ class ContextDriftFilter:
         self,
         content: str,
         source_type: str = "transcript"
-    ) -> tuple[bool, float, bool]:
+    ) -> tuple[bool, float, bool, bool]:
         clean = content.strip()
         if len(clean) == 0:
-            return False, 1.0, False
+            return False, 1.0, False, False
 
         if is_refusal_text(clean):
             self.drift_count += 1
-            return True, 0.0, False
+            return True, 0.0, False, False
 
         words = clean.split()
         if len(words) < self.min_words:
-            return False, 1.0, False
+            return False, 1.0, False, False
 
         vector = self.embed_text(clean)
         if vector is None:
-            return False, 1.0, False
+            return False, 1.0, False, False
 
         if self.running_anchor is None:
             self.running_anchor = vector
             self.accepted_count = 1
-            return False, 1.0, False
+            return False, 1.0, False, True
 
         effective_threshold = self.drift_threshold
         if self.accepted_count < 3:
@@ -181,7 +195,7 @@ class ContextDriftFilter:
             )
             self.quarantine_buffer.clear()
             self.accepted_count += 1
-            return False, similarity, False
+            return False, similarity, False, True
 
         self.quarantine_buffer.append((clean, vector))
         if len(self.quarantine_buffer) > 20:
@@ -202,13 +216,13 @@ class ContextDriftFilter:
                 self.quarantine_buffer.clear()
                 self.accepted_count += self.sustain_consecutive
                 logger.info("sustained lecture topic shift detected; anchor updated")
-                return False, similarity, True
+                return False, similarity, True, True
 
         self.drift_count += 1
-        return True, similarity, False
+        return True, similarity, False, False
 
     def check_entry(self, content: str, source_type: str = "transcript") -> tuple[bool, float]:
-        is_drift, similarity, _ = self.check_entry_with_shift(content, source_type=source_type)
+        is_drift, similarity, _, _ = self.check_entry_with_shift(content, source_type=source_type)
         return is_drift, similarity
 
     def filter_batch_entries(self, entries: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -225,7 +239,7 @@ class ContextDriftFilter:
 
             content = str(entry.get("content", ""))
             source_type = str(entry.get("source_type", "transcript"))
-            is_drift, score, shift_occurred = self.check_entry_with_shift(content, source_type=source_type)
+            is_drift, score, shift_occurred, confirmed_on_topic = self.check_entry_with_shift(content, source_type=source_type)
 
             if shift_occurred:
                 filtered.extend(self.pending_quarantine_entries)
@@ -235,8 +249,10 @@ class ContextDriftFilter:
                 self.pending_quarantine_entries.append(entry)
                 if len(self.pending_quarantine_entries) > 20:
                     self.pending_quarantine_entries.pop(0)
-            else:
+            elif confirmed_on_topic:
                 self.pending_quarantine_entries.clear()
+                filtered.append(entry)
+            else:
                 filtered.append(entry)
 
         return filtered

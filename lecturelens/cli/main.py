@@ -156,7 +156,6 @@ def build_agent_environment(
         environment["LECTURELENS_DRIFT_THRESHOLD"] = str(settings.drift_similarity_threshold)
     if getattr(settings, "local_model", None):
         environment["LECTURELENS_LOCAL_MODEL"] = str(settings.local_model)
-        environment["LECTURELENS_OLLAMA_MODEL"] = str(settings.local_model)
     if getattr(settings, "ollama_model", None):
         environment["LECTURELENS_OLLAMA_MODEL"] = str(settings.ollama_model)
     if getattr(settings, "primary_provider", None):
@@ -725,7 +724,7 @@ def ask(
                 embedding_model=settings.embedding_model,
                 fallback_model=settings.local_model,
                 storage=storage,
-                embed_batch_size=settings.embed_batch_size
+                embed_batch_size=settings.qa_embed_batch_size
             )
             try:
                 return await engine.ask_with_sources(question)
@@ -810,13 +809,18 @@ def student(
     from lecturelens.client.student_client import StudentClient, StudentProfile
     from lecturelens.knowledge.student_graph import StudentKnowledgeGraph
 
+    safe_id = sanitize_file_stem(student_id)
     profile = StudentProfile(
-        student_id=student_id,
+        student_id=safe_id,
         preferred_language=language,
         detail_level=detail
     )
-    safe_id = sanitize_file_stem(student_id)
-    graph_db = settings.output_dir / safe_id / "student_graph.db"
+    student_output_dir = (settings.output_dir / safe_id).resolve()
+    try:
+        student_output_dir.relative_to(settings.output_dir.resolve())
+    except ValueError:
+        fail("Invalid student ID path")
+    graph_db = student_output_dir / "student_graph.db"
     graph = StudentKnowledgeGraph(graph_db)
 
     router = None
@@ -851,7 +855,7 @@ def student(
         server_url=resolved_server,
         session_id=session,
         profile=profile,
-        output_dir=settings.output_dir / student_id,
+        output_dir=student_output_dir,
         api_key=api_key,
         llm_router=router,
         student_graph=graph

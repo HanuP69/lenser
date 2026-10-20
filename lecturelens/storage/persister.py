@@ -10,6 +10,7 @@ from lecturelens.config.settings import Settings
 from lecturelens.core.agent_runtime import (
     PERSISTER_STOP_FLAG_NAME,
     AgentControl,
+    create_redis_bus,
     execute_agent_main,
     parse_runtime_arguments
 )
@@ -156,8 +157,8 @@ async def main() -> None:
     namespace = parse_runtime_arguments()
     session_id = namespace.session or settings.session_name or "default_session"
     session_dir = settings.get_session_output_dir(session_id)
-    redis_bus = RedisBus(settings.redis_url)
-    storage = PostgresStorage(settings.postgres_url)
+    redis_bus = create_redis_bus(settings)
+    storage = PostgresStorage(settings.postgres_url, query_limit=getattr(settings, "postgres_query_limit", 1000))
     try:
         await storage.init_schema()
     except Exception as pg_err:

@@ -448,8 +448,12 @@ class StructuringAgent:
             }
 
     def save_state(self, running_context: str, timeline_byte_offset: int, overlap_entries: list[dict[str, Any]]) -> None:
+        max_context = getattr(self.settings, "context_max_characters", 4000)
+        trimmed_context = running_context
+        if max_context > 0 and len(trimmed_context) > max_context:
+            trimmed_context = trimmed_context[-max_context:]
         payload = {
-            "running_context": running_context,
+            "running_context": trimmed_context,
             "timeline_byte_offset": timeline_byte_offset,
             "overlap_entries": overlap_entries,
             "sequence_number": self.sequence_number
@@ -644,14 +648,16 @@ class StructuringAgent:
 
     async def process_all_pending(self) -> int:
         processed_batches = 0
-        max_batches = getattr(self.settings, "max_structuring_batches", 1000)
-        for _ in range(max_batches):
+        max_batches = getattr(self.settings, "structuring_max_batches_per_run", getattr(self.settings, "max_structuring_batches", 1000))
+        while processed_batches < max_batches:
             batches = self.read_pending_batches()
             if len(batches) == 0:
                 break
             state = self.load_state()
             running_context = state["running_context"]
             for batch in batches:
+                if processed_batches >= max_batches:
+                    break
                 running_context = await self.process_single_batch(batch, running_context)
                 processed_batches += 1
                 self.control.set_stat("batches_processed", processed_batches)
@@ -666,6 +672,8 @@ class StructuringAgent:
                 path.unlink()
         self.current_overlap = []
         self.sequence_number = 0
+        if self.drift_filter is not None:
+            self.drift_filter.reset()
 
     async def run_guarded_pass(self) -> None:
         try:

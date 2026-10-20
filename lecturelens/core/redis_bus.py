@@ -62,23 +62,25 @@ class RedisBus:
         self.retry_ttl_seconds: int = retry_ttl_seconds
         self.outbox_max_size: int = outbox_max_size
         self.outbox: list[tuple[str, BaseModel]] = []
+        self._outbox_lock: asyncio.Lock = asyncio.Lock()
         self.failure_counts: dict[str, int] = {}
 
     async def flush_outbox(self) -> int:
-        if not self.outbox:
-            return 0
-        flushed = 0
-        remaining: list[tuple[str, BaseModel]] = []
-        for stream_name, event in self.outbox:
-            try:
-                await self.publish(stream_name, event)
-                flushed += 1
-            except Exception:
-                remaining.append((stream_name, event))
-        self.outbox = remaining
-        if flushed > 0:
-            logger.info("flushed %d events from outbox (%d remaining)", flushed, len(self.outbox))
-        return flushed
+        async with self._outbox_lock:
+            if not self.outbox:
+                return 0
+            flushed = 0
+            remaining: list[tuple[str, BaseModel]] = []
+            for stream_name, event in self.outbox:
+                try:
+                    await self.publish(stream_name, event)
+                    flushed += 1
+                except Exception:
+                    remaining.append((stream_name, event))
+            self.outbox = remaining
+            if flushed > 0:
+                logger.info("flushed %d events from outbox (%d remaining)", flushed, len(self.outbox))
+            return flushed
 
     async def publish(self, stream_name: str, event: BaseModel) -> str:
         event_data = event_to_redis_fields(event)
@@ -96,12 +98,13 @@ class RedisBus:
             return await self.publish(stream_name, event)
         except (redis.RedisError, OSError) as error:
             logger.warning("publish failed for %s: %s, buffering in outbox", stream_name, error)
-            if len(self.outbox) < self.outbox_max_size:
-                self.outbox.append((stream_name, event))
-            else:
-                logger.error("outbox full (%d items), dropping oldest event", self.outbox_max_size)
-                self.outbox.pop(0)
-                self.outbox.append((stream_name, event))
+            async with self._outbox_lock:
+                if len(self.outbox) < self.outbox_max_size:
+                    self.outbox.append((stream_name, event))
+                else:
+                    logger.error("outbox full (%d items), dropping oldest event", self.outbox_max_size)
+                    self.outbox.pop(0)
+                    self.outbox.append((stream_name, event))
             return None
 
     async def ensure_consumer_group(self, stream_name: str, group_name: str) -> None:

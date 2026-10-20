@@ -435,6 +435,71 @@ class TestGatewayMessages(GatewayTestBase):
         self.assertEqual(len(note_payloads), 1)
         self.assertEqual(note_payloads[0]["sequence_number"], 2)
 
+    def test_active_subscribers_prevent_session_eviction(self) -> None:
+        runtime = self.gateway.get_or_create_session("active_sub_session")
+        runtime.connection_count = 0
+        self.gateway.subscribers["active_sub_session"] = {mock.MagicMock(): asyncio.Queue()}
+        evicted = self.gateway.evict_idle_sessions(1)
+        self.assertEqual(evicted, 0)
+        self.assertIn("active_sub_session", self.gateway.sessions)
+
+    def test_idle_session_evicted_when_no_subscribers(self) -> None:
+        runtime = self.gateway.get_or_create_session("idle_session")
+        runtime.connection_count = 0
+        self.gateway.subscribers.pop("idle_session", None)
+        evicted = self.gateway.evict_idle_sessions(1)
+        self.assertEqual(evicted, 1)
+        self.assertNotIn("idle_session", self.gateway.sessions)
+
+
+class TestRemoteClientShutdown(unittest.IsolatedAsyncioTestCase):
+    async def test_remote_client_terminates_when_stop_event_set(self) -> None:
+        from lecturelens.client.remote_client import run_remote_client
+
+        class FakeSocket:
+            async def send(self, data: str) -> None:
+                pass
+
+            async def recv(self) -> str:
+                return json.dumps({"status": "authenticated"})
+
+        class FakeConnectContext:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            async def __aenter__(self) -> FakeSocket:
+                return FakeSocket()
+
+            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                pass
+
+        stop_event = asyncio.Event()
+        settings = Settings()
+
+        async def stop_after_delay() -> None:
+            await asyncio.sleep(0.05)
+            stop_event.set()
+
+        asyncio.create_task(stop_after_delay())
+
+        async def mock_stream(s: Any, setts: Any, stop_ev: Any) -> None:
+            await stop_ev.wait()
+
+        with mock.patch("websockets.connect", side_effect=lambda *a, **kw: FakeConnectContext(*a, **kw)):
+            with mock.patch("lecturelens.client.remote_client.stream_audio", side_effect=mock_stream):
+                await asyncio.wait_for(
+                    run_remote_client(
+                        settings,
+                        "ws://localhost:8765",
+                        api_key=None,
+                        session_id="test_remote_sess",
+                        use_audio=True,
+                        use_screen=False,
+                        stop_event=stop_event
+                    ),
+                    timeout=2.0
+                )
+
 
 class TestRateLimiter(unittest.TestCase):
     def test_burst_then_refill(self) -> None:

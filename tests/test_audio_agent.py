@@ -294,7 +294,8 @@ class TestAudioAgent(unittest.IsolatedAsyncioTestCase):
             wav_files = list(agent.raw_audio_dir.glob("chunk_*.wav"))
             self.assertEqual(len(wav_files), 5)
             self.assertEqual(agent.transcription_queue.qsize(), 2)
-            self.assertEqual(agent.dropped_transcriptions, 3)
+            self.assertEqual(len(agent.spillover_queue), 3)
+            self.assertEqual(agent.dropped_transcriptions, 0)
 
     async def test_stalled_source_is_restarted(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

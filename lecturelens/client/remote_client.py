@@ -134,12 +134,20 @@ async def run_remote_client(
                         raise PermissionError(str(reply))
                     tasks.append(asyncio.create_task(stream_screen(extra_socket, settings, session_stop_event)))
 
+                async def watch_stop() -> None:
+                    await stop_event.wait()
+                    session_stop_event.set()
+
+                stop_watcher = asyncio.create_task(watch_stop())
+                tasks.append(stop_watcher)
+
                 try:
-                    if len(tasks) == 0:
+                    if len(tasks) == 1 and tasks[0] is stop_watcher:
                         return
                     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                     session_stop_event.set()
                 finally:
+                    session_stop_event.set()
                     for task in tasks:
                         if not task.done():
                             task.cancel()

@@ -230,6 +230,8 @@ class ScreenAgent:
         published_id = await self.redis_bus.publish_resilient(self.stream_name, slide_event)
         if published_id is not None:
             self.control.increment_stat("slides_published")
+        else:
+            self.control.increment_stat("slides_buffered")
         needs_text_retry = (
             len(extracted_text.strip()) == 0
             and revisited_number == 0

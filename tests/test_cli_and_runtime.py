@@ -4,6 +4,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import typer
@@ -344,6 +345,42 @@ class TestCliCommands(unittest.TestCase):
                     audio_only=False,
                     monitor_index=1
                 )
+
+    def test_ask_command_passes_configured_qa_embed_batch_size(self) -> None:
+        captured_kwargs = {}
+
+        class DummyQAEngine:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                captured_kwargs.update(kwargs)
+
+            async def ask_with_sources(self, question: str) -> tuple[str, list]:
+                return "Answer", ["Source 1"]
+
+        with mock.patch("lecturelens.cli.main.check_redis", return_value=False), \
+             mock.patch("lecturelens.knowledge.qa_engine.QAEngine", DummyQAEngine):
+            session_dir = self.output / "test_qa_sess"
+            session_dir.mkdir(parents=True, exist_ok=True)
+            cli_main.ask(question="What is dynamic programming?", session="test_qa_sess", student_id=None)
+            self.assertEqual(captured_kwargs.get("embed_batch_size"), 32)
+
+    def test_student_output_dir_uses_sanitized_id(self) -> None:
+        with mock.patch("lecturelens.client.student_client.StudentClient") as MockClient:
+            mock_instance = mock.MagicMock()
+            mock_instance.run = mock.AsyncMock()
+            MockClient.return_value = mock_instance
+            cli_main.student(
+                server="ws://localhost:8765",
+                session="test_sess",
+                student_id="../../escaped_student",
+                language="English",
+                detail="comprehensive",
+                api_key=None
+            )
+            _, kwargs = MockClient.call_args
+            out_dir = kwargs.get("output_dir")
+            self.assertIsNotNone(out_dir)
+            self.assertEqual(out_dir.name, "escaped_student")
+            self.assertTrue(out_dir.resolve().is_relative_to(Settings().output_dir.resolve()))
 
     def test_event_loop_helper(self) -> None:
         from lecturelens.core.event_loop import ensure_event_loop_policy, run_async

@@ -612,11 +612,13 @@ class AudioAgent:
         try:
             self.transcription_queue.put_nowait(pending)
         except asyncio.QueueFull:
-            self.dropped_transcriptions += 1
-            self.control.set_stat("dropped_transcriptions", self.dropped_transcriptions)
-            logger.warning("transcription backlog full, buffering to spillover queue: %s", wav_path)
             if len(self.spillover_queue) < 100:
                 self.spillover_queue.append(pending)
+                logger.warning("transcription backlog full, buffering to spillover queue: %s", wav_path)
+            else:
+                self.dropped_transcriptions += 1
+                self.control.set_stat("dropped_transcriptions", self.dropped_transcriptions)
+                logger.error("transcription backlog and spillover full (%d), dropped: %s", len(self.spillover_queue), wav_path)
 
     async def transcription_loop(self) -> None:
         while True:
@@ -627,6 +629,13 @@ class AudioAgent:
                     pass
             pending = await self.transcription_queue.get()
             if pending is None:
+                while not self.transcription_queue.empty():
+                    rem = self.transcription_queue.get_nowait()
+                    if rem is not None:
+                        try:
+                            await self.transcribe_and_publish(rem)
+                        except Exception as error:
+                            logger.error("transcription failed for remaining %s: %s", rem.wav_path, error)
                 while self.spillover_queue:
                     spill_pending = self.spillover_queue.pop(0)
                     try:
@@ -683,6 +692,8 @@ class AudioAgent:
         published_id = await self.redis_bus.publish_resilient(self.stream_name, chunk_event)
         if published_id is not None:
             self.control.increment_stat("transcripts_published")
+        else:
+            self.control.increment_stat("transcripts_buffered")
         return chunk_event
 
     async def ingest_wav_bytes(

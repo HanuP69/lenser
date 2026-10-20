@@ -234,11 +234,13 @@ def create_base_chat_model(
         except ImportError:
             logger.warning("langchain_ollama missing, provider %s skipped", provider_name)
             return None
+        configured_model = str(provider_config.get("model", "")).strip()
         model_name = (
-            os.environ.get("LECTURELENS_OLLAMA_MODEL")
+            configured_model
+            or os.environ.get("LECTURELENS_OLLAMA_MODEL")
             or os.environ.get("LECTURELENS_LOCAL_MODEL")
             or os.environ.get("OLLAMA_MODEL")
-            or provider_config.get("model", "")
+            or ""
         )
         return ChatOllama(
             base_url=resolved_ollama_url,

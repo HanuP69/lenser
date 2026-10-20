@@ -191,6 +191,31 @@ class TestContextDriftFilterBehavior(unittest.TestCase):
         self.assertEqual(new_filter.accepted_count, 1)
         self.assertTrue(np.array_equal(new_filter.running_anchor, self.filter.running_anchor))
 
+    def test_short_statement_preserves_topic_shift_quarantine(self) -> None:
+        self.filter.filter_batch_entries([
+            {"content": "Chapter 4 Quadratic Equation Master Plan", "source_type": "transcript", "importance_flags": []}
+        ])
+        entries = [
+            {"content": "Welcome to chapter 5 arithmetic progressions", "source_type": "transcript", "importance_flags": []},
+            {"content": "Arithmetic progressions common difference and nth term", "source_type": "transcript", "importance_flags": []},
+            {"content": "Yes okay", "source_type": "transcript", "importance_flags": []},
+            {"content": "Sum of first n terms of arithmetic progression", "source_type": "transcript", "importance_flags": []},
+        ]
+        kept = self.filter.filter_batch_entries(entries)
+        contents = [e["content"] for e in kept]
+        self.assertIn("Welcome to chapter 5 arithmetic progressions", contents)
+        self.assertIn("Arithmetic progressions common difference and nth term", contents)
+        self.assertIn("Yes okay", contents)
+        self.assertIn("Sum of first n terms of arithmetic progression", contents)
+
+    def test_drift_filter_reset(self) -> None:
+        self.filter.check_entry("Chapter 4 Quadratic Equation Master Plan")
+        self.assertIsNotNone(self.filter.running_anchor)
+        self.filter.reset()
+        self.assertIsNone(self.filter.running_anchor)
+        self.assertEqual(self.filter.accepted_count, 0)
+        self.assertEqual(len(self.filter.pending_quarantine_entries), 0)
+
 
 class TestRecordedTimelineFiltering(unittest.TestCase):
     def test_yt_test_timeline_filtering(self) -> None:

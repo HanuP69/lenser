@@ -144,6 +144,15 @@ def parse_runtime_arguments(argument_list: Optional[list[str]] = None) -> argpar
     return namespace
 
 
+def create_redis_bus(settings: Settings) -> RedisBus:
+    return RedisBus(
+        settings.redis_url,
+        stream_max_length=getattr(settings, "stream_max_length", 200000),
+        reclaim_idle_ms=getattr(settings, "reclaim_idle_ms", 30000),
+        retry_ttl_seconds=getattr(settings, "retry_key_ttl_seconds", getattr(settings, "redis_retry_ttl_seconds", 86400))
+    )
+
+
 def build_runtime_context(namespace: argparse.Namespace) -> RuntimeContext:
     settings = Settings()
     if namespace.session is not None and len(namespace.session) > 0:
@@ -157,12 +166,7 @@ def build_runtime_context(namespace: argparse.Namespace) -> RuntimeContext:
 
     session_dir = settings.create_session_directories(session_id)
     session_clock = SessionClock.load_or_create(session_dir / "clock.json")
-    redis_bus = RedisBus(
-        settings.redis_url,
-        stream_max_length=getattr(settings, "stream_max_length", 200000),
-        reclaim_idle_ms=getattr(settings, "reclaim_idle_ms", 30000),
-        retry_ttl_seconds=getattr(settings, "redis_retry_ttl_seconds", 86400)
-    )
+    redis_bus = create_redis_bus(settings)
     configure_pools(settings.thread_pool_max_workers, settings.process_pool_max_workers)
     return RuntimeContext(
         settings=settings,

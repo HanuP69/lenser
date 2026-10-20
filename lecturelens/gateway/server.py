@@ -17,7 +17,12 @@ ensure_event_loop_policy()
 from lecturelens.agents.audio_agent import AudioAgent
 from lecturelens.agents.screen_agent import ScreenAgent
 from lecturelens.config.settings import Settings
-from lecturelens.core.agent_runtime import AgentControl, execute_agent_main, parse_runtime_arguments
+from lecturelens.core.agent_runtime import (
+    AgentControl,
+    create_redis_bus,
+    execute_agent_main,
+    parse_runtime_arguments
+)
 from lecturelens.core.clock import SessionClock
 from lecturelens.core.concurrency import configure_pools, shutdown_pools
 from lecturelens.core.logging_setup import get_logger
@@ -197,7 +202,10 @@ class GatewayServer:
 
     def evict_idle_sessions(self, count: int) -> int:
         idle_runtimes = sorted(
-            (runtime for runtime in self.sessions.values() if runtime.connection_count <= 0),
+            (
+                runtime for runtime in self.sessions.values()
+                if runtime.connection_count <= 0 and not self.subscribers.get(runtime.session_id)
+            ),
             key=lambda runtime: runtime.last_active
         )
         evicted = 0
@@ -339,6 +347,8 @@ class GatewayServer:
             await self.send_json(websocket, {"status": "authenticated", "session_id": session_id})
 
             if is_subscriber:
+                if session_id in self.sessions:
+                    self.sessions[session_id].last_active = time.monotonic()
                 client_queue = asyncio.Queue(maxsize=200)
                 writer_task = asyncio.create_task(self._subscriber_writer(websocket, client_queue))
 
@@ -530,7 +540,7 @@ async def main() -> None:
     control = AgentControl(session_dir, "gateway")
     control.write_heartbeat("live")
     heartbeat_task = asyncio.create_task(control.heartbeat_loop())
-    redis_bus = RedisBus(settings.redis_url)
+    redis_bus = create_redis_bus(settings)
     router = None
     try:
         from lecturelens.router.llm_router import build_router_for_task, load_router_config

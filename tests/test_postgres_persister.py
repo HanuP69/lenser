@@ -322,5 +322,42 @@ class TestPostgresLiveIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertIn("logarithmic_time", matching[0]["related_concepts"])
 
 
+class TestPostgresSchemaFallback(unittest.IsolatedAsyncioTestCase):
+    async def test_init_schema_succeeds_even_when_vector_extension_fails(self) -> None:
+        executed_sqls: list[str] = []
+
+        class FakeCursor:
+            async def execute(self, sql: str, params: Any = None) -> None:
+                executed_sqls.append(sql)
+                if "CREATE EXTENSION" in sql:
+                    raise RuntimeError("extension vector not found")
+
+            async def __aenter__(self) -> "FakeCursor":
+                return self
+
+            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                pass
+
+        class FakeConn:
+            def cursor(self) -> FakeCursor:
+                return FakeCursor()
+
+            async def __aenter__(self) -> "FakeConn":
+                return self
+
+            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                pass
+
+            def transaction(self) -> "FakeConn":
+                return self
+
+        storage = PostgresStorage("postgresql://mock/db")
+        storage._connection = FakeConn()
+        storage.get_connection = mock.AsyncMock(return_value=FakeConn())
+
+        await storage.init_schema()
+        self.assertTrue(any("CREATE TABLE IF NOT EXISTS timeline_events" in s for s in executed_sqls))
+
+
 if __name__ == "__main__":
     unittest.main()

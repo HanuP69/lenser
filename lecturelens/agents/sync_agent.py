@@ -80,7 +80,7 @@ class SyncAgent:
         self.recent_anchors: list[AnchorRecord] = []
         self.buffer_lock: asyncio.Lock = asyncio.Lock()
         self.entries_written: int = 0
-        self.fingerprint_history_limit: int = getattr(settings, "fingerprint_history_limit", FINGERPRINT_HISTORY_LIMIT)
+        self.fingerprint_history_limit: int = getattr(settings, "sync_fingerprint_history_limit", getattr(settings, "fingerprint_history_limit", FINGERPRINT_HISTORY_LIMIT))
         self.load_written_fingerprints()
 
     def load_written_fingerprints(self) -> None:
