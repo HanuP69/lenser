@@ -264,14 +264,91 @@ class TestStudentClient(unittest.IsolatedAsyncioTestCase):
         conn.commit()
         conn.close()
 
-        notes_file = self.output_dir / "lec_recon_personalized_notes.md"
+        notes_file = self.output_dir / "lec_recon_student_reconcile_personalized_notes.md"
         notes_file.write_text("\nContent segment 1\n", encoding="utf-8")
 
         client = StudentClient("ws://localhost:8765", "lec_recon", profile, self.output_dir)
-        written = notes_file.read_text(encoding="utf-8")
+        written = client.notes_file.read_text(encoding="utf-8")
         self.assertIn("Content segment 1", written)
         self.assertIn("Content segment 2", written)
         self.assertEqual(client.last_sequence_number, 2)
+
+    async def test_unauthorized_reply_is_recorded(self) -> None:
+        """The client used to ignore the unauthorized reply and reconnect
+        every second with the same rejected credentials."""
+        profile = StudentProfile(student_id="student_auth", preferred_language="English")
+        client = StudentClient("ws://localhost:8765", "lec_auth", profile, self.output_dir)
+        self.assertIsNone(client.auth_error)
+
+        await client.handle_server_frame(json.dumps({"status": "unauthorized", "error": "invalid api key"}))
+        self.assertEqual(client.auth_error, "invalid api key")
+
+    async def test_replay_requests_are_capped(self) -> None:
+        """A gap that can never be filled used to trigger an endless stream
+        of request_replay messages."""
+        profile = StudentProfile(student_id="student_gap", preferred_language="English")
+        client = StudentClient("ws://localhost:8765", "lec_gap", profile, self.output_dir)
+        sent: list[str] = []
+
+        class FakeSocket:
+            async def send(self, payload: str) -> None:
+                sent.append(payload)
+
+        socket = FakeSocket()
+        segment = GeneralNoteSegment(
+            session_id="lec_gap",
+            sequence_number=5,
+            timestamp_epoch=1700000000.0,
+            start_time="00:00:10",
+            end_time="00:00:30",
+            heading="Section 5",
+            content="Gap content",
+            key_points=[],
+            concept_tags=[]
+        )
+        for _ in range(40):
+            client.last_replay_request_time = 0.0
+            await client.on_note_segment_received(segment, socket)
+
+        self.assertLessEqual(len(sent), client.max_replay_requests + 1)
+        self.assertGreater(len(sent), 0)
+
+    async def test_two_students_in_one_directory_do_not_overwrite_each_other(self) -> None:
+        """The notes file used to be named after the session only, so two
+        students sharing an output directory clobbered each other's notes."""
+        profile_a = StudentProfile(student_id="student_a", preferred_language="English")
+        profile_b = StudentProfile(student_id="student_b", preferred_language="English")
+        client_a = StudentClient("ws://localhost:8765", "lec_shared", profile_a, self.output_dir)
+        client_b = StudentClient("ws://localhost:8765", "lec_shared", profile_b, self.output_dir)
+        self.assertNotEqual(client_a.notes_file, client_b.notes_file)
+
+        seg_a = GeneralNoteSegment(
+            session_id="lec_shared",
+            sequence_number=1,
+            timestamp_epoch=1700000000.0,
+            start_time="00:00:10",
+            end_time="00:00:30",
+            heading="Section 1",
+            content="Content written by student A",
+            key_points=[],
+            concept_tags=[]
+        )
+        seg_b = GeneralNoteSegment(
+            session_id="lec_shared",
+            sequence_number=1,
+            timestamp_epoch=1700000000.0,
+            start_time="00:00:10",
+            end_time="00:00:30",
+            heading="Section 1",
+            content="Content written by student B",
+            key_points=[],
+            concept_tags=[]
+        )
+        await client_a.on_note_segment_received(seg_a)
+        await client_b.on_note_segment_received(seg_b)
+
+        self.assertIn("Content written by student A", client_a.notes_file.read_text(encoding="utf-8"))
+        self.assertIn("Content written by student B", client_b.notes_file.read_text(encoding="utf-8"))
 
     async def test_apply_segment_raises_and_preserves_cursor_on_ledger_error(self) -> None:
         profile = StudentProfile(student_id="student_err", preferred_language="English")
@@ -452,11 +529,17 @@ class TestStudentClient(unittest.IsolatedAsyncioTestCase):
         profile = StudentProfile(student_id="student_legacy", preferred_language="English")
         state_file = self.output_dir / "lec_legacy_student_legacy_state.json"
         state_file.write_text(json.dumps({"last_sequence_number": 7}), encoding="utf-8")
-        notes_file = self.output_dir / "lec_legacy_personalized_notes.md"
-        notes_file.write_text("Preserved legacy notes content\n", encoding="utf-8")
+        legacy_notes_file = self.output_dir / "lec_legacy_personalized_notes.md"
+        legacy_notes_file.write_text("Preserved legacy notes content\n", encoding="utf-8")
 
         client = StudentClient("ws://localhost:8765", "lec_legacy", profile, self.output_dir)
-        self.assertTrue(notes_file.exists())
+        # The legacy per-session notes file is migrated to the per-student
+        # name so an upgrade does not lose the notes.
+        self.assertFalse(legacy_notes_file.exists())
+        self.assertIn(
+            "Preserved legacy notes content",
+            client.notes_file.read_text(encoding="utf-8")
+        )
         self.assertEqual(client.last_sequence_number, 7)
         self.assertFalse(client.pending_reconciliation)
 

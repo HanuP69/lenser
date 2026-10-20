@@ -45,9 +45,16 @@ def encode_message(
 
 
 class CaptureSpool:
-    def __init__(self, spool_path: Path, max_size: int = 500) -> None:
+    def __init__(
+        self,
+        spool_path: Path,
+        max_size: int = 500,
+        append_timeout_seconds: float = 5.0
+    ) -> None:
         self.spool_path = spool_path
         self.max_size = max_size
+        self.append_timeout_seconds = append_timeout_seconds
+        self.dropped_count = 0
         self.spool_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -66,27 +73,46 @@ class CaptureSpool:
             conn.close()
 
     def append(self, capture_id: str, payload_text: str) -> None:
-        conn = sqlite3.connect(str(self.spool_path), timeout=5.0)
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM pending_captures;")
-            count = int(cur.fetchone()[0])
-            if count >= self.max_size:
+        deadline = time.monotonic() + self.append_timeout_seconds
+        while True:
+            conn = sqlite3.connect(str(self.spool_path), timeout=5.0)
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM pending_captures;")
+                count = int(cur.fetchone()[0])
+                if count >= self.max_size:
+                    if time.monotonic() < deadline:
+                        # Backpressure: wait for the sender to acknowledge
+                        # something instead of dropping the capture.
+                        conn.close()
+                        time.sleep(0.05)
+                        continue
+                    # The spool stayed full. Dropping the oldest undelivered
+                    # capture lost lecture audio silently, so the failure is
+                    # now explicit and counted.
+                    self.dropped_count += 1
+                    logger.error(
+                        "capture spool %s is full (%d captures) after %.1fs; dropping the "
+                        "oldest pending capture (%d dropped so far)",
+                        self.spool_path, self.max_size, self.append_timeout_seconds,
+                        self.dropped_count
+                    )
+                    cur.execute(
+                        "SELECT capture_id FROM pending_captures ORDER BY created_at ASC LIMIT 1;"
+                    )
+                    old_rows = cur.fetchall()
+                    if old_rows:
+                        cur.execute(
+                            "DELETE FROM pending_captures WHERE capture_id = ?;", (old_rows[0][0],)
+                        )
                 cur.execute(
-                    "SELECT capture_id FROM pending_captures ORDER BY created_at ASC LIMIT ?;",
-                    (count - self.max_size + 1,)
+                    "INSERT OR REPLACE INTO pending_captures (capture_id, payload, created_at) VALUES (?, ?, ?);",
+                    (capture_id, payload_text, time.time())
                 )
-                old_ids = [row[0] for row in cur.fetchall()]
-                if old_ids:
-                    placeholders = ",".join("?" for _ in old_ids)
-                    cur.execute(f"DELETE FROM pending_captures WHERE capture_id IN ({placeholders});", old_ids)
-            cur.execute(
-                "INSERT OR REPLACE INTO pending_captures (capture_id, payload, created_at) VALUES (?, ?, ?);",
-                (capture_id, payload_text, time.time())
-            )
-            conn.commit()
-        finally:
-            conn.close()
+                conn.commit()
+                return
+            finally:
+                conn.close()
 
     def acknowledge(self, capture_id: str) -> None:
         conn = sqlite3.connect(str(self.spool_path), timeout=5.0)
@@ -115,17 +141,66 @@ class CaptureSpool:
             conn.close()
 
 
+def is_connection_closed(error: BaseException, websocket: Any = None) -> bool:
+    """Decide whether a send failure means the connection is gone.
+
+    The check used to look for the substring "close" in the error message and
+    for a ``websocket.closed`` attribute. The modern websockets client has no
+    ``closed`` attribute and a transport level reset ("connection reset by
+    peer") contains neither, so the loop kept running on a dead socket and
+    the client never reconnected.
+    """
+    try:
+        from websockets.exceptions import ConnectionClosed
+    except ImportError:
+        ConnectionClosed = ()  # type: ignore[assignment]
+    if ConnectionClosed and isinstance(error, ConnectionClosed):
+        return True
+    if isinstance(error, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, EOFError)):
+        return True
+    closed_state = getattr(websocket, "closed", None)
+    if closed_state is True:
+        return True
+    closed_property = getattr(websocket, "close_code", None)
+    if closed_property is not None:
+        return True
+    return False
+
+
 async def drain_spool(
     spool: CaptureSpool,
     websocket: Any,
-    stop_event: Optional[asyncio.Event] = None
-) -> None:
-    pending = spool.get_pending(limit=25)
-    for cap_id, frame_str in pending:
+    stop_event: Optional[asyncio.Event] = None,
+    batch_size: int = 25
+) -> int:
+    """Send every pending capture.
+
+    The drain used to send a single batch of 25 per connection, so a client
+    that had been offline longer than that never delivered the rest of the
+    backlog.
+    """
+    delivered = 0
+    while True:
         if stop_event is not None and stop_event.is_set():
             break
-        await send_and_wait(websocket, frame_str, max_retries=2, stop_event=stop_event, timeout=5.0)
-        spool.acknowledge(cap_id)
+        pending = await run_in_thread_pool(spool.get_pending, batch_size)
+        if len(pending) == 0:
+            break
+        progressed = False
+        for cap_id, frame_str in pending:
+            if stop_event is not None and stop_event.is_set():
+                break
+            try:
+                await send_and_wait(websocket, frame_str, max_retries=2, stop_event=stop_event, timeout=5.0)
+            except Exception as send_error:
+                logger.warning("could not send a spooled capture: %s", send_error)
+                break
+            await run_in_thread_pool(spool.acknowledge, cap_id)
+            delivered += 1
+            progressed = True
+        if not progressed:
+            break
+    return delivered
 
 
 async def wait_with_stop(coro: Any, stop_event: Optional[asyncio.Event] = None, timeout: float = 10.0) -> Any:
@@ -219,11 +294,11 @@ async def stream_audio(
                 cap_id = uuid.uuid4().hex
                 msg_text = encode_message("audio", "wav_b64", wav_bytes, time.time(), capture_id=cap_id)
                 if spool is not None:
-                    spool.append(cap_id, msg_text)
+                    await run_in_thread_pool(spool.append, cap_id, msg_text)
                 try:
                     await send_and_wait(websocket, msg_text, stop_event=stop_event)
                     if spool is not None:
-                        spool.acknowledge(cap_id)
+                        await run_in_thread_pool(spool.acknowledge, cap_id)
                 except Exception as stream_err:
                     logger.error("audio streaming error: %s", stream_err)
                     raise
@@ -260,13 +335,13 @@ async def stream_screen(
                 cap_id = uuid.uuid4().hex
                 msg_text = encode_message("screen", "png_b64", png_bytes, captured_at, capture_id=cap_id)
                 if spool is not None:
-                    spool.append(cap_id, msg_text)
+                    await run_in_thread_pool(spool.append, cap_id, msg_text)
                 await send_and_wait(websocket, msg_text, stop_event=stop_event)
                 if spool is not None:
-                    spool.acknowledge(cap_id)
+                    await run_in_thread_pool(spool.acknowledge, cap_id)
         except Exception as error:
             logger.error("screen streaming error: %s", error)
-            if "close" in str(error).lower() or getattr(websocket, "closed", False):
+            if is_connection_closed(error, websocket):
                 break
         await asyncio.sleep(settings.screenshot_interval_seconds)
 

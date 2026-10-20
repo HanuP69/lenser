@@ -39,6 +39,13 @@ CRITICAL CONSTRAINTS:
 5. Output pure markdown notes only.
 """
 
+KEY_POINT_STOPWORDS = frozenset({
+    "that", "this", "with", "from", "they", "their", "there", "these", "those",
+    "when", "then", "than", "which", "what", "where", "while", "into", "onto",
+    "each", "some", "such", "also", "only", "over", "under", "about", "have",
+    "will", "would", "could", "should", "because", "these", "those", "very",
+})
+
 
 class PersonalizationEngine:
     def __init__(
@@ -54,14 +61,47 @@ class PersonalizationEngine:
             preferred_language=self.profile.preferred_language,
             detail_level=self.profile.detail_level
         )
+        preserved = ""
+        if self.profile.preserved_terms:
+            preserved = (
+                "\nThese terms must appear verbatim in the rewritten section: "
+                + ", ".join(self.profile.preserved_terms)
+                + "\n"
+            )
         return (
-            f"{prompt_intro}\n\n"
+            f"{prompt_intro}\n{preserved}\n"
             f"SOURCE SECTION:\n"
             f"Heading: {segment.heading}\n"
             f"Key Points: {json.dumps(segment.key_points)}\n"
             f"Concepts: {', '.join(segment.concept_tags)}\n\n"
             f"SOURCE CONTENT:\n{segment.content}\n"
         )
+
+    def _significant_words(self, text: str) -> list[str]:
+        return [
+            word.lower()
+            for word in re.findall(r"\b\w{4,}\b", text)
+            if word.lower() not in KEY_POINT_STOPWORDS
+        ]
+
+    @staticmethod
+    def _word_matches(word: str, candidates: set[str]) -> bool:
+        """Match a word against the rewrite, tolerating simple inflection.
+
+        "halves" has to match "half" and "sorted" has to match "sort",
+        otherwise a faithful paraphrase is rejected as a hallucination.
+        """
+        if word in candidates:
+            return True
+        if len(word) < 4:
+            return False
+        stem = word[:3]
+        for candidate in candidates:
+            if len(candidate) < 3:
+                continue
+            if candidate[:3] == stem and abs(len(candidate) - len(word)) <= 3:
+                return True
+        return False
 
     def validate_rewrite(self, segment: GeneralNoteSegment, rewritten_text: str) -> bool:
         if not rewritten_text or len(rewritten_text.strip()) < 20:
@@ -72,7 +112,7 @@ class PersonalizationEngine:
             present_tags = 0
             for tag in segment.concept_tags:
                 clean_tag = tag.replace("_", " ").lower()
-                if clean_tag in lower_rewritten:
+                if clean_tag in lower_rewritten or tag.lower() in lower_rewritten:
                     present_tags += 1
             if present_tags < math.ceil(len(segment.concept_tags) * 0.5):
                 logger.warning("rewritten note omitted over half of the concept tags, rejected")
@@ -83,15 +123,44 @@ class PersonalizationEngine:
                 logger.warning("rewritten note omitted timestamp %s, rejected", segment.start_time)
                 return False
 
+        # Terms the student explicitly asked to keep have to survive the rewrite.
+        for term in self.profile.preserved_terms:
+            if term.lower() not in lower_rewritten:
+                logger.warning("rewritten note omitted the preserved term %r, rejected", term)
+                return False
+
         if segment.key_points:
-            found_kp = False
-            for kp in segment.key_points:
-                words = [w.lower() for w in re.findall(r"\b\w{4,}\b", kp)]
-                if words and any(w in lower_rewritten for w in words):
-                    found_kp = True
-                    break
-            if not found_kp:
-                logger.warning("rewritten note omitted all key points content, rejected")
+            rewrite_words = set(self._significant_words(rewritten_text))
+            source_words = set(self._significant_words(segment.content))
+            shared_with_source = sum(
+                1 for word in source_words if self._word_matches(word, rewrite_words)
+            )
+            if source_words and shared_with_source < 2:
+                # The rewrite shares almost no vocabulary with the source, so
+                # it is a translation into another script. Word level key
+                # point matching cannot judge it, and the concept tag check
+                # above already guards against a hallucinated rewrite.
+                return True
+
+            # A key point counts as covered when the rewrite reuses most of
+            # its significant words. Requiring a single literal word from a
+            # single key point was far too lax (a rewrite could drop
+            # everything and still pass).
+            required = math.ceil(len(segment.key_points) * 0.5)
+            covered = 0
+            for key_point in segment.key_points:
+                words = self._significant_words(key_point)
+                if not words:
+                    continue
+                needed = 1 if len(words) <= 2 else math.ceil(len(words) * 0.5)
+                hits = sum(1 for word in words if self._word_matches(word, rewrite_words))
+                if hits >= needed:
+                    covered += 1
+            if covered < required:
+                logger.warning(
+                    "rewritten note covered %d of %d key points, rejected",
+                    covered, len(segment.key_points)
+                )
                 return False
 
         return True
@@ -142,13 +211,29 @@ class StudentClient:
         self.ledger_file = output_dir / f"{session_id}_{profile.student_id}_ledger.db"
         self._ledger_was_new = not self.ledger_file.exists()
         self._init_ledger()
-        self.notes_file = output_dir / f"{session_id}_personalized_notes.md"
+        # The ledger and the cursor are per student, so the rendered notes
+        # have to be per student as well. A per-session file name meant two
+        # students sharing an output directory overwrote each other's notes.
+        self.notes_file = output_dir / f"{session_id}_{profile.student_id}_personalized_notes.md"
+        self.legacy_notes_file = output_dir / f"{session_id}_personalized_notes.md"
+        if not self.notes_file.exists() and self.legacy_notes_file.exists():
+            # Migrate the pre-0.4 per-session notes file so an upgrade does
+            # not lose the notes that were already written.
+            try:
+                self.legacy_notes_file.replace(self.notes_file)
+            except OSError as error:
+                logger.warning("could not migrate the legacy notes file: %s", error)
         reconciled = self.reconcile_notes_from_ledger()
         self.pending_reconciliation = not reconciled
         self.last_sequence_number = self.load_persisted_sequence()
         self.received_segments: list[GeneralNoteSegment] = []
         self.pending_segments: dict[int, GeneralNoteSegment] = {}
         self.is_running = False
+        self.auth_error: Optional[str] = None
+        self.replay_request_count = 0
+        self.max_replay_requests = 10
+        self.last_replay_request_time = 0.0
+        self.replay_request_interval_seconds = 2.0
 
     def reconcile_notes_from_ledger(self) -> bool:
         if not hasattr(self, "ledger_file") or not self.ledger_file.exists():
@@ -374,14 +459,7 @@ class StudentClient:
         if seq > self.last_sequence_number + 1:
             self.pending_segments[seq] = segment
             if websocket is not None:
-                gap_request = {
-                    "type": "request_replay",
-                    "last_sequence_number": self.last_sequence_number
-                }
-                try:
-                    await websocket.send(json.dumps(gap_request))
-                except Exception:
-                    pass
+                await self.request_replay(websocket)
             return ""
 
         last_applied = await self._apply_segment(segment)
@@ -393,6 +471,36 @@ class StudentClient:
 
         return last_applied
 
+    async def request_replay(self, websocket: Any) -> None:
+        """Ask the gateway for the notes that are missing.
+
+        The request used to be sent for every out-of-order segment with no
+        cap and no backoff, so a gap that could never be filled (a note that
+        never reached the durable store) turned into an endless request loop.
+        """
+        if self.replay_request_count >= self.max_replay_requests:
+            if self.replay_request_count == self.max_replay_requests:
+                logger.error(
+                    "sequence gap at %d could not be filled after %d replay requests; "
+                    "giving up on the replay",
+                    self.last_sequence_number + 1, self.max_replay_requests
+                )
+                self.replay_request_count += 1
+            return
+        now = time.monotonic()
+        if (now - self.last_replay_request_time) < self.replay_request_interval_seconds:
+            return
+        self.last_replay_request_time = now
+        self.replay_request_count += 1
+        gap_request = {
+            "type": "request_replay",
+            "last_sequence_number": self.last_sequence_number
+        }
+        try:
+            await websocket.send(json.dumps(gap_request))
+        except Exception:
+            pass
+
     async def handle_server_frame(self, raw_frame: str, websocket: Optional[Any] = None) -> None:
         try:
             payload = json.loads(raw_frame)
@@ -401,6 +509,14 @@ class StudentClient:
                 segment_data = payload.get("payload", {})
                 segment = GeneralNoteSegment(**segment_data)
                 await self.on_note_segment_received(segment, websocket)
+                return
+            status = payload.get("status")
+            if status == "unauthorized":
+                # The gateway rejected the handshake. Retrying every second
+                # with the same credentials is pointless, so the error is
+                # recorded and the reconnect loop stops.
+                self.auth_error = str(payload.get("error", "unauthorized"))
+                logger.error("gateway rejected the connection: %s", self.auth_error)
         except Exception as error:
             logger.warning("error parsing server frame: %s", error)
 
@@ -445,6 +561,12 @@ class StudentClient:
                         try:
                             frame = await asyncio.wait_for(websocket.recv(), timeout=2.0)
                             await self.handle_server_frame(frame, websocket)
+                            if self.auth_error is not None:
+                                logger.error(
+                                    "stopping the student client: the gateway rejected the "
+                                    "credentials (%s)", self.auth_error
+                                )
+                                return
                         except asyncio.TimeoutError:
                             if getattr(self, "pending_reconciliation", False):
                                 if self.reconcile_notes_from_ledger():
