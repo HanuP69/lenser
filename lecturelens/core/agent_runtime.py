@@ -152,14 +152,14 @@ def create_redis_bus(
     if outbox_path is not None:
         resolved_outbox = outbox_path
     else:
-        comp = component_name or f"proc_{os.getpid()}"
+        comp = component_name or "default"
         resolved_outbox = settings.output_dir / f"redis_outbox_{comp}.db"
     return RedisBus(
         settings.redis_url,
         stream_max_length=getattr(settings, "stream_max_length", 200000),
         reclaim_idle_ms=getattr(settings, "reclaim_idle_ms", 30000),
         retry_ttl_seconds=getattr(settings, "retry_key_ttl_seconds", getattr(settings, "redis_retry_ttl_seconds", 86400)),
-        outbox_max_size=getattr(settings, "outbox_max_size", getattr(settings, "redis_outbox_max_size", 1000)),
+        outbox_max_size=getattr(settings, "redis_outbox_max_size", getattr(settings, "outbox_max_size", 1000)),
         outbox_path=resolved_outbox
     )
 
@@ -172,7 +172,10 @@ def create_postgres_storage(settings: Settings) -> Any:
     )
 
 
-def build_runtime_context(namespace: argparse.Namespace) -> RuntimeContext:
+def build_runtime_context(
+    namespace: argparse.Namespace,
+    agent_name: Optional[str] = None
+) -> RuntimeContext:
     settings = Settings()
     if namespace.session is not None and len(namespace.session) > 0:
         settings.session_name = namespace.session
@@ -185,7 +188,12 @@ def build_runtime_context(namespace: argparse.Namespace) -> RuntimeContext:
 
     session_dir = settings.create_session_directories(session_id)
     session_clock = SessionClock.load_or_create(session_dir / "clock.json")
-    redis_bus = create_redis_bus(settings, outbox_path=session_dir / "redis_outbox.jsonl")
+    comp = agent_name or "runtime"
+    redis_bus = create_redis_bus(
+        settings,
+        outbox_path=session_dir / f"redis_outbox_{comp}.db",
+        component_name=comp
+    )
     configure_pools(settings.thread_pool_max_workers, settings.process_pool_max_workers)
     return RuntimeContext(
         settings=settings,
@@ -210,9 +218,13 @@ async def run_agent_with_heartbeat(agent: Any) -> None:
             logger.warning("final heartbeat failed: %s", error)
 
 
-async def run_standard_agent(build_agent: Callable[[RuntimeContext], Any]) -> None:
+async def run_standard_agent(
+    build_agent: Callable[[RuntimeContext], Any],
+    agent_name: Optional[str] = None
+) -> None:
     namespace = parse_runtime_arguments()
-    context = build_runtime_context(namespace)
+    inferred_name = agent_name or Path(sys.argv[0]).stem.replace("_agent", "")
+    context = build_runtime_context(namespace, agent_name=inferred_name)
     agent = build_agent(context)
     try:
         await run_agent_with_heartbeat(agent)

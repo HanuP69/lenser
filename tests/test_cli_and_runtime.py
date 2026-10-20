@@ -391,6 +391,20 @@ class TestCliCommands(unittest.TestCase):
 
         self.assertEqual(run_async(sample_coro()), 42)
 
+    def test_replay_cli_invokes_engine_and_reports_counts(self) -> None:
+        (self.session_dir / "timeline.jsonl").write_text('{"event_id": "1"}\n', encoding="utf-8")
+        with mock.patch("lecturelens.cli.main.create_redis_bus") as mock_bus_factory, \
+             mock.patch("lecturelens.core.replay.ReplayEngine.replay", new_callable=mock.AsyncMock) as mock_replay:
+            mock_bus = mock.AsyncMock()
+            mock_bus_factory.return_value = mock_bus
+            mock_replay.return_value = 1
+
+            cli_main.replay(session="lec1", speed=2.0, target_session="target_lec")
+            mock_bus_factory.assert_called_once()
+            _, kwargs = mock_bus_factory.call_args
+            self.assertEqual(kwargs.get("component_name"), "replay")
+            mock_replay.assert_awaited_once_with(target_session_id="target_lec")
+
 
 if __name__ == "__main__":
     unittest.main()

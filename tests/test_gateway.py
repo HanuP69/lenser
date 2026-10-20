@@ -469,6 +469,64 @@ class TestGatewayMessages(GatewayTestBase):
         self.assertEqual(note_payloads[0]["heading"], "From Redis")
         self.assertEqual(note_payloads[0]["sequence_number"], 2)
 
+    async def test_subscriber_replay_merges_postgres_and_uncommitted_redis_notes(self) -> None:
+        class PartialPostgresStorage:
+            async def get_general_notes_since(self, session_id: str, after_seq: int) -> list[dict[str, Any]]:
+                return [{
+                    "session_id": "room1",
+                    "sequence_number": 2,
+                    "timestamp_epoch": 100.0,
+                    "start_time": "00:01:00",
+                    "end_time": "00:02:00",
+                    "heading": "From Postgres",
+                    "content": "Postgres note content",
+                    "key_points": [],
+                    "concept_tags": []
+                }]
+
+        self.gateway.storage = PartialPostgresStorage()
+        redis_notes = [
+            {
+                "session_id": "room1",
+                "sequence_number": 2,
+                "timestamp_epoch": 100.0,
+                "start_time": "00:01:00",
+                "end_time": "00:02:00",
+                "heading": "From Postgres",
+                "content": "Postgres note content",
+                "key_points": [],
+                "concept_tags": []
+            },
+            {
+                "session_id": "room1",
+                "sequence_number": 3,
+                "timestamp_epoch": 110.0,
+                "start_time": "00:02:00",
+                "end_time": "00:03:00",
+                "heading": "From Redis New",
+                "content": "Unpersisted Redis note content",
+                "key_points": [],
+                "concept_tags": []
+            }
+        ]
+        self.gateway._replay_notes_from_redis = mock.AsyncMock(return_value=redis_notes)
+
+        sub_hello = json.dumps({
+            "type": "hello",
+            "api_key": "secret",
+            "session_id": "room1",
+            "role": "subscriber",
+            "last_sequence_number": 1
+        })
+        socket = FakeWebSocket([sub_hello])
+        await self.gateway.handle_connection(socket)
+
+        note_payloads = [msg["payload"] for msg in socket.sent if msg.get("type") == "note_segment"]
+        self.assertEqual(len(note_payloads), 2)
+        self.assertEqual(note_payloads[0]["sequence_number"], 2)
+        self.assertEqual(note_payloads[1]["sequence_number"], 3)
+        self.assertEqual(note_payloads[1]["heading"], "From Redis New")
+
     def test_active_subscribers_prevent_session_eviction(self) -> None:
         runtime = self.gateway.get_or_create_session("active_sub_session")
         runtime.connection_count = 0
@@ -533,6 +591,50 @@ class TestRemoteClientShutdown(unittest.IsolatedAsyncioTestCase):
                     ),
                     timeout=2.0
                 )
+
+    async def test_remote_client_terminates_immediately_on_cancellation(self) -> None:
+        from lecturelens.client.remote_client import run_remote_client
+
+        class HangingSocket:
+            async def send(self, data: str) -> None:
+                pass
+
+            async def recv(self) -> str:
+                await asyncio.sleep(60.0)
+                return "{}"
+
+        class FakeConnectContext:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                self.exited = False
+
+            async def __aenter__(self) -> HangingSocket:
+                return HangingSocket()
+
+            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                self.exited = True
+
+        settings = Settings()
+        ctx_instance = FakeConnectContext()
+
+        with mock.patch("websockets.connect", return_value=ctx_instance):
+            task = asyncio.create_task(
+                run_remote_client(
+                    settings,
+                    "ws://localhost:8765",
+                    api_key=None,
+                    session_id="test_cancel_sess",
+                    use_audio=False,
+                    use_screen=False,
+                    stop_event=None
+                )
+            )
+            await asyncio.sleep(0.05)
+            task.cancel()
+            start_t = time.monotonic()
+            await asyncio.gather(task, return_exceptions=True)
+            elapsed = time.monotonic() - start_t
+            self.assertLess(elapsed, 1.0)
+            self.assertTrue(ctx_instance.exited)
 
 
 class TestRateLimiter(unittest.TestCase):

@@ -73,6 +73,7 @@ class RedisBus:
         self._last_flush_attempt: float = 0.0
         self._flush_backoff_seconds: float = 1.0
         self._db_conn: Optional[sqlite3.Connection] = None
+        self._retry_task: Optional[asyncio.Task] = None
         if self.outbox_path:
             self._init_db()
             self._load_outbox()
@@ -82,6 +83,7 @@ class RedisBus:
             return
         self.outbox_path.parent.mkdir(parents=True, exist_ok=True)
         is_legacy = False
+        legacy_path = None
         if self.outbox_path.exists():
             try:
                 with open(self.outbox_path, "rb") as check_f:
@@ -94,7 +96,9 @@ class RedisBus:
         legacy_items: list[tuple[str, Any]] = []
         if is_legacy:
             try:
-                with open(self.outbox_path, "r", encoding="utf-8") as f:
+                legacy_path = self.outbox_path.with_suffix(".legacy_migration")
+                self.outbox_path.rename(legacy_path)
+                with open(legacy_path, "r", encoding="utf-8") as f:
                     for line in f:
                         stripped = line.strip()
                         if stripped:
@@ -103,9 +107,8 @@ class RedisBus:
                             p = item.get("data")
                             if s and p:
                                 legacy_items.append((s, p))
-                self.outbox_path.unlink(missing_ok=True)
             except Exception as err:
-                logger.warning("migrating legacy outbox file failed: %s", err)
+                logger.warning("reading legacy outbox file failed: %s", err)
 
         self._db_conn = sqlite3.connect(str(self.outbox_path), timeout=10.0, check_same_thread=False)
         self._db_conn.execute("PRAGMA journal_mode = WAL;")
@@ -129,6 +132,8 @@ class RedisBus:
                     (ev_id, s, json.dumps(p), time.time())
                 )
             self._db_conn.commit()
+            if legacy_path and legacy_path.exists():
+                legacy_path.unlink(missing_ok=True)
 
     def _load_outbox(self) -> None:
         if self._db_conn is None:
@@ -150,7 +155,18 @@ class RedisBus:
             logger.warning("loading persistent outbox failed: %s", err)
 
     def _append_to_outbox(self, stream_name: str, event: Any) -> None:
-        if len(self.outbox) >= self.outbox_max_size:
+        if self._db_conn is not None:
+            try:
+                cur = self._db_conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM outbox_entries;")
+                count_row = cur.fetchone()
+                total_in_db = int(count_row[0]) if count_row else 0
+            except Exception:
+                total_in_db = len(self.outbox)
+        else:
+            total_in_db = len(self.outbox)
+
+        if total_in_db >= self.outbox_max_size:
             raise RuntimeError(f"Persistent outbox capacity exceeded ({self.outbox_max_size})")
 
         event_data = event_to_redis_fields(event) if isinstance(event, BaseModel) else event
@@ -164,13 +180,26 @@ class RedisBus:
                     (event_id, stream_name, payload_str, time.time())
                 )
                 self._db_conn.commit()
-                row_id = cursor.lastrowid
-                if row_id is not None:
-                    self._outbox_row_ids.append(row_id)
+                self._outbox_row_ids.append(cursor.lastrowid)
             except Exception as err:
                 logger.error("saving persistent outbox failed: %s", err)
                 raise RuntimeError(f"Persisting to outbox failed: {err}") from err
         self.outbox.append((stream_name, event_data))
+
+    def start_background_worker(self) -> None:
+        if self._retry_task is None or self._retry_task.done():
+            self._retry_task = asyncio.create_task(self._retry_worker_loop())
+
+    async def _retry_worker_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(self._flush_backoff_seconds)
+                if self.outbox:
+                    await self.flush_outbox()
+            except asyncio.CancelledError:
+                break
+            except Exception as err:
+                logger.debug("outbox retry worker error: %s", err)
 
     async def flush_outbox(self) -> int:
         async with self._outbox_lock:
@@ -187,7 +216,7 @@ class RedisBus:
                         row_id = self._outbox_row_ids[idx]
                         self._db_conn.execute("DELETE FROM outbox_entries WHERE id = ?", (row_id,))
                         self._db_conn.commit()
-                except (redis.RedisError, OSError) as net_err:
+                except (redis.RedisError, OSError):
                     fail_idx = idx
                     self._flush_backoff_seconds = min(60.0, max(2.0, self._flush_backoff_seconds * 2.0))
                     break
@@ -220,6 +249,7 @@ class RedisBus:
         return entry_id
 
     async def publish_resilient(self, stream_name: str, event: BaseModel) -> Optional[str]:
+        self.start_background_worker()
         now = time.monotonic()
         if now - self._last_flush_attempt >= self._flush_backoff_seconds:
             await self.flush_outbox()
@@ -480,6 +510,14 @@ class RedisBus:
             return False
 
     async def close(self) -> None:
+        if self._retry_task is not None and not self._retry_task.done():
+            self._retry_task.cancel()
+            await asyncio.gather(self._retry_task, return_exceptions=True)
+            self._retry_task = None
+        try:
+            await self.flush_outbox()
+        except Exception:
+            pass
         if self._db_conn is not None:
             try:
                 self._db_conn.close()

@@ -476,7 +476,6 @@ class GatewayServer:
 
     async def _replay_notes(self, session_id: str, after_seq: int = 0) -> list[dict[str, Any]]:
         notes_by_seq: dict[int, dict[str, Any]] = {}
-        pg_success = False
         if self.storage is not None:
             try:
                 pg_notes = await self.storage.get_general_notes_since(session_id, after_seq)
@@ -484,19 +483,17 @@ class GatewayServer:
                     seq = int(note.get("sequence_number", 0))
                     if seq > after_seq:
                         notes_by_seq[seq] = note
-                pg_success = True
             except Exception as replay_err:
                 logger.warning("postgres replay failed for %s: %s; falling back to redis", session_id, replay_err)
 
-        if not pg_success or self.storage is None or not notes_by_seq:
-            try:
-                redis_notes = await self._replay_notes_from_redis(session_id, after_seq)
-                for note in redis_notes:
-                    seq = int(note.get("sequence_number", 0))
-                    if seq > after_seq and seq not in notes_by_seq:
-                        notes_by_seq[seq] = note
-            except Exception as redis_err:
-                logger.warning("redis replay failed for %s: %s", session_id, redis_err)
+        try:
+            redis_notes = await self._replay_notes_from_redis(session_id, after_seq)
+            for note in redis_notes:
+                seq = int(note.get("sequence_number", 0))
+                if seq > after_seq and seq not in notes_by_seq:
+                    notes_by_seq[seq] = note
+        except Exception as redis_err:
+            logger.warning("redis replay failed for %s: %s", session_id, redis_err)
 
         return [notes_by_seq[s] for s in sorted(notes_by_seq.keys())]
 

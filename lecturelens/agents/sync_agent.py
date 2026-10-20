@@ -366,17 +366,20 @@ class SyncAgent:
                 ordered_entries.append(buffered.entry)
             self.assign_correlation_ids(ordered_entries)
             text_block = self.render_lines(ordered_entries)
+            timeline_stream = f"lecturelens:{self.session_id}:stream:timeline"
+            try:
+                for entry in ordered_entries:
+                    await self.redis_bus.publish_resilient(timeline_stream, entry)
+            except Exception as pub_error:
+                logger.error("publishing timeline entry failed, keeping buffer unacknowledged: %s", pub_error)
+                return 0
+
             try:
                 await run_in_thread_pool(append_text_durably, self.timeline_path, text_block)
             except OSError as error:
                 logger.error("timeline write failed, entries kept in buffer: %s", error)
                 return 0
-            timeline_stream = f"lecturelens:{self.session_id}:stream:timeline"
-            for entry in ordered_entries:
-                try:
-                    await self.redis_bus.publish_resilient(timeline_stream, entry)
-                except Exception as pub_error:
-                    logger.warning("failed to publish timeline entry to stream: %s", pub_error)
+
             for buffered in ready:
                 self.remember_fingerprint(entry_fingerprint(buffered.entry))
                 if buffered.message_id is not None:

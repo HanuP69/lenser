@@ -57,6 +57,17 @@ class TestReplayEngine(unittest.IsolatedAsyncioTestCase):
         stream_name, entry = call_args[0]
         self.assertEqual(stream_name, "lecturelens:dest_sess:stream:timeline")
         self.assertEqual(entry.session_id, "dest_sess")
+        self.assertEqual(engine.published_count, 2)
+
+    async def test_replay_tracks_published_and_buffered_counts(self) -> None:
+        self.write_sample_timeline(3)
+        mock_bus = mock.AsyncMock()
+        mock_bus.publish_resilient.side_effect = ["1-0", None, "3-0"]
+        engine = ReplayEngine(self.timeline_path, redis_bus=mock_bus, speed=0.0)
+        count = await engine.replay(target_session_id="dest_sess", publish_to_timeline_stream=True)
+        self.assertEqual(count, 3)
+        self.assertEqual(engine.published_count, 2)
+        self.assertEqual(engine.buffered_count, 1)
 
     async def test_empty_or_missing_file_returns_zero(self) -> None:
         missing_path = Path(self.temp_dir.name) / "nonexistent.jsonl"

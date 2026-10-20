@@ -86,8 +86,7 @@ CREATE TABLE IF NOT EXISTS embeddings (
     source_id TEXT,
     chunk_text TEXT,
     embedding_model TEXT DEFAULT '',
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    CONSTRAINT embeddings_session_id_source_id_key UNIQUE(session_id, source_id)
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_timeline_events_session ON timeline_events (session_id, timestamp_epoch);
@@ -158,6 +157,10 @@ class PostgresStorage:
             async with self.transaction() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute("ALTER TABLE embeddings ADD COLUMN IF NOT EXISTS embedding_model TEXT DEFAULT '';")
+                    await cur.execute("""
+                        DELETE FROM embeddings a USING embeddings b
+                        WHERE a.id < b.id AND a.session_id = b.session_id AND a.source_id = b.source_id;
+                    """)
                     await cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_session_source ON embeddings (session_id, source_id);")
         except Exception as schema_err:
             logger.debug("embeddings schema update skipped: %s", schema_err)
@@ -411,7 +414,7 @@ class PostgresStorage:
         exclude_model: Optional[str] = None
     ) -> int:
         if exclude_model:
-            query = "DELETE FROM embeddings WHERE session_id = %s AND embedding_model != %s AND embedding_model != '';"
+            query = "DELETE FROM embeddings WHERE session_id = %s AND (embedding_model != %s OR embedding_model IS NULL);"
             params = (session_id, exclude_model)
         else:
             query = "DELETE FROM embeddings WHERE session_id = %s;"
@@ -432,7 +435,7 @@ class PostgresStorage:
             query = """
             SELECT chunk_text, source_id, source_type, (embedding <=> %s::vector) AS distance
             FROM embeddings
-            WHERE session_id = %s AND embedding IS NOT NULL AND (embedding_model = %s OR embedding_model = '' OR embedding_model IS NULL)
+            WHERE session_id = %s AND embedding IS NOT NULL AND embedding_model = %s
             ORDER BY distance ASC
             LIMIT %s;
             """

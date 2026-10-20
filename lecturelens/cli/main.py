@@ -955,17 +955,21 @@ def replay(
     if not timeline_path.exists():
         fail(f"No timeline.jsonl found in {session_dir}")
 
-    async def run() -> int:
-        bus = create_redis_bus(settings)
+    async def run() -> tuple[int, int, int]:
+        bus = create_redis_bus(settings, component_name="replay")
         try:
             engine = ReplayEngine(timeline_path, redis_bus=bus, speed=speed)
-            return await engine.replay(target_session_id=target_session or session_id)
+            total = await engine.replay(target_session_id=target_session or session_id)
+            return total, engine.published_count, engine.buffered_count
         finally:
             await bus.close()
 
     try:
-        count = asyncio.run(run())
-        console.print(f"[green]Replayed {count} event(s) at {speed}x speed.[/green]")
+        total, published, buffered = asyncio.run(run())
+        if buffered > 0:
+            console.print(f"[yellow]Replayed {total} event(s) at {speed}x speed ({published} published to Redis, {buffered} buffered in outbox).[/yellow]")
+        else:
+            console.print(f"[green]Replayed {total} event(s) at {speed}x speed.[/green]")
     except Exception as error:
         fail(f"Replay failed: {error}")
 

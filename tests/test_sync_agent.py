@@ -237,6 +237,27 @@ class TestSyncEndToEnd(SyncTestBase):
         for suffix in ("transcript", "slide"):
             await self.bus.client.delete(f"lecturelens:{session}:stream:{suffix}")
 
+    async def test_flush_ready_entries_retains_buffer_when_publish_fails(self) -> None:
+        agent = SyncAgent(self.settings, self.bus, SessionClock(), "test_sync_fail_session")
+        ent = entry(100.0, "transcript", "test fail")
+        buf = BufferedEntry(
+            entry=ent,
+            arrival_monotonic=time.monotonic() - 10.0,
+            stream_name="s",
+            group_name="g",
+            message_id="1-0"
+        )
+        agent.pending_buffer.append(buf)
+        agent.acknowledge = mock.AsyncMock()
+
+        agent.redis_bus.publish_resilient = mock.AsyncMock(side_effect=RuntimeError("outbox disk full"))
+
+        flushed = await agent.flush_ready_entries(force=True)
+        self.assertEqual(flushed, 0)
+        self.assertEqual(len(agent.pending_buffer), 1)
+        self.assertFalse(agent.acknowledge.called)
+        self.assertFalse(agent.timeline_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

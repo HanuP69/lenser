@@ -101,14 +101,22 @@ async def wait_with_stop(coro: Any, stop_event: asyncio.Event, timeout: float = 
         raise asyncio.CancelledError("Stopped before starting operation")
     stop_task = asyncio.create_task(stop_event.wait())
     op_task = asyncio.create_task(coro)
-    done, pending = await asyncio.wait([op_task, stop_task], timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
-    for p in pending:
-        p.cancel()
-    if stop_event.is_set():
-        raise asyncio.CancelledError("Operation interrupted by stop_event")
-    if op_task not in done:
-        raise TimeoutError("Operation timed out")
-    return op_task.result()
+    try:
+        done, pending = await asyncio.wait([op_task, stop_task], timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        for p in pending:
+            p.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        if stop_event.is_set():
+            raise asyncio.CancelledError("Operation interrupted by stop_event")
+        if op_task not in done:
+            raise TimeoutError("Operation timed out")
+        return op_task.result()
+    except BaseException:
+        stop_task.cancel()
+        op_task.cancel()
+        await asyncio.gather(stop_task, op_task, return_exceptions=True)
+        raise
 
 
 async def connect_and_auth(
@@ -129,8 +137,11 @@ async def connect_and_auth(
         if reply.get("status") != "authenticated":
             raise PermissionError(str(reply))
         return ctx, socket
-    except Exception:
-        await ctx.__aexit__(None, None, None)
+    except BaseException:
+        try:
+            await ctx.__aexit__(None, None, None)
+        except Exception:
+            pass
         raise
 
 
@@ -180,7 +191,9 @@ async def run_remote_client(
             session_stop_event.set()
         except PermissionError:
             raise
-        except (asyncio.CancelledError, Exception) as conn_error:
+        except asyncio.CancelledError:
+            break
+        except Exception as conn_error:
             if stop_event.is_set():
                 break
             logger.warning("remote client connection lost (%s), reconnecting in 2s...", conn_error)

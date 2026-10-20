@@ -63,6 +63,7 @@ class Settings(BaseSettings):
     stream_max_length: int = Field(default=200000)
     reclaim_idle_ms: int = Field(default=30000)
     retry_key_ttl_seconds: int = Field(default=86400)
+    redis_outbox_max_size: int = Field(default=1000)
     structuring_max_batches_per_run: int = Field(default=1000)
     qa_embed_batch_size: int = Field(default=32)
     postgres_query_limit: int = Field(default=1000)

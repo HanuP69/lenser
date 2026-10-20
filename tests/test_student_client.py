@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -237,6 +238,62 @@ class TestStudentClient(unittest.IsolatedAsyncioTestCase):
         written = client.notes_file.read_text(encoding="utf-8")
         self.assertEqual(written.count("Ledger content should appear once."), 1)
         self.assertTrue(client.ledger_file.exists())
+
+    async def test_startup_reconciliation_appends_missing_markdown(self) -> None:
+        import sqlite3
+        profile = StudentProfile(student_id="student_reconcile", preferred_language="English")
+        ledger_file = self.output_dir / "lec_recon_student_reconcile_ledger.db"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(ledger_file))
+        conn.execute("""
+            CREATE TABLE applied_segments (
+                sequence_number INTEGER PRIMARY KEY,
+                session_id TEXT,
+                heading TEXT,
+                content TEXT,
+                created_at REAL
+            );
+        """)
+        conn.execute(
+            "INSERT INTO applied_segments VALUES (1, 'lec_recon', 'Head 1', 'Content segment 1', 1000.0)"
+        )
+        conn.execute(
+            "INSERT INTO applied_segments VALUES (2, 'lec_recon', 'Head 2', 'Content segment 2', 1001.0)"
+        )
+        conn.commit()
+        conn.close()
+
+        notes_file = self.output_dir / "lec_recon_personalized_notes.md"
+        notes_file.write_text("\nContent segment 1\n", encoding="utf-8")
+
+        client = StudentClient("ws://localhost:8765", "lec_recon", profile, self.output_dir)
+        written = notes_file.read_text(encoding="utf-8")
+        self.assertIn("Content segment 1", written)
+        self.assertIn("Content segment 2", written)
+        self.assertEqual(client.last_sequence_number, 2)
+
+    async def test_apply_segment_raises_and_preserves_cursor_on_ledger_error(self) -> None:
+        profile = StudentProfile(student_id="student_err", preferred_language="English")
+        client = StudentClient("ws://localhost:8765", "lec_err", profile, self.output_dir)
+        self.assertEqual(client.last_sequence_number, 0)
+        seg = GeneralNoteSegment(
+            session_id="lec_err",
+            sequence_number=1,
+            timestamp_epoch=1700000010.0,
+            start_time="00:00:10",
+            end_time="00:00:20",
+            heading="Err Section",
+            content="Content should not persist on error.",
+            key_points=[],
+            concept_tags=[]
+        )
+        with mock.patch("sqlite3.connect", side_effect=sqlite3.OperationalError("disk failure")):
+            with self.assertRaises(RuntimeError):
+                await client._apply_segment(seg)
+
+        self.assertEqual(client.last_sequence_number, 0)
+        if client.notes_file.exists():
+            self.assertNotIn("Content should not persist on error.", client.notes_file.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

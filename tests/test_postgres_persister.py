@@ -444,7 +444,88 @@ class TestPostgresSchemaFallback(unittest.IsolatedAsyncioTestCase):
         del_count = await storage.delete_session_embeddings("sess_abc", exclude_model="nomic-embed-text")
         self.assertEqual(del_count, 3)
         self.assertIn("embedding_model !=", executed[1][0])
+        self.assertIn("embedding_model IS NULL", executed[1][0])
         self.assertEqual(executed[1][1], ("sess_abc", "nomic-embed-text"))
+
+    async def test_search_embeddings_strictly_filters_model(self) -> None:
+        executed: list[tuple[str, Any]] = []
+
+        class FakeSearchCursor:
+            async def execute(self, sql: str, params: Any = None) -> None:
+                executed.append((sql, params))
+
+            async def fetchall(self) -> list[dict[str, Any]]:
+                return [{"chunk_text": "text", "source_id": "s1", "source_type": "transcript", "distance": 0.1}]
+
+            async def __aenter__(self) -> "FakeSearchCursor":
+                return self
+
+            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                pass
+
+        class FakeSearchConn:
+            def cursor(self) -> FakeSearchCursor:
+                return FakeSearchCursor()
+
+            async def __aenter__(self) -> "FakeSearchConn":
+                return self
+
+            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                pass
+
+        storage = PostgresStorage("postgresql://mock/db")
+        storage._connection = FakeSearchConn()
+        storage.get_connection = mock.AsyncMock(return_value=FakeSearchConn())
+
+        results = await storage.search_embeddings("sess_abc", [0.1, 0.2], top_k=3, embedding_model="nomic-embed-text")
+        self.assertEqual(len(results), 1)
+        sql, params = executed[0]
+        self.assertIn("embedding_model = %s", sql)
+        self.assertNotIn("embedding_model = ''", sql)
+        self.assertNotIn("embedding_model IS NULL", sql)
+        self.assertEqual(params, ([0.1, 0.2], "sess_abc", "nomic-embed-text", 3))
+
+    async def test_init_schema_deduplicates_embeddings_before_unique_index(self) -> None:
+        executed_sqls: list[str] = []
+
+        class FakeMigrateCursor:
+            async def execute(self, sql: str, params: Any = None) -> None:
+                executed_sqls.append(sql)
+
+            async def __aenter__(self) -> "FakeMigrateCursor":
+                return self
+
+            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                pass
+
+        class FakeMigrateConn:
+            def cursor(self) -> FakeMigrateCursor:
+                return FakeMigrateCursor()
+
+            async def __aenter__(self) -> "FakeMigrateConn":
+                return self
+
+            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                pass
+
+            def transaction(self) -> "FakeMigrateConn":
+                return self
+
+        storage = PostgresStorage("postgresql://mock/db")
+        storage._connection = FakeMigrateConn()
+        storage.get_connection = mock.AsyncMock(return_value=FakeMigrateConn())
+
+        await storage.init_schema()
+        dedup_idx = -1
+        index_idx = -1
+        for idx, sql in enumerate(executed_sqls):
+            if "DELETE FROM embeddings a USING embeddings b" in sql:
+                dedup_idx = idx
+            if "CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_session_source" in sql:
+                index_idx = idx
+
+        self.assertGreaterEqual(dedup_idx, 0)
+        self.assertGreater(index_idx, dedup_idx)
 
 
 if __name__ == "__main__":

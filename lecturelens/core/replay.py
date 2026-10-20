@@ -20,6 +20,8 @@ class ReplayEngine:
         self.timeline_path = timeline_path
         self.redis_bus = redis_bus
         self.speed = speed
+        self.published_count: int = 0
+        self.buffered_count: int = 0
 
     def load_entries(self) -> list[TimelineEntry]:
         if not self.timeline_path.exists():
@@ -56,6 +58,8 @@ class ReplayEngine:
         first_timestamp = entries[0].timestamp_epoch
         last_timestamp = first_timestamp
         replayed_count = 0
+        self.published_count = 0
+        self.buffered_count = 0
 
         for entry in entries:
             current_timestamp = entry.timestamp_epoch
@@ -77,7 +81,11 @@ class ReplayEngine:
             if self.redis_bus is not None:
                 if publish_to_timeline_stream:
                     stream_name = f"lecturelens:{session_id}:stream:timeline"
-                    await self.redis_bus.publish_resilient(stream_name, replayed_entry)
+                    res = await self.redis_bus.publish_resilient(stream_name, replayed_entry)
+                    if res is not None:
+                        self.published_count += 1
+                    else:
+                        self.buffered_count += 1
                 if publish_to_source_streams:
                     if replayed_entry.source_type == "transcript":
                         meta = replayed_entry.metadata or {}
@@ -95,7 +103,12 @@ class ReplayEngine:
                             raw_audio_path=str(meta.get("raw_audio_path", "") or "")
                         )
                         source_stream = f"lecturelens:{session_id}:stream:transcript"
-                        await self.redis_bus.publish_resilient(source_stream, chunk)
+                        res_src = await self.redis_bus.publish_resilient(source_stream, chunk)
+                        if not publish_to_timeline_stream:
+                            if res_src is not None:
+                                self.published_count += 1
+                            else:
+                                self.buffered_count += 1
                     elif replayed_entry.source_type == "slide":
                         meta = replayed_entry.metadata or {}
                         slide = SlideCaptured(
@@ -109,7 +122,14 @@ class ReplayEngine:
                             ocr_latency_ms=float(meta.get("ocr_latency_ms", 0.0) or 0.0)
                         )
                         source_stream = f"lecturelens:{session_id}:stream:slide"
-                        await self.redis_bus.publish_resilient(source_stream, slide)
+                        res_src = await self.redis_bus.publish_resilient(source_stream, slide)
+                        if not publish_to_timeline_stream:
+                            if res_src is not None:
+                                self.published_count += 1
+                            else:
+                                self.buffered_count += 1
+            else:
+                self.published_count += 1
 
             replayed_count += 1
 

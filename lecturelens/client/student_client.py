@@ -143,9 +143,41 @@ class StudentClient:
         self._init_ledger()
         self.last_sequence_number = self.load_persisted_sequence()
         self.notes_file = output_dir / f"{session_id}_personalized_notes.md"
+        self.reconcile_notes_from_ledger()
         self.received_segments: list[GeneralNoteSegment] = []
         self.pending_segments: dict[int, GeneralNoteSegment] = {}
         self.is_running = False
+
+    def reconcile_notes_from_ledger(self) -> None:
+        if not hasattr(self, "ledger_file") or not self.ledger_file.exists():
+            return
+        try:
+            conn = sqlite3.connect(str(self.ledger_file), timeout=5.0)
+            cur = conn.cursor()
+            cur.execute("SELECT sequence_number, content FROM applied_segments ORDER BY sequence_number ASC;")
+            rows = cur.fetchall()
+            conn.close()
+            if not rows:
+                return
+            existing_text = ""
+            if self.notes_file.exists():
+                existing_text = self.notes_file.read_text(encoding="utf-8")
+            missing_content = []
+            for seq, content in rows:
+                if content and content.strip() and content.strip() not in existing_text:
+                    missing_content.append(content)
+            if missing_content:
+                self.output_dir.mkdir(parents=True, exist_ok=True)
+                with open(self.notes_file, "a", encoding="utf-8") as handle:
+                    for c in missing_content:
+                        handle.write(f"\n{c}\n")
+                    handle.flush()
+                    try:
+                        os.fsync(handle.fileno())
+                    except Exception:
+                        pass
+        except Exception as err:
+            logger.warning("failed to reconcile notes from ledger: %s", err)
 
     def _init_ledger(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -197,7 +229,7 @@ class StudentClient:
 
     async def _apply_segment(self, segment: GeneralNoteSegment) -> str:
         personalized_content = await self.rewriter.rewrite_segment(segment)
-        is_new = True
+        is_new = False
         try:
             conn = sqlite3.connect(str(self.ledger_file), timeout=10.0)
             cur = conn.cursor()
@@ -209,7 +241,8 @@ class StudentClient:
             conn.commit()
             conn.close()
         except Exception as ledger_err:
-            logger.warning("saving to student ledger failed: %s", ledger_err)
+            logger.error("saving to student ledger failed: %s", ledger_err)
+            raise RuntimeError(f"saving to student ledger failed: {ledger_err}") from ledger_err
 
         if is_new:
             self.output_dir.mkdir(parents=True, exist_ok=True)
