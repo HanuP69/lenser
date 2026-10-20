@@ -648,5 +648,33 @@ class TestRateLimiter(unittest.TestCase):
         self.assertTrue(limiter.allow())
 
 
+class TestRemoteClientSendAndWait(unittest.IsolatedAsyncioTestCase):
+    async def test_send_and_wait_succeeds_on_acknowledged(self) -> None:
+        from lecturelens.client.remote_client import send_and_wait
+        mock_ws = mock.AsyncMock()
+        mock_ws.recv.return_value = json.dumps({"status": "acknowledged"})
+        await send_and_wait(mock_ws, '{"type": "audio"}')
+        mock_ws.send.assert_awaited_once_with('{"type": "audio"}')
+
+    async def test_send_and_wait_retries_transient_error_and_succeeds(self) -> None:
+        from lecturelens.client.remote_client import send_and_wait
+        mock_ws = mock.AsyncMock()
+        mock_ws.recv.side_effect = [
+            json.dumps({"status": "error", "error": "busy"}),
+            json.dumps({"status": "acknowledged"})
+        ]
+        await send_and_wait(mock_ws, '{"type": "screen"}', max_retries=3, initial_backoff=0.01)
+        self.assertEqual(mock_ws.send.await_count, 2)
+
+    async def test_send_and_wait_raises_runtime_error_when_retries_exhausted(self) -> None:
+        from lecturelens.client.remote_client import send_and_wait
+        mock_ws = mock.AsyncMock()
+        mock_ws.recv.return_value = json.dumps({"status": "error", "error": "outbox full"})
+        with self.assertRaises(RuntimeError) as ctx:
+            await send_and_wait(mock_ws, '{"type": "audio"}', max_retries=2, initial_backoff=0.01)
+        self.assertIn("server rejected frame", str(ctx.exception))
+        self.assertEqual(mock_ws.send.await_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

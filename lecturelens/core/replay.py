@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -73,7 +74,8 @@ class ReplayEngine:
 
             session_id = target_session_id or entry.session_id
             if target_session_id is not None and target_session_id != entry.session_id:
-                new_event_id = uuid.uuid4().hex
+                source_id = entry.event_id or f"{entry.source_type}_{entry.timestamp_epoch}"
+                new_event_id = hashlib.sha256(f"{target_session_id}:{source_id}".encode("utf-8")).hexdigest()[:32]
                 replayed_entry = entry.model_copy(update={"session_id": session_id, "event_id": new_event_id})
             else:
                 replayed_entry = entry.model_copy(update={"session_id": session_id})

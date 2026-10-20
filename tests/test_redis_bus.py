@@ -406,6 +406,48 @@ class TestRedisBusReliability(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(bus2._retry_task.done())
             await bus2.close()
 
+    async def test_outbox_can_buffer_same_event_id_to_different_streams_during_outage(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            outbox_file = Path(td) / "outbox.db"
+            bus = RedisBus(Settings().redis_url, outbox_path=outbox_file)
+
+            async def offline_pub(stream, event):
+                raise redis_module.ConnectionError("offline")
+
+            bus.publish = offline_pub
+            chunk = make_chunk("shared event")
+            chunk.event_id = "shared_evt_42"
+
+            res1 = await bus.publish_resilient("stream_timeline", chunk)
+            res2 = await bus.publish_resilient("stream_transcript", chunk)
+
+            self.assertIsNone(res1)
+            self.assertIsNone(res2)
+            self.assertEqual(len(bus.outbox), 2)
+            self.assertEqual(bus.outbox[0][0], "stream_timeline")
+            self.assertEqual(bus.outbox[1][0], "stream_transcript")
+            self.assertEqual(bus.outbox[0][1]["event_id"], "shared_evt_42")
+            self.assertEqual(bus.outbox[1][1]["event_id"], "shared_evt_42")
+            await bus.close()
+
+    async def test_close_prevents_retry_worker_restart_and_cleans_up_task(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            outbox_file = Path(td) / "outbox.db"
+            bus = RedisBus(Settings().redis_url, outbox_path=outbox_file)
+
+            async def offline_pub(stream, event):
+                raise redis_module.ConnectionError("offline")
+
+            bus.publish = offline_pub
+            chunk = make_chunk("failing event")
+            await bus.publish_resilient("stream_fail", chunk)
+            self.assertEqual(len(bus.outbox), 1)
+
+            await bus.close()
+            self.assertTrue(bus._closing)
+            self.assertIsNone(bus._retry_task)
+            self.assertIsNone(bus._db_conn)
+
 
 if __name__ == "__main__":
     unittest.main()

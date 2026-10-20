@@ -33,12 +33,31 @@ def encode_message(
     return json.dumps({"type": message_type, field_name: encoded, "timestamp_epoch": capture_epoch})
 
 
-async def send_and_wait(websocket: Any, text_frame: str) -> None:
-    await websocket.send(text_frame)
-    reply = await websocket.recv()
-    parsed = json.loads(reply)
-    if parsed.get("status") != "acknowledged":
-        logger.warning("server replied: %s", parsed)
+async def send_and_wait(
+    websocket: Any,
+    text_frame: str,
+    max_retries: int = 3,
+    initial_backoff: float = 0.5
+) -> None:
+    backoff = initial_backoff
+    last_reply = None
+    for attempt in range(max_retries):
+        await websocket.send(text_frame)
+        reply = await websocket.recv()
+        parsed = json.loads(reply)
+        if parsed.get("status") == "acknowledged":
+            return
+        last_reply = parsed
+        logger.warning(
+            "server rejected frame (attempt %d/%d): %s",
+            attempt + 1,
+            max_retries,
+            parsed
+        )
+        if attempt < max_retries - 1:
+            await asyncio.sleep(backoff)
+            backoff *= 2.0
+    raise RuntimeError(f"server rejected frame after {max_retries} attempts: {last_reply}")
 
 
 async def stream_audio(websocket: Any, settings: Settings, stop_event: asyncio.Event) -> None:
@@ -64,7 +83,7 @@ async def stream_audio(websocket: Any, settings: Settings, stop_event: asyncio.E
                         websocket, encode_message("audio", "wav_b64", wav_bytes, time.time())
                     )
                 except Exception as stream_err:
-                    logger.warning("audio streaming connection closed: %s", stream_err)
+                    logger.error("audio streaming error: %s", stream_err)
                     return
     finally:
         await run_in_thread_pool(source.stop)

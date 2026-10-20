@@ -75,10 +75,10 @@ class RedisBus:
         self._flush_backoff_seconds: float = 1.0
         self._db_conn: Optional[sqlite3.Connection] = None
         self._retry_task: Optional[asyncio.Task] = None
+        self._closing: bool = False
         if self.outbox_path:
             self._init_db()
             self._load_outbox()
-            self.ensure_background_worker()
 
     def _init_db(self) -> None:
         if not self.outbox_path:
@@ -119,12 +119,47 @@ class RedisBus:
         self._db_conn.execute("""
             CREATE TABLE IF NOT EXISTS outbox_entries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id TEXT UNIQUE,
+                event_id TEXT NOT NULL,
                 stream_name TEXT NOT NULL,
                 payload TEXT NOT NULL,
-                created_at REAL NOT NULL
+                created_at REAL NOT NULL,
+                UNIQUE (stream_name, event_id)
             );
         """)
+        try:
+            cur = self._db_conn.cursor()
+            cur.execute("PRAGMA index_list(outbox_entries);")
+            indexes = cur.fetchall()
+            needs_migration = False
+            for idx_row in indexes:
+                is_unique = idx_row[2]
+                idx_name = idx_row[1]
+                if is_unique:
+                    cur.execute(f"PRAGMA index_info('{idx_name}');")
+                    indexed_cols = [c[2] for c in cur.fetchall()]
+                    if indexed_cols == ["event_id"]:
+                        needs_migration = True
+                        break
+            if needs_migration:
+                self._db_conn.execute("""
+                    CREATE TABLE outbox_entries_migrated (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_id TEXT NOT NULL,
+                        stream_name TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        created_at REAL NOT NULL,
+                        UNIQUE (stream_name, event_id)
+                    );
+                """)
+                self._db_conn.execute("""
+                    INSERT INTO outbox_entries_migrated (id, event_id, stream_name, payload, created_at)
+                    SELECT id, event_id, stream_name, payload, created_at FROM outbox_entries;
+                """)
+                self._db_conn.execute("DROP TABLE outbox_entries;")
+                self._db_conn.execute("ALTER TABLE outbox_entries_migrated RENAME TO outbox_entries;")
+                self._db_conn.commit()
+        except Exception as mig_err:
+            logger.debug("outbox schema check skipped: %s", mig_err)
         self._db_conn.commit()
 
         if legacy_items:
@@ -203,7 +238,7 @@ class RedisBus:
             try:
                 cursor = self._db_conn.cursor()
                 cursor.execute(
-                    "INSERT INTO outbox_entries (event_id, stream_name, payload, created_at) VALUES (?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO outbox_entries (event_id, stream_name, payload, created_at) VALUES (?, ?, ?, ?)",
                     (event_id, stream_name, payload_str, time.time())
                 )
                 self._db_conn.commit()
@@ -213,22 +248,37 @@ class RedisBus:
                 raise RuntimeError(f"Persisting to outbox failed: {err}") from err
         self.outbox.append((stream_name, event_data))
 
-    def start_background_worker(self) -> None:
-        if self._retry_task is None or self._retry_task.done():
+    def has_pending_items(self) -> bool:
+        if self._db_conn is not None:
             try:
-                self._retry_task = asyncio.create_task(self._retry_worker_loop())
-            except RuntimeError:
+                cur = self._db_conn.cursor()
+                cur.execute("SELECT 1 FROM outbox_entries LIMIT 1;")
+                return cur.fetchone() is not None
+            except Exception:
                 pass
+        return bool(self.outbox)
+
+    def start_background_worker(self) -> None:
+        if getattr(self, "_closing", False):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if loop.is_running() and (self._retry_task is None or self._retry_task.done()):
+            self._retry_task = loop.create_task(self._retry_worker_loop())
 
     def ensure_background_worker(self) -> None:
-        if self.outbox and (self._retry_task is None or self._retry_task.done()):
+        if getattr(self, "_closing", False):
+            return
+        if self.has_pending_items() and (self._retry_task is None or self._retry_task.done()):
             self.start_background_worker()
 
     async def _retry_worker_loop(self) -> None:
-        while True:
+        while not getattr(self, "_closing", False):
             try:
                 await asyncio.sleep(self._flush_backoff_seconds)
-                if self.outbox:
+                if self.has_pending_items():
                     await self.flush_outbox()
             except asyncio.CancelledError:
                 break
@@ -237,6 +287,8 @@ class RedisBus:
 
     async def flush_outbox(self) -> int:
         async with self._outbox_lock:
+            if not self.outbox and self._db_conn is not None:
+                self._load_outbox()
             if not self.outbox:
                 return 0
             self._last_flush_attempt = time.monotonic()
@@ -546,14 +598,15 @@ class RedisBus:
             return False
 
     async def close(self) -> None:
-        if self._retry_task is not None and not self._retry_task.done():
-            self._retry_task.cancel()
-            await asyncio.gather(self._retry_task, return_exceptions=True)
-            self._retry_task = None
+        self._closing = True
         try:
             await self.flush_outbox()
         except Exception:
             pass
+        if self._retry_task is not None and not self._retry_task.done():
+            self._retry_task.cancel()
+            await asyncio.gather(self._retry_task, return_exceptions=True)
+            self._retry_task = None
         if self._db_conn is not None:
             try:
                 self._db_conn.close()

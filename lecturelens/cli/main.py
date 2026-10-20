@@ -824,6 +824,7 @@ def student(
     graph = StudentKnowledgeGraph(graph_db)
 
     router = None
+    bus = None
     try:
         from lecturelens.router.llm_router import build_router_for_task, load_router_config
         config = load_router_config(settings.router_config_path)
@@ -866,6 +867,12 @@ def student(
         asyncio.run(client.run())
     except KeyboardInterrupt:
         console.print("[yellow]Student client stopped.[/yellow]")
+    finally:
+        if bus is not None:
+            try:
+                asyncio.run(bus.close())
+            except Exception:
+                pass
 
 
 @app.command()

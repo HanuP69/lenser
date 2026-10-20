@@ -219,8 +219,8 @@ class StudentClient:
                     persisted = int(data.get("last_sequence_number", 0))
             except Exception:
                 pass
-        if getattr(self, "pending_reconciliation", False):
-            return persisted
+
+        ledger_max: Optional[int] = None
         if hasattr(self, "ledger_file") and self.ledger_file.exists():
             try:
                 conn = sqlite3.connect(str(self.ledger_file), timeout=5.0)
@@ -229,9 +229,19 @@ class StudentClient:
                 row = cur.fetchone()
                 conn.close()
                 if row and row[0] is not None:
-                    persisted = max(persisted, int(row[0]))
+                    ledger_max = int(row[0])
+                else:
+                    ledger_max = 0
             except Exception:
                 pass
+
+        if getattr(self, "pending_reconciliation", False):
+            if ledger_max is not None:
+                return min(persisted, ledger_max)
+            return persisted
+
+        if ledger_max is not None:
+            return max(persisted, ledger_max)
         return persisted
 
     def save_persisted_sequence(self) -> None:
@@ -333,6 +343,12 @@ class StudentClient:
             if stop_event is not None and stop_event.is_set():
                 break
 
+            if getattr(self, "pending_reconciliation", False):
+                if self.reconcile_notes_from_ledger():
+                    self.pending_reconciliation = False
+                    self.last_sequence_number = self.load_persisted_sequence()
+                    self.save_persisted_sequence()
+
             hello_payload = {
                 "type": "hello",
                 "role": "student",
@@ -353,6 +369,11 @@ class StudentClient:
                             frame = await asyncio.wait_for(websocket.recv(), timeout=2.0)
                             await self.handle_server_frame(frame, websocket)
                         except asyncio.TimeoutError:
+                            if getattr(self, "pending_reconciliation", False):
+                                if self.reconcile_notes_from_ledger():
+                                    self.pending_reconciliation = False
+                                    self.last_sequence_number = self.load_persisted_sequence()
+                                    self.save_persisted_sequence()
                             continue
             except asyncio.CancelledError:
                 raise

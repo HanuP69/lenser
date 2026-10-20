@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -417,6 +418,34 @@ class TestStudentClient(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(client.last_sequence_number, 0)
         self.assertTrue(client.pending_reconciliation)
+        self.assertEqual(client.load_persisted_sequence(), 0)
+
+    async def test_load_persisted_sequence_bounds_stale_state_file_by_ledger_max_when_pending(self) -> None:
+        profile = StudentProfile(student_id="student_stale_state", preferred_language="English")
+        client = StudentClient("ws://localhost:8765", "lec_stale_state", profile, self.output_dir)
+
+        client.state_file.write_text(json.dumps({"last_sequence_number": 100}), encoding="utf-8")
+
+        conn = sqlite3.connect(str(client.ledger_file))
+        for seq in [1, 2, 95]:
+            conn.execute(
+                "INSERT INTO applied_segments (sequence_number, session_id, heading, content, created_at) VALUES (?, ?, ?, ?, ?)",
+                (seq, "lec_stale_state", f"Head {seq}", f"Content {seq}", 1700000000.0)
+            )
+        conn.commit()
+        conn.close()
+
+        client.pending_reconciliation = True
+        self.assertEqual(client.load_persisted_sequence(), 95)
+
+        client.pending_reconciliation = False
+        self.assertEqual(client.load_persisted_sequence(), 100)
+
+    async def test_reconcile_notes_from_ledger_cleans_empty_ledger_with_zero_cursor(self) -> None:
+        profile = StudentProfile(student_id="student_empty_state", preferred_language="English")
+        client = StudentClient("ws://localhost:8765", "lec_empty_state", profile, self.output_dir)
+        client.state_file.write_text(json.dumps({"last_sequence_number": 50}), encoding="utf-8")
+        client.pending_reconciliation = True
         self.assertEqual(client.load_persisted_sequence(), 0)
 
 

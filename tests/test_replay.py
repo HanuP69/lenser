@@ -51,6 +51,25 @@ class TestReplayEngine(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(same_session_received[0].event_id, "evt_0")
         self.assertEqual(same_session_received[3].event_id, "evt_3")
 
+    async def test_repeated_cross_session_replay_generates_stable_idempotent_event_ids(self) -> None:
+        self.write_sample_timeline(3)
+        engine = ReplayEngine(self.timeline_path, speed=0.0)
+
+        run1_received: list[TimelineEntry] = []
+        await engine.replay(target_session_id="target_idem", on_entry=run1_received.append, publish_to_timeline_stream=False)
+
+        run2_received: list[TimelineEntry] = []
+        await engine.replay(target_session_id="target_idem", on_entry=run2_received.append, publish_to_timeline_stream=False)
+
+        self.assertEqual(len(run1_received), 3)
+        self.assertEqual(len(run2_received), 3)
+        for i in range(3):
+            self.assertEqual(run1_received[i].event_id, run2_received[i].event_id)
+
+        other_target_received: list[TimelineEntry] = []
+        await engine.replay(target_session_id="other_target", on_entry=other_target_received.append, publish_to_timeline_stream=False)
+        self.assertNotEqual(run1_received[0].event_id, other_target_received[0].event_id)
+
     async def test_replay_cross_session_source_streams_share_new_event_id(self) -> None:
         self.write_sample_timeline(2)
         mock_bus = mock.AsyncMock()
