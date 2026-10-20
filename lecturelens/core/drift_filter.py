@@ -16,6 +16,11 @@ REFUSAL_PHRASES: tuple[str, ...] = (
     "i need an image of the presentation slide",
     "no text is currently visible",
     "please provide an image",
+    "[name]",
+    "[insert",
+    "[presentation",
+    "[title",
+    "presented by: [",
 )
 
 
@@ -47,7 +52,7 @@ class ContextDriftFilter:
         self,
         ollama_url: str = "http://127.0.0.1:11434",
         embed_model: str = "nomic-embed-text",
-        drift_threshold: float = 0.48,
+        drift_threshold: float = 0.50,
         sustain_consecutive: int = 3,
         min_words: int = 8,
         alpha: float = 0.85,
@@ -87,7 +92,10 @@ class ContextDriftFilter:
                 return None
 
         endpoint = f"{self.ollama_url}/api/embeddings"
-        payload = json.dumps({"model": self.embed_model, "prompt": clean_text}).encode("utf-8")
+        prompt_text = clean_text
+        if "nomic" in self.embed_model.lower() and not clean_text.startswith("search_"):
+            prompt_text = f"search_document: {clean_text}"
+        payload = json.dumps({"model": self.embed_model, "prompt": prompt_text}).encode("utf-8")
         req = urllib.request.Request(
             endpoint,
             data=payload,

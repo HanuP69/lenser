@@ -99,7 +99,7 @@ class Settings(BaseSettings):
     openrouter_api_key: Optional[str] = Field(default=None)
     google_api_key: Optional[str] = Field(default=None)
     enable_drift_filter: bool = Field(default=True)
-    drift_similarity_threshold: float = Field(default=0.48)
+    drift_similarity_threshold: float = Field(default=0.50)
     drift_consecutive_shift: int = Field(default=3)
     drift_min_content_words: int = Field(default=8)
     drift_embed_model: str = Field(default="nomic-embed-text")

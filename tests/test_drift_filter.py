@@ -128,13 +128,17 @@ class TestContextDriftFilterBehavior(unittest.TestCase):
 
 class TestRecordedTimelineFiltering(unittest.TestCase):
     def test_yt_test_timeline_filtering(self) -> None:
-        timeline_path = Path("C:/Users/enup1/output/yt_test/timeline.jsonl")
-        if not timeline_path.exists():
+        candidates = [
+            Path.home() / "output" / "yt_test" / "timeline.jsonl",
+            Path.cwd() / "output" / "yt_test" / "timeline.jsonl",
+            Path("C:/Users/enup1/output/yt_test/timeline.jsonl")
+        ]
+        timeline_path = next((p for p in candidates if p.exists()), None)
+        if timeline_path is None:
             self.skipTest("yt_test output not available on disk")
 
         filt = ContextDriftFilter(
-            session_topic="Chapter 4 Core Dactic Equation Master Plan Quadratic Equations",
-            drift_threshold=0.48,
+            drift_threshold=0.50,
             sustain_consecutive=3,
             min_words=8
         )

@@ -378,11 +378,14 @@ class StructuringAgent:
         if drift_filter is not None:
             self.drift_filter: Optional[ContextDriftFilter] = drift_filter
         elif getattr(settings, "enable_drift_filter", True):
+            resolved_ollama_url = getattr(settings, "ollama_url", None) or os.environ.get("LECTURELENS_OLLAMA_URL", "http://127.0.0.1:11434")
             self.drift_filter = ContextDriftFilter(
+                ollama_url=resolved_ollama_url,
                 embed_model=getattr(settings, "drift_embed_model", "nomic-embed-text"),
-                drift_threshold=getattr(settings, "drift_similarity_threshold", 0.48),
+                drift_threshold=getattr(settings, "drift_similarity_threshold", 0.50),
                 sustain_consecutive=getattr(settings, "drift_consecutive_shift", 3),
-                min_words=getattr(settings, "drift_min_content_words", 3)
+                min_words=getattr(settings, "drift_min_content_words", 8),
+                session_topic=getattr(settings, "course_name", None)
             )
         else:
             self.drift_filter = None
