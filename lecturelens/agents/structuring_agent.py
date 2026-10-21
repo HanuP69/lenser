@@ -38,6 +38,37 @@ OVERLAP_WINDOW_SECONDS = 20.0
 MAX_OVERLAP_ITEMS = 15
 MAX_BATCH_RETRIES = 3
 MAX_CONSECUTIVE_PASS_FAILURES = 10
+# How often a batch is split in half when the provider says that the
+# message is too long. The limit of a message is different for every
+# provider, so the batch is made smaller until it fits.
+MAX_BATCH_SPLITS = 6
+
+
+def is_message_too_long_error(error: BaseException) -> bool:
+    """Whether the provider refused the message because it was too long.
+
+    The free providers put a limit on the length of a single message. A
+    long batch is refused with a plain error, and the whole lecture would
+    be left without notes. The batch is split instead.
+    """
+    message = str(error).lower()
+    if "limits the length of a single message" in message:
+        return True
+    if "shorten your last message" in message:
+        return True
+    for signature in (
+        "context length",
+        "maximum context",
+        "too many tokens",
+        "request too large",
+        "payload too large",
+        "input is too long",
+        "prompt is too long",
+        "string too long",
+    ):
+        if signature in message:
+            return True
+    return False
 
 
 class StructuringBatchError(RuntimeError):
@@ -435,6 +466,9 @@ class StructuringAgent:
         self._batch_attempts: dict[int, int] = self.load_batch_attempts()
         self.current_overlap: list[dict[str, Any]] = list(initial_state_data.get("overlap_entries", []))
         self.sequence_number: int = int(initial_state_data.get("sequence_number", 0))
+        # How often the current batch was already split, so a provider with
+        # a very small limit cannot make it split forever.
+        self._split_depth: int = 0
 
     def load_notes_marker(self) -> int:
         if not self.notes_marker_path.exists():
@@ -724,6 +758,57 @@ class StructuringAgent:
             return keys
         return keys
 
+    async def process_split_batch(
+        self,
+        batch: SliceBatch,
+        entries: list[dict[str, Any]],
+        running_context: str
+    ) -> Optional[str]:
+        """Do a batch in two halves, because the message was too long.
+
+        Returns the running context, or None when the batch cannot be
+        split any further.
+        """
+        if len(entries) < 2:
+            return None
+        if self._split_depth >= MAX_BATCH_SPLITS:
+            logger.error(
+                "the batch was split %d times and the provider still refuses the "
+                "message, falling back to the raw content",
+                self._split_depth
+            )
+            return None
+        self._split_depth += 1
+        try:
+            split_index = max(1, len(entries) // 2)
+            first_entries = entries[:split_index]
+            second_entries = entries[split_index:]
+
+            # The halves share the start, so the retry counter of the batch
+            # stays the same. The end of the first half is the end of its
+            # last entry, so the marker of the notes moves forward in order
+            # and the second half is not skipped as already written.
+            first_end = int(first_entries[-1].get("_line_end_offset", batch.end_offset))
+            first_half = SliceBatch(
+                entries=first_entries,
+                end_offset=first_end,
+                start_offset=batch.start_offset
+            )
+            second_half = SliceBatch(
+                entries=second_entries,
+                end_offset=batch.end_offset,
+                start_offset=batch.start_offset
+            )
+
+            logger.warning(
+                "the provider cannot take a message of %d entries, splitting the batch",
+                len(entries)
+            )
+            context = await self.process_single_batch(first_half, running_context)
+            return await self.process_single_batch(second_half, context)
+        finally:
+            self._split_depth -= 1
+
     async def process_single_batch(self, batch: SliceBatch, running_context: str) -> str:
         entries = batch.entries
         if self.drift_filter is not None:
@@ -738,7 +823,11 @@ class StructuringAgent:
             self.save_state(running_context, batch.end_offset, self.current_overlap)
             return running_context
 
-        active_batch = SliceBatch(entries=entries, end_offset=batch.end_offset)
+        active_batch = SliceBatch(
+            entries=entries,
+            end_offset=batch.end_offset,
+            start_offset=batch.start_offset
+        )
         initial_state: StructuringState = {
             "timeline_slice": entries,
             "running_context": running_context,
@@ -760,6 +849,19 @@ class StructuringAgent:
             raise
         except Exception as error:
             synthesis_error = error
+
+        if synthesis_error is not None and is_message_too_long_error(synthesis_error):
+            # The provider cannot take a message this long. The batch is
+            # split in half and each half is done on its own, which gives
+            # two sections with a time mark each instead of no notes at
+            # all. A whole lecture of eleven minutes is one batch when
+            # nothing was processed while it was recorded, and the
+            # provider refused it.
+            split_result = await self.process_split_batch(
+                batch, entries, running_context
+            )
+            if split_result is not None:
+                return split_result
 
         section_text = "" if synthesis_error is not None else self.build_notes_section(active_batch, result_state)
 

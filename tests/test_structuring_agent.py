@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any, Optional
+from unittest import mock
 
 from lecturelens.agents.structuring_agent import (
     StructuringAgent,
@@ -426,6 +427,76 @@ class TestBatchHelpers(unittest.TestCase):
             {"source_type": "slide", "timestamp_epoch": 40.0, "content": "another slide"},
         ]
         self.assertEqual(agent.section_start_timestamp(entries), 22.0)
+
+    def test_a_message_that_is_too_long_is_recognised(self) -> None:
+        from lecturelens.agents.structuring_agent import is_message_too_long_error
+
+        self.assertTrue(is_message_too_long_error(Exception(
+            "Error code: 400 - {'error': {'message': 'This provider limits the length "
+            "of a single message. Shorten your last message, or retry and another "
+            "provider will take it.'}}"
+        )))
+        self.assertTrue(is_message_too_long_error(Exception("maximum context length exceeded")))
+        self.assertTrue(is_message_too_long_error(Exception("context length exceeded")))
+        self.assertFalse(is_message_too_long_error(Exception("rate limit reached")))
+        self.assertFalse(is_message_too_long_error(Exception("connection refused")))
+
+    def test_a_long_batch_is_split_in_half(self) -> None:
+        """A provider that refuses a long message must not cost the notes.
+
+        A whole lecture of eleven minutes is one batch when nothing was
+        processed while it was recorded, and the provider refused it with
+        a plain error, so the lecture was left without notes.
+        """
+        from lecturelens.agents import structuring_agent as sa
+
+        settings = Settings()
+        with tempfile.TemporaryDirectory() as folder:
+            settings.output_dir = Path(folder)
+            settings.create_session_directories("split_test")
+            agent = sa.StructuringAgent(
+                settings=settings,
+                session_id="split_test",
+                llm_router=None,
+                redis_bus=None
+            )
+
+            seen_sizes: list[int] = []
+            accepted_sizes: list[int] = []
+
+            async def fake_graph_ainvoke(state: Any) -> dict:
+                seen_sizes.append(len(state["timeline_slice"]))
+                if len(state["timeline_slice"]) > 2:
+                    raise RuntimeError(
+                        "Error code: 400 - This provider limits the length of a single message."
+                    )
+                accepted_sizes.append(len(state["timeline_slice"]))
+                result = dict(state)
+                result["summary"] = "a summary of the batch"
+                return result
+
+            agent.graph = mock.MagicMock()
+            agent.graph.ainvoke = fake_graph_ainvoke
+
+            entries = [
+                {
+                    "source_type": "transcript",
+                    "timestamp_epoch": float(index),
+                    "content": f"entry {index}",
+                    "_line_end_offset": (index + 1) * 10,
+                }
+                for index in range(8)
+            ]
+            batch = sa.SliceBatch(entries=entries, end_offset=80, start_offset=0)
+
+            asyncio.run(agent.process_single_batch(batch, "context"))
+
+            # The batch was split until the provider took it.
+            self.assertGreater(len(seen_sizes), 1)
+            self.assertLessEqual(max(accepted_sizes), 2)
+            self.assertEqual(len(accepted_sizes), 4)
+            # Every entry of the batch was done, none was dropped.
+            self.assertEqual(sum(accepted_sizes), 8)
 
 
 if __name__ == "__main__":

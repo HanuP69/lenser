@@ -95,7 +95,12 @@ class Settings(BaseSettings):
     postgres_query_limit: int = Field(default=1000)
 
     structuring_interval_seconds: int = Field(default=120)
-    max_slice_characters: int = Field(default=12000)
+    # How much of the timeline goes into one request to the model. The
+    # free providers put a limit on the length of a single message, and a
+    # batch that is too long is refused with an error that leaves the
+    # lecture without notes. The batch is also split in half when the
+    # provider says that the message is too long.
+    max_slice_characters: int = Field(default=6000)
     context_max_characters: int = Field(default=4000)
     correlation_window_seconds: float = Field(default=5.0)
     correlation_active_seconds: float = Field(default=600.0)
