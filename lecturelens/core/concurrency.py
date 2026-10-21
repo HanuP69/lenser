@@ -99,12 +99,18 @@ async def run_in_process_pool(
     callable_function: Callable,
     *args: Any,
     max_workers: Optional[int] = None,
-    max_attempts: int = 2
+    max_attempts: int = 2,
+    allow_thread_fallback: bool = True
 ) -> Any:
     loop = asyncio.get_running_loop()
     last_error: Optional[BaseException] = None
     for attempt_number in range(max_attempts):
-        pool = get_process_pool(max_workers)
+        try:
+            pool = get_process_pool(max_workers)
+        except Exception as error:
+            last_error = error
+            logger.error("could not create the process pool: %s", error)
+            break
         try:
             result = await loop.run_in_executor(pool, callable_function, *args)
             return result
@@ -116,6 +122,26 @@ async def run_in_process_pool(
                 error
             )
             reset_process_pool()
+        except Exception as error:
+            # The worker died in a way that is not a broken pool, for example
+            # a spawn failure after a native crash in the parent. Without this
+            # the whole feature stops working, because the pool is never
+            # usable again.
+            last_error = error
+            logger.error(
+                "process pool worker failed on attempt %d: %s",
+                attempt_number + 1,
+                error
+            )
+            reset_process_pool()
+    if allow_thread_fallback:
+        # The work still gets done, it is just slower because it shares the
+        # process with the event loop. A dead pool is worse than a slow one.
+        logger.warning(
+            "process pool unavailable, falling back to the thread pool for %s",
+            getattr(callable_function, "__name__", callable_function)
+        )
+        return await run_in_thread_pool(callable_function, *args)
     raise RuntimeError("process pool unavailable after rebuild attempts") from last_error
 
 
