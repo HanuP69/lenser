@@ -235,15 +235,19 @@ class TestCliCommands(unittest.TestCase):
         self.assertEqual(environment["LECTURELENS_MONITOR_INDEX"], "2")
 
     def test_environment_passes_unorouter_api_key(self) -> None:
+        # The settings are set explicitly, so the test does not depend on
+        # whatever is in the .env file of the machine it runs on.
         settings = Settings()
+        settings.unorouter_api_key = "test_uno_key"
+        settings.unorouter_api_keys = "k1,k2"
         with mock.patch.dict(os.environ, {
             "UNOROUTER_API_KEY": "test_uno_key",
             "GOOGLE_API_KEYS": "k1,k2",
             "OPENROUTER_API_KEYS": "ok1,ok2"
         }):
             environment = cli_main.build_agent_environment(settings, "lec1", "system", 1, "hybrid", None)
-            self.assertEqual(environment["UNOROUTER_API_KEY"], "test_uno_key")
             self.assertEqual(environment["LECTURELENS_UNOROUTER_API_KEY"], "test_uno_key")
+            self.assertEqual(environment["LECTURELENS_UNOROUTER_API_KEYS"], "k1,k2")
             self.assertEqual(environment["LECTURELENS_GOOGLE_API_KEYS"], "k1,k2")
             self.assertEqual(environment["LECTURELENS_OPENROUTER_API_KEYS"], "ok1,ok2")
             self.assertIn("LECTURELENS_REDIS_URL", environment)

@@ -21,10 +21,14 @@ providers:
     api_key_env: "UNOROUTER_API_KEY"
     timeout_seconds: 120
     rate_limit:
-      max_rpm: 20
+      # The UnoRouter free tier allows one request per minute per model.
+      max_rpm: 1
       window_seconds: 60
     circuit_breaker:
-      failure_threshold: 3
+      # A 429 is a provider failure, so a single burst is enough to open the
+      # breaker. It is closed for a minute so the next request can go
+      # through.
+      failure_threshold: 1
       cooldown_seconds: 60
 
   unorouter_structuring:
@@ -35,10 +39,14 @@ providers:
     api_key_env: "UNOROUTER_API_KEY"
     timeout_seconds: 120
     rate_limit:
-      max_rpm: 20
+      # The UnoRouter free tier allows one request per minute per model.
+      max_rpm: 1
       window_seconds: 60
     circuit_breaker:
-      failure_threshold: 3
+      # A 429 is a provider failure, so a single burst is enough to open the
+      # breaker. It is closed for a minute so the next request can go
+      # through.
+      failure_threshold: 1
       cooldown_seconds: 60
 
   unorouter_qa:
@@ -49,10 +57,14 @@ providers:
     api_key_env: "UNOROUTER_API_KEY"
     timeout_seconds: 90
     rate_limit:
-      max_rpm: 20
+      # The UnoRouter free tier allows one request per minute per model.
+      max_rpm: 1
       window_seconds: 60
     circuit_breaker:
-      failure_threshold: 3
+      # A 429 is a provider failure, so a single burst is enough to open the
+      # breaker. It is closed for a minute so the next request can go
+      # through.
+      failure_threshold: 1
       cooldown_seconds: 60
 
   openrouter:
