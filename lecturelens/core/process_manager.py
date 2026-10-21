@@ -218,12 +218,24 @@ class AgentProcessManager:
             if len(running_names) == 0:
                 continue
             set_flag(session_dir, flag_name)
-            exited_cleanly = self.wait_for_exit(
-                running_names,
-                timeout_seconds,
-                progress_probe=self._phase_progress_probe(session_dir),
-                progress_timeout_seconds=PROGRESS_STALL_SECONDS,
-            )
+            try:
+                exited_cleanly = self.wait_for_exit(
+                    running_names,
+                    timeout_seconds,
+                    progress_probe=self._phase_progress_probe(session_dir),
+                    progress_timeout_seconds=PROGRESS_STALL_SECONDS,
+                )
+            except KeyboardInterrupt:
+                # The user pressed the key again while the session was
+                # closing. The flag is set, so the agent finishes on its
+                # own, and the phases that are left still run. Without
+                # this the whole shutdown was thrown away and the queue
+                # of the session was never drained.
+                logger.warning(
+                    "the wait for %s was interrupted, the agents finish on their own",
+                    flag_name
+                )
+                exited_cleanly = False
             for agent_name in running_names:
                 process = self.processes[agent_name]
                 clean = process.poll() is not None

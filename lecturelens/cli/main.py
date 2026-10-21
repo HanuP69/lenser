@@ -452,6 +452,12 @@ def run_shutdown(monitor: AgentMonitor, session_dir: Path, planned_agents: list[
         with console.status("[bold cyan]Stopping agents, flushing timeline, and generating final notes with LLM...[/bold cyan]", spinner="dots"):
             outcomes = monitor.run_shutdown_sequence(session_dir, phases)
         unfinished = [name for name, clean in outcomes.items() if not clean]
+    except KeyboardInterrupt:
+        # The user pressed the key again. The agents have their stop
+        # flags, so they finish on their own and the queue of the session
+        # is still drained. The session is marked as finished below, so
+        # the stop command does not wait for a timeout either.
+        logger.warning("the shutdown was interrupted, the agents finish on their own")
     except Exception as error:
         # The shutdown is the cleanup path. When it fails the agents are
         # left running and the session is never marked as finished, so the

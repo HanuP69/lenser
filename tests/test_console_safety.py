@@ -81,6 +81,79 @@ class TestAgentLiveness(unittest.TestCase):
                 self.assertTrue(cli_main.agents_are_gone(session_dir))
 
 
+class TestInterruptedShutdown(unittest.TestCase):
+    def test_the_phases_still_run_after_a_second_interrupt(self) -> None:
+        """A second Ctrl+C must not throw the queue of the session away.
+
+        The user presses the key again while the session is closing,
+        because the closing takes a while when the provider is on a free
+        tier. The whole shutdown used to be thrown away, so the events
+        that were waiting were never written into the notes.
+        """
+        from lecturelens.core.process_manager import AgentProcessManager
+
+        class FakeProcess:
+            def poll(self) -> int:
+                return 0
+
+        manager = AgentProcessManager()
+        manager.processes = {
+            "sync_agent": FakeProcess(),
+            "structuring_agent": FakeProcess(),
+        }
+        manager.started_at = {"sync_agent": 0.0, "structuring_agent": 0.0}
+        manager.next_restart_at = {}
+
+        flags_written: list[str] = []
+
+        def fake_set_flag(session_dir: Path, flag_name: str) -> None:
+            flags_written.append(flag_name)
+
+        def interrupted_wait(*args: object, **kwargs: object) -> bool:
+            raise KeyboardInterrupt
+
+        from lecturelens.core import process_manager
+
+        with mock.patch.object(process_manager, "set_flag", side_effect=fake_set_flag):
+            with mock.patch.object(process_manager.AgentProcessManager, "wait_for_exit", side_effect=interrupted_wait):
+                manager.run_shutdown_sequence(
+                    Path("."),
+                    [
+                        (["sync_agent"], "sync_stop.flag", 60.0),
+                        (["structuring_agent"], "finalize.flag", 300.0),
+                    ]
+                )
+
+        # The phase that was interrupted and the phase after it both ran.
+        self.assertIn("sync_stop.flag", flags_written)
+        self.assertIn("finalize.flag", flags_written)
+
+    def test_the_session_is_marked_as_finished_after_an_interrupt(self) -> None:
+        from lecturelens.cli import main as cli_main
+        from lecturelens.core.agent_runtime import SESSION_FINISHED_FLAG_NAME, flag_exists
+
+        class BrokenConsole:
+            def __enter__(self) -> "BrokenConsole":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def print(self, *args: object, **kwargs: object) -> None:
+                raise UnicodeEncodeError("charmap", "\u0628", 0, 1, "not encodable")
+
+        class InterruptedMonitor:
+            def run_shutdown_sequence(self, *args: object, **kwargs: object) -> dict:
+                raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as folder:
+            session_dir = Path(folder)
+            (session_dir / "control").mkdir(parents=True, exist_ok=True)
+            with mock.patch.object(cli_main, "console", BrokenConsole()):
+                cli_main.run_shutdown(InterruptedMonitor(), session_dir, ["audio_agent"])
+            self.assertTrue(flag_exists(session_dir, SESSION_FINISHED_FLAG_NAME))
+
+
 class TestShutdownSurvivesABrokenConsole(unittest.TestCase):
     def test_the_session_is_marked_as_finished_even_when_the_console_fails(self) -> None:
         """A console that cannot show a character must not keep the session
