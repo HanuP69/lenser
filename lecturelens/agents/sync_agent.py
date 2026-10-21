@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import time
 import uuid
 from collections import deque
@@ -129,13 +130,17 @@ class SyncAgent:
         self.flush_state_tracked = True
 
     def save_flush_states(self) -> None:
-        """Persist the per sink state.
+        """Persist the per sink state."""
+        self.write_flush_states(self.flush_states)
+
+    def write_flush_states(self, states: dict[str, str]) -> None:
+        """Write the given per sink state to disk.
 
         The file is removed when nothing is pending. A stale file would make
         the next start believe that an entry was only written to the file
         and never published, so it would be published a second time.
         """
-        if not self.flush_states:
+        if not states:
             try:
                 if self.flush_state_path.exists():
                     self.flush_state_path.unlink()
@@ -145,11 +150,24 @@ class SyncAgent:
         try:
             atomic_write_text(
                 self.flush_state_path,
-                json.dumps(self.flush_states)
+                json.dumps(states)
             )
             self.flush_state_tracked = True
         except OSError as error:
             logger.warning("could not persist the timeline flush state: %s", error)
+
+    @staticmethod
+    def trigger_fault(fault_name: str) -> None:
+        """Test only fault injection.
+
+        LECTURELENS_FAULT names a fault point. The agent then exits hard,
+        without unwinding, so a test can reproduce a crash in a specific
+        window. A timed kill would be flaky, so the crash is deterministic.
+        """
+        if os.environ.get("LECTURELENS_FAULT", "") != fault_name:
+            return
+        logger.error("fault injected: %s", fault_name)
+        os._exit(1)
 
     def load_written_fingerprints(self) -> None:
         if not self.timeline_path.exists():
@@ -532,6 +550,7 @@ class SyncAgent:
                 # between does not make the next start treat the entry as
                 # fully flushed.
                 self.save_flush_states()
+                self.trigger_fault("crash_after_file_write")
 
             if len(needs_redis) > 0:
                 for buffered in needs_redis:
@@ -553,23 +572,38 @@ class SyncAgent:
                 self.save_flush_states()
 
             flushed: list[BufferedEntry] = []
+            finished_fingerprints: list[str] = []
             for buffered, fingerprint in zip(ready, fingerprints):
                 if self.flush_states.get(fingerprint) != "both":
                     # Only one of the two sinks accepted the entry, so it
                     # stays in the buffer and is retried for the missing sink.
                     continue
                 flushed.append(buffered)
+                finished_fingerprints.append(fingerprint)
+
+            if len(finished_fingerprints) > 0:
+                # The state file is written before the in-memory state is
+                # updated and before the entries are released. A crash after
+                # this point leaves a correct state on disk, so the next
+                # start does not publish the entry a second time.
+                finished_set = set(finished_fingerprints)
+                remaining = {
+                    fingerprint: state
+                    for fingerprint, state in self.flush_states.items()
+                    if fingerprint not in finished_set
+                }
+                self.write_flush_states(remaining)
+                self.flush_states = remaining
+                self.trigger_fault("crash_after_state_pop")
+
+            for buffered, fingerprint in zip(flushed, finished_fingerprints):
                 self.remember_fingerprint(fingerprint)
-                self.flush_states.pop(fingerprint, None)
                 if buffered.entry.event_id:
                     self.remember_event_id(buffered.entry.event_id)
                 if buffered.message_id is not None:
                     self.pending_message_ids.discard((buffered.stream_name or "", buffered.message_id))
                 await self.acknowledge(buffered.stream_name, buffered.group_name, buffered.message_id)
             self.remove_flushed_entries(flushed)
-            # The state is written after the entries are released, so the file
-            # is removed once nothing is pending.
-            self.save_flush_states()
             self.entries_written += len(flushed)
             self.control.set_stat("timeline_entries_written", self.entries_written)
             self.control.set_stat("buffered_entries", len(self.pending_buffer))

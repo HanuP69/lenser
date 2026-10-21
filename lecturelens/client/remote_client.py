@@ -59,8 +59,9 @@ class CaptureSpool:
         self.max_size = max_size
         self.append_timeout_seconds = append_timeout_seconds
         # "drop_oldest" keeps the capture running and loses the oldest
-        # pending capture. "raise" loses nothing but the capture itself
-        # fails, so the caller can decide what to do.
+        # pending capture. "raise" loses nothing: the capture itself is
+        # dropped and only a log line reports it, so the client never
+        # receives that capture.
         self.on_full = on_full
         self.dropped_count = 0
         self.spool_path.parent.mkdir(parents=True, exist_ok=True)

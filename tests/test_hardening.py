@@ -13,7 +13,6 @@ from unittest import mock
 import numpy as np
 from PIL import Image, ImageDraw
 
-from lecturelens.agents import screen_agent
 from lecturelens.agents.audio_agent import SpeechSegmenter
 from lecturelens.agents.screen_agent import ScreenAgent
 from lecturelens.agents.structuring_agent import StructuringAgent

@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 from lecturelens.agents.structuring_agent import (
-    SliceBatch,
     StructuringAgent,
     StructuringBatchError,
     extract_json_payload,

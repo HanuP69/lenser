@@ -4,7 +4,6 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from typing import Optional
 from unittest import mock
 
 from lecturelens.agents import sync_agent
@@ -411,7 +410,7 @@ class TestSyncEndToEnd(SyncTestBase):
             restarted = SyncAgent(settings, self.bus, SessionClock(), session)
             self.assertTrue(restarted.flush_state_tracked)
 
-            published: list[Any] = []
+            published: list[object] = []
             restarted.acknowledge = mock.AsyncMock()
             restarted.redis_bus.publish_resilient = mock.AsyncMock(
                 side_effect=lambda stream, item: published.append(item) or "1-0"

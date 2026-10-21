@@ -191,7 +191,7 @@ class TestGatewaySecurity(GatewayTestBase):
         self.assertIn("newer", self.gateway.sessions)
 
     async def test_release_session_cleans_up_fanout_tasks(self) -> None:
-        runtime = self.gateway.get_or_create_session("cleanup_room")
+        self.gateway.get_or_create_session("cleanup_room")
         dummy_task = asyncio.create_task(asyncio.sleep(10.0))
         self.gateway.fanout_tasks["cleanup_room"] = dummy_task
         self.gateway.subscribers["cleanup_room"] = set()
@@ -794,6 +794,41 @@ class TestRemoteClientSendAndWait(unittest.IsolatedAsyncioTestCase):
             await drain_spool(spool, mock_ws, stop_evt)
             self.assertEqual(spool.count(), 0)
             self.assertEqual(mock_ws.send.await_count, 2)
+
+    async def test_capture_spool_with_a_large_backlog(self) -> None:
+        """A spool with more than 500 pending captures has to behave the same
+        way in both policies."""
+        from lecturelens.client.remote_client import CaptureSpool, CaptureSpoolFull
+        with tempfile.TemporaryDirectory() as td:
+            spool_file = Path(td) / "spool.db"
+
+            # drop_oldest: the oldest captures are evicted, the newest survive.
+            spool = CaptureSpool(
+                spool_file, max_size=500, append_timeout_seconds=0.1, on_full="drop_oldest"
+            )
+            for index in range(520):
+                await spool.append(f"c{index}", f"payload {index}")
+            self.assertEqual(spool.count(), 500)
+            self.assertGreater(spool.dropped_count, 0)
+            pending = [capture_id for capture_id, _ in spool.get_pending(limit=1000)]
+            self.assertEqual(len(pending), 500)
+            self.assertNotIn("c0", pending)
+            self.assertIn("c519", pending)
+
+            # raise: nothing is evicted, the capture itself fails.
+            spool_file2 = Path(td) / "spool2.db"
+            strict = CaptureSpool(
+                spool_file2, max_size=500, append_timeout_seconds=0.1, on_full="raise"
+            )
+            for index in range(500):
+                await strict.append(f"c{index}", f"payload {index}")
+            self.assertEqual(strict.count(), 500)
+            with self.assertRaises(CaptureSpoolFull):
+                await strict.append("overflow", "payload overflow")
+            self.assertEqual(strict.count(), 500)
+            self.assertEqual(strict.dropped_count, 0)
+            pending = [capture_id for capture_id, _ in strict.get_pending(limit=1000)]
+            self.assertEqual(pending[0], "c0")
 
     async def test_capture_spool_raise_policy_drops_nothing(self) -> None:
         """With the raise policy nothing is evicted, the capture fails

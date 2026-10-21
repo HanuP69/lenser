@@ -276,7 +276,6 @@ class TestRedisBusReliability(unittest.IsolatedAsyncioTestCase):
                 await bus.close()
 
     async def test_consume_survives_read_errors_with_backoff(self) -> None:
-        original_read = self.bus.read_group_messages
         calls = {"count": 0}
 
         async def flaky_read(*args, **kwargs):
@@ -290,18 +289,14 @@ class TestRedisBusReliability(unittest.IsolatedAsyncioTestCase):
         async def noop(data: dict) -> None:
             return None
 
-        original_ensure = self.bus.ensure_consumer_group
-
         async def fake_ensure(stream_name, group_name):
             return None
-
         self.bus.ensure_consumer_group = fake_ensure
         stop_flag = {"stop": True}
         started = time.monotonic()
         await asyncio.wait_for(self.run_consumer(noop, stop_flag), timeout=10)
         self.assertTrue(calls["count"] >= 1)
         self.assertLess(time.monotonic() - started, 10)
-
     async def test_unfinished_legacy_migration_file_recovered_on_startup(self) -> None:
         import json
         with tempfile.TemporaryDirectory() as td:

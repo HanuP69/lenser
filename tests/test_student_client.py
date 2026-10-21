@@ -1,4 +1,3 @@
-import asyncio
 import json
 import sqlite3
 import tempfile
@@ -162,7 +161,7 @@ class TestStudentClient(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.last_sequence_number, 1)
         self.assertIn(3, client.pending_segments)
 
-        res2 = await client.on_note_segment_received(seg2)
+        await client.on_note_segment_received(seg2)
         self.assertEqual(client.last_sequence_number, 3)
         self.assertEqual(len(client.pending_segments), 0)
         written_text = client.notes_file.read_text(encoding="utf-8")
@@ -468,8 +467,9 @@ class TestStudentClient(unittest.IsolatedAsyncioTestCase):
         stale_file.write_text("Stale notes from previous run\n", encoding="utf-8")
         self.assertTrue(stale_file.exists())
 
-        client = StudentClient("ws://localhost:8765", "lec_stale", profile, self.output_dir)
+        stale_client = StudentClient("ws://localhost:8765", "lec_stale", profile, self.output_dir)
         self.assertFalse(stale_file.exists())
+        self.assertIsNotNone(stale_client)
 
     async def test_apply_segment_raises_and_preserves_cursor_on_reconciliation_failure(self) -> None:
         profile = StudentProfile(student_id="student_fail", preferred_language="English")
@@ -522,6 +522,26 @@ class TestStudentClient(unittest.IsolatedAsyncioTestCase):
 
         client.pending_reconciliation = False
         self.assertEqual(client.load_persisted_sequence(), 2)
+
+    async def test_stale_cursor_with_a_gap_in_the_ledger_resumes_from_the_gap(self) -> None:
+        """The cursor says 100 but the ledger only has 1 to 95 and then 100.
+        The client has to resume from 95, otherwise 96 to 99 are skipped and
+        never written to the notes."""
+        profile = StudentProfile(student_id="student_resume_gap", preferred_language="English")
+        client = StudentClient("ws://localhost:8765", "lec_resume_gap", profile, self.output_dir)
+
+        client.state_file.write_text(json.dumps({"last_sequence_number": 100}), encoding="utf-8")
+
+        conn = sqlite3.connect(str(client.ledger_file))
+        for seq in list(range(1, 96)) + [100]:
+            conn.execute(
+                "INSERT INTO applied_segments (sequence_number, session_id, heading, content, created_at) VALUES (?, ?, ?, ?, ?)",
+                (seq, "lec_resume_gap", f"Head {seq}", f"Content {seq}", 1700000000.0)
+            )
+        conn.commit()
+        conn.close()
+
+        self.assertEqual(client.load_persisted_sequence(), 95)
 
     async def test_load_persisted_sequence_uses_the_ledger_when_it_is_ahead(self) -> None:
         profile = StudentProfile(student_id="student_ledger_ahead", preferred_language="English")

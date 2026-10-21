@@ -10,7 +10,6 @@ from unittest import mock
 import numpy as np
 from PIL import Image, ImageDraw
 
-from lecturelens.agents import screen_agent
 from lecturelens.agents.screen_agent import ScreenAgent, build_thumbnail_from_png
 from lecturelens.config.settings import Settings
 from lecturelens.core.clock import SessionClock

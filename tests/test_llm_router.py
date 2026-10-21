@@ -185,7 +185,6 @@ class TestRouter(RouterTestBase):
             self.skipTest("Redis not available")
         with mock.patch.dict("os.environ", {}, clear=False):
             for name in ("TEST_KEY_A", "TEST_KEY_B"):
-                import os
                 os.environ.pop(name, None)
             config = {
                 "providers": {"cloud_a": CONFIG["providers"]["cloud_a"]},

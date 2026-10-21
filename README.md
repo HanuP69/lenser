@@ -12,7 +12,7 @@
 4. [Redis vs. Postgres: Durability & Replay](#redis-vs-postgres-durability--replay)
 5. [Thin Student Client & Personalization Engine](#thin-student-client--personalization-engine)
 6. [Student Knowledge Graph (`student_graph.db`)](#student-knowledge-graph-student_graphdb)
-7. [Automated Test Suite (398 Tests)](#automated-test-suite-398-tests)
+7. [Automated Test Suite (412 Tests)](#automated-test-suite-412-tests)
 8. [CLI Command Reference](#cli-command-reference)
 9. [Configuration & Environment Variables](#configuration--environment-variables)
 10. [Docker Compose & Getting Started](#docker-compose--getting-started)
@@ -223,33 +223,40 @@ Each student maintains an isolated, private SQLite database (`student_graph.db`)
 
 ---
 
-## Automated Test Suite (398 Tests)
+## Automated Test Suite (412 Tests)
 
-LectureLens maintains an automated test suite of **398 unit and integration tests** verifying concurrency, resilience, audio processing, screen capture, Postgres persistence, gateway fan-out, client personalization, and knowledge graphs:
+LectureLens maintains an automated test suite of **412 unit and integration tests** verifying concurrency, resilience, audio processing, screen capture, Postgres persistence, gateway fan-out, client personalization, and knowledge graphs:
 
 ```
-================= 398 passed in 55.50s =================
+================= 410 passed, 2 skipped in 62.21s =================
+```
+
+The two skipped tests are the failure injection tests. They need a live Redis
+and are only run when it is configured:
+
+```bash
+LECTURELENS_INTEGRATION_REDIS=redis://127.0.0.1:6379 pytest tests/test_integration_failures.py
 ```
 
 ### Module Breakdown:
 
 | Test Module | Test Count | Scope & Behaviors Verified |
 | :--- | :--- | :--- |
-| `test_gateway.py` | **47 tests** | WebSocket gateway server, API key validation, Origin validation, role separation, bounded subscriber queues, reconnect race buffering, two-gateway fan-out groups, datetime serialization. |
+| `test_gateway.py` | **51 tests** | WebSocket gateway server, API key validation, Origin validation, role separation, bounded subscriber queues, reconnect race buffering, two-gateway fan-out groups, capture spool policies. |
 | `test_hardening.py` | **45 tests** | Regression coverage: replay-without-spin, duplicate protection, active-slide correlation, notes idempotency and marker, JSON recovery, adaptive VAD scenarios, vision retry, capture timestamps. |
-| `test_cli_and_runtime.py` | **40 tests** | CLI commands (`start`, `stop`, `pause`, `resume`, `status`, `export`, `reprocess`, `replay`, `student`, `persister`, `review`, `ask`, `client`), process flag coordination, option validations, event-loop nesting. |
-| `test_student_client.py` | **26 tests** | Thin client subscription, Hinglish/Hindi personalization engine, concise English rewrite, gap buffering & draining, sequence persistence across instances, ledger gap recovery, knowledge graph integration. |
+| `test_cli_and_runtime.py` | **41 tests** | CLI commands (`start`, `stop`, `pause`, `resume`, `status`, `export`, `reprocess`, `replay`, `student`, `persister`, `review`, `ask`, `client`), process flag coordination, option validations, event-loop nesting. |
+| `test_student_client.py` | **27 tests** | Thin client subscription, Hinglish/Hindi personalization engine, concise English rewrite, gap buffering & draining, sequence persistence across instances, ledger gap recovery, knowledge graph integration. |
+| `test_sync_agent.py` | **23 tests** | Redis Streams consumption, sliding merge window, cross-modal correlation IDs, chronological timeline serialization, two-sink flush ordering, crash recovery. |
 | `test_redis_bus.py` | **23 tests** | Redis Streams resilient publishing, consumer group acknowledgements, delivery retry discarding with Redis persistence, backlog drain budget. |
 | `test_importance.py` | **21 tests** | Verbal cue classification across English, Hindi, and Hinglish ("definition", "exam_relevant", "dhyaan do"), plus protection of lecture content against the ad heuristics. |
+| `test_drift_filter.py` | **21 tests** | Context drift detection, sustained topic shifts, refusal handling, retry idempotency, corroborated ad/drift flags, quarantine. |
 | `test_audio_agent.py` | **20 tests** | RMS VAD energy gating, speech segmentation, audio mixing, faster-whisper chunking, dropped block timestamp compensation. |
 | `test_postgres_persister.py` | **20 tests** | Idempotent timeline events, general note sequence numbers, concept tag extraction and merge with `COALESCE`, crash recovery, pgvector support, embedding reconciliation. |
-| `test_drift_filter.py` | **20 tests** | Context drift detection, sustained topic shifts, refusal handling, retry idempotency, corroborated ad/drift flags. |
-| `test_sync_agent.py` | **18 tests** | Redis Streams consumption, sliding merge window, cross-modal correlation IDs, chronological timeline serialization, two-sink flush ordering. |
 | `test_screen_agent.py` | **17 tests** | MSS screenshot grabbing, perceptual dHash hashing, Hamming distance slide cache, vision-LLM OCR fallback, mixed-clock gate, model checksum verification. |
 | `test_llm_router.py` | **17 tests** | Multimodal task routing, OpenAI-compatible provider, Google GenAI, Ollama, circuit breaker rate-limiting, retries, per-task breaker scoping. |
+| `test_clock_and_files.py` | **14 tests** | SessionClock persistence, elapsed duration calculation, accumulated_seconds tracking, atomic file writes. |
 | `test_markdown_formatter.py` | **14 tests** | Code block indentation preservation, equation heading protection, unicode math preservation, display math block normalization. |
 | `test_structuring_agent.py` | **14 tests** | LangGraph pipeline, rolling window, 20s context overlap, byte-offset tracking, robust JSON extraction, crash rollback, empty-summary retry and raw fallback. |
-| `test_clock_and_files.py` | **14 tests** | SessionClock persistence, elapsed duration calculation, accumulated_seconds tracking, atomic file writes. |
 | `test_qa_engine.py` | **10 tests** | Vector indexing, pgvector integration with Chroma fallback, semantic search, RAG-grounded question answering with source citations. |
 | `test_student_chat_and_graph.py` | **9 tests** | Student knowledge graph, concept normalization, mastery decay, misconception recording with confidence, timestamp citations in tutor chat. |
 | `test_replay.py` | **8 tests** | ReplayEngine timeline playback, speed scaling (instant to real-time), Redis stream publishing. |
@@ -257,6 +264,7 @@ LectureLens maintains an automated test suite of **398 unit and integration test
 | `test_concurrency.py` | **4 tests** | Thread pool and process pool executor allocation, worker limits, safe shutdown. |
 | `test_pipeline_integration.py` | **3 tests** | Full integration test from multimodal stream ingestion through sync to general notes synthesis. |
 | `test_circuit_breaker.py` | **3 tests** | Redis fixed-window rate limiter, failure count tracking and TTL cooldown. |
+| `test_integration_failures.py` | **2 tests** | Opt-in failure injection: a crash between the durable file write and the Redis publish, and a crash between the state update and the release. |
 
 To run the complete test suite:
 ```bash
@@ -380,6 +388,9 @@ lecturelens client --session "cs101_01" --server "ws://192.168.1.20:8765" --api-
 | `LECTURELENS_OUTPUT_DIR` | `./output` | Root directory for session outputs. |
 | `LECTURELENS_ROUTER_CONFIG_PATH` | `./router.yaml` | Provider routing configuration. |
 | `LECTURELENS_VISION_MODEL_SHA256` | *(pinned)* | SHA-256 of the downloaded ONNX vision model. Override only for a mirrored copy. |
+| `LECTURELENS_SYNC_CONSUMER_GROUP` | `group:kuudere` | Redis consumer group of the sync agent. **Changing it orphans the pending messages of every existing session**, because the old group is never read or acknowledged again. Drain the old group before switching. |
+| `LECTURELENS_CAPTURE_SPOOL_MAX_SIZE` | `500` | How many captures the remote client keeps on disk while it is offline. |
+| `LECTURELENS_CAPTURE_SPOOL_ON_FULL` | `drop_oldest` | `drop_oldest` keeps the capture running and loses the oldest pending capture. `raise` loses nothing: the new capture is dropped instead and only a log line reports it. |
 | `UNOROUTER_API_KEY` / `UNOROUTER_API_KEYS` | *(none)* | Cloud provider credentials. Both the plain and the `LECTURELENS_`-prefixed spellings are accepted, and comma-separated values enable key rotation. |
 | `OPENROUTER_API_KEY` / `OPENROUTER_API_KEYS` | *(none)* | As above. |
 | `GOOGLE_API_KEY` / `GOOGLE_API_KEYS` | *(none)* | As above. |
