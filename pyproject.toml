@@ -23,9 +23,14 @@ dependencies = [
     # imports langchain-core and langgraph, the router imports langchain-core
     # and langchain-ollama, and the screen agent imports Pillow. Without these
     # the base install could not run a lecture at all.
-    "langchain-core>=0.3",
-    "langchain-ollama>=0.2",
-    "langgraph>=0.2",
+    #
+    # The versions of the langchain packages have to agree with each other.
+    # They did not have to before, and a machine with an old langgraph and a
+    # new langchain-core could not start the agent that writes the notes. The
+    # reason was only in the log of that agent.
+    "langchain-core>=1.4.7,<2.0",
+    "langchain-ollama>=1.0,<2.0",
+    "langgraph>=1.0,<2.0",
     "Pillow>=10.0",
     # The notes are turned into a page that draws the formulas, so they
     # can be read in a browser without any other program.
@@ -41,11 +46,11 @@ full = [
     "faster-whisper>=1.0",
     "mss>=9.0",
     "Pillow>=10.0",
-    "langchain-core>=0.3",
-    "langchain-ollama>=0.2",
-    "langchain-openai>=0.2",
-    "langchain-google-genai>=2.0",
-    "langgraph>=0.2",
+    "langchain-core>=1.4.7,<2.0",
+    "langchain-ollama>=1.0,<2.0",
+    "langchain-openai>=1.0,<2.0",
+    "langchain-google-genai>=3.0,<5.0",
+    "langgraph>=1.0,<2.0",
     "chromadb>=0.5",
     "websockets>=12.0",
     "onnxruntime>=1.15.0",
@@ -56,8 +61,8 @@ qa = [
     "onnxruntime>=1.15.0",
 ]
 cloud = [
-    "langchain-openai>=0.2",
-    "langchain-google-genai>=2.0",
+    "langchain-openai>=1.0,<2.0",
+    "langchain-google-genai>=3.0,<5.0",
 ]
 client = [
     "sounddevice>=0.4",

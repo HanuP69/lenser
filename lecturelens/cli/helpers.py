@@ -227,6 +227,79 @@ def build_agent_rows(
     return rows
 
 
+def _read_requirement_lines(pyproject_text: str) -> list[str]:
+    """The requirement lines of the pyproject file.
+
+    The file is read as text and not as a table, because tomllib is only
+    there from python 3.11 and the project runs on 3.10 as well.
+    """
+    lines: list[str] = []
+    inside = False
+    for raw_line in pyproject_text.splitlines():
+        stripped = raw_line.strip()
+        if not inside:
+            # Every list of the file is read, so the requirements of the
+            # base install and of the extras are both found. A line that
+            # is a table name ends with a bracket, not with an opening
+            # one.
+            if stripped.endswith("[") and not stripped.startswith("["):
+                inside = True
+            continue
+        if stripped.startswith("]"):
+            inside = False
+            continue
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = re.match(r'^"([^"]+)"', stripped)
+        if match:
+            lines.append(match.group(1))
+    return lines
+
+
+def check_dependency_versions() -> list[str]:
+    """Whether the installed versions are the ones the project needs.
+
+    The versions of the langchain packages have to agree with each other.
+    A machine with an old langgraph and a new langchain-core cannot start
+    the agent that writes the notes, and the reason is a confusing message
+    about a module that is installed but does not work.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+    from pathlib import Path
+
+    try:
+        from packaging.requirements import Requirement
+    except ImportError:
+        return []
+
+    project_file = Path(__file__).resolve().parent.parent.parent / "pyproject.toml"
+    if not project_file.exists():
+        return []
+    try:
+        pyproject_text = project_file.read_text(encoding="utf-8")
+    except OSError:
+        return []
+
+    problems: list[str] = []
+    for requirement_text in _read_requirement_lines(pyproject_text):
+        try:
+            requirement = Requirement(requirement_text)
+        except Exception:
+            continue
+        try:
+            installed = version(requirement.name)
+        except PackageNotFoundError:
+            continue
+        if requirement.specifier and not requirement.specifier.contains(
+            installed, prereleases=True
+        ):
+            problems.append(
+                f"{requirement.name} {installed} is installed, but the project needs "
+                f"{requirement.specifier}. Run: pip install -e \".[full]\""
+            )
+    return problems
+
+
 def check_agent_dependencies(agent_names: list[str]) -> list[str]:
     """Whether the agents can be started at all.
 
@@ -257,10 +330,18 @@ def check_agent_dependencies(agent_names: list[str]) -> list[str]:
         if result.returncode == 0:
             continue
         missing = _missing_module_name(result.stderr)
+        version_problems = check_dependency_versions()
         if missing:
+            reason = ""
+            for problem in version_problems:
+                if missing.lower() in problem.lower():
+                    reason = f" ({problem})"
+                    break
+            if not reason and version_problems:
+                reason = f" The installed versions do not fit each other: {version_problems[0]}"
             problems.append(
-                f"{agent_name} needs the module {missing}, which is not installed. "
-                f"Run: pip install -e \".[full]\""
+                f"{agent_name} needs the module {missing}, which does not work on this "
+                f"machine.{reason} Run: pip install -e \".[full]\""
             )
         else:
             last_line = ""

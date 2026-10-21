@@ -166,5 +166,51 @@ class TestAgentDependencies(unittest.TestCase):
         self.assertIn("not_an_agent", problems[0])
 
 
+class TestDependencyVersions(unittest.TestCase):
+    def test_the_requirement_lines_are_read(self) -> None:
+        from lecturelens.cli.helpers import _read_requirement_lines
+
+        text = (
+            "[project]\n"
+            "dependencies = [\n"
+            '    "pydantic>=2.0",\n'
+            "    # a comment\n"
+            '    "redis>=5.0"\n'
+            "]\n"
+            "\n"
+            "[project.optional-dependencies]\n"
+            "full = [\n"
+            '    "mss>=9.0"\n'
+            "]\n"
+        )
+        lines = _read_requirement_lines(text)
+        self.assertIn("pydantic>=2.0", lines)
+        self.assertIn("redis>=5.0", lines)
+        self.assertIn("mss>=9.0", lines)
+
+    def test_the_installed_versions_fit(self) -> None:
+        """The versions of the langchain packages have to agree.
+
+        A machine with an old langgraph and a new langchain-core could
+        not start the agent that writes the notes, and the reason was a
+        confusing message about a module that is installed.
+        """
+        from lecturelens.cli.helpers import check_dependency_versions
+
+        self.assertEqual(check_dependency_versions(), [])
+
+
+class TestDoctorCommand(unittest.TestCase):
+    def test_the_doctor_command_runs(self) -> None:
+        import typer
+
+        from lecturelens.cli import main as cli_main
+
+        try:
+            cli_main.doctor_command()
+        except typer.Exit as error:
+            self.assertNotEqual(error.exit_code, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

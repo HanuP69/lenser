@@ -490,6 +490,60 @@ def run_shutdown(monitor: AgentMonitor, session_dir: Path, planned_agents: list[
         logger.error("the session summary could not be shown: %s", error)
 
 
+@app.command("doctor")
+def doctor_command() -> None:
+    """Check whether this machine can run a lecture."""
+    from lecturelens.cli.helpers import check_agent_dependencies, check_dependency_versions
+
+    settings = Settings()
+    console.print("[bold]LectureLens doctor[/bold]\n")
+
+    console.print(f"output folder : {settings.output_dir}")
+    console.print(f"router file   : {settings.router_config_path}")
+
+    console.print("\n[bold]The packages[/bold]")
+    version_problems = check_dependency_versions()
+    if version_problems:
+        for problem in version_problems:
+            console.print(f"  [red]{problem}[/red]")
+    else:
+        console.print("  [green]The installed versions fit each other.[/green]")
+
+    console.print("\n[bold]The agents[/bold]")
+    agent_problems = check_agent_dependencies(
+        ["audio_agent", "screen_agent", "sync_agent", "structuring_agent"]
+    )
+    if agent_problems:
+        for problem in agent_problems:
+            console.print(f"  [red]{problem}[/red]")
+    else:
+        console.print("  [green]Every agent can be started.[/green]")
+
+    console.print("\n[bold]The services[/bold]")
+    if check_redis(settings):
+        console.print(f"  [green]Redis is running[/green] at {settings.redis_url}")
+    else:
+        console.print(f"  [red]Redis is not reachable[/red] at {settings.redis_url}")
+
+    console.print("\n[bold]The sound[/bold]")
+    from lecturelens.agents.audio_agent import find_loopback_microphone
+
+    device, error = find_loopback_microphone()
+    if device is not None:
+        console.print(f"  [green]The system audio can be recorded[/green] through {device}")
+    else:
+        console.print(f"  [yellow]The system audio cannot be recorded[/yellow]: {error}")
+
+    console.print("\n[bold]The windows[/bold]")
+    from lecturelens.core.window_capture import WindowCaptureUnavailable, list_windows
+
+    try:
+        windows = list_windows()
+        console.print(f"  [green]{len(windows)} windows[/green] can be recorded")
+    except WindowCaptureUnavailable as error:
+        console.print(f"  [yellow]The windows cannot be listed[/yellow]: {error}")
+
+
 @app.command("windows")
 def list_windows_command(
     set_window: Optional[str] = typer.Option(
