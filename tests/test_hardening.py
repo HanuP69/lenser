@@ -17,7 +17,7 @@ from lecturelens.agents.audio_agent import SpeechSegmenter
 from lecturelens.agents.screen_agent import ScreenAgent
 from lecturelens.agents.structuring_agent import StructuringAgent
 from lecturelens.agents.sync_agent import SyncAgent, entry_fingerprint
-from lecturelens.cli.main import session_has_live_agents
+from lecturelens.cli.commands.session import session_has_live_agents
 from lecturelens.config.settings import Settings
 from lecturelens.core.clock import SessionClock
 from lecturelens.core.markdown_formatter import format_clean_markdown, normalize_headings

@@ -7,7 +7,17 @@ from pathlib import Path
 from unittest import mock
 
 from lecturelens.cli import helpers
-from lecturelens.cli import main as cli_main
+
+from lecturelens.cli.app import (
+    run_shutdown,
+)
+from lecturelens.cli import app as cli_app
+from lecturelens.cli.commands.session import (
+    agents_are_gone,
+)
+from lecturelens.cli.commands.windows import (
+    doctor_command,
+)
 
 
 class TestConsoleSafety(unittest.TestCase):
@@ -52,7 +62,7 @@ class TestAgentLiveness(unittest.TestCase):
     def test_a_session_without_heartbeats_is_not_given_up_on(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             session_dir = Path(folder)
-            self.assertFalse(cli_main.agents_are_gone(session_dir))
+            self.assertFalse(agents_are_gone(session_dir))
 
     def test_a_session_with_running_agents_is_not_given_up_on(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -63,7 +73,7 @@ class TestAgentLiveness(unittest.TestCase):
                 json.dumps({"agent": "audio_agent", "pid": os.getpid()}),
                 encoding="utf-8"
             )
-            self.assertFalse(cli_main.agents_are_gone(session_dir))
+            self.assertFalse(agents_are_gone(session_dir))
 
     def test_a_session_whose_agents_are_gone_is_given_up_on(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -76,9 +86,9 @@ class TestAgentLiveness(unittest.TestCase):
                 encoding="utf-8"
             )
             if os.name == "nt":
-                self.assertTrue(cli_main.agents_are_gone(session_dir))
+                self.assertTrue(agents_are_gone(session_dir))
             else:
-                self.assertTrue(cli_main.agents_are_gone(session_dir))
+                self.assertTrue(agents_are_gone(session_dir))
 
 
 class TestInterruptedShutdown(unittest.TestCase):
@@ -129,7 +139,6 @@ class TestInterruptedShutdown(unittest.TestCase):
         self.assertIn("finalize.flag", flags_written)
 
     def test_the_session_is_marked_as_finished_after_an_interrupt(self) -> None:
-        from lecturelens.cli import main as cli_main
         from lecturelens.core.agent_runtime import SESSION_FINISHED_FLAG_NAME, flag_exists
 
         class BrokenConsole:
@@ -149,8 +158,8 @@ class TestInterruptedShutdown(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             session_dir = Path(folder)
             (session_dir / "control").mkdir(parents=True, exist_ok=True)
-            with mock.patch.object(cli_main, "console", BrokenConsole()):
-                cli_main.run_shutdown(InterruptedMonitor(), session_dir, ["audio_agent"])
+            with mock.patch.object(cli_app, "console", BrokenConsole()):
+                run_shutdown(InterruptedMonitor(), session_dir, ["audio_agent"])
             self.assertTrue(flag_exists(session_dir, SESSION_FINISHED_FLAG_NAME))
 
 
@@ -182,8 +191,8 @@ class TestShutdownSurvivesABrokenConsole(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             session_dir = Path(folder)
             (session_dir / "control").mkdir(parents=True, exist_ok=True)
-            with mock.patch.object(cli_main, "console", BrokenConsole()):
-                cli_main.run_shutdown(BrokenMonitor(), session_dir, ["audio_agent"])
+            with mock.patch.object(cli_app, "console", BrokenConsole()):
+                run_shutdown(BrokenMonitor(), session_dir, ["audio_agent"])
             self.assertTrue(flag_exists(session_dir, SESSION_FINISHED_FLAG_NAME))
 
 
@@ -306,10 +315,9 @@ class TestDoctorCommand(unittest.TestCase):
     def test_the_doctor_command_runs(self) -> None:
         import typer
 
-        from lecturelens.cli import main as cli_main
 
         try:
-            cli_main.doctor_command()
+            doctor_command()
         except typer.Exit as error:
             self.assertNotEqual(error.exit_code, 1)
 

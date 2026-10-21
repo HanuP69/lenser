@@ -10,11 +10,35 @@ from unittest import mock
 
 import typer
 
-from lecturelens.cli import helpers, main as cli_main
+from lecturelens.cli import helpers
 from lecturelens.config.settings import Settings
 from lecturelens.core import agent_runtime
 from lecturelens.core.agent_runtime import AgentControl, read_heartbeats
 from tests.support import index_by
+
+from lecturelens.cli.app import (
+    build_agent_environment,
+    module_for_agent,
+    plan_agents,
+)
+from lecturelens.cli.commands.knowledge import (
+    ask,
+    review,
+)
+from lecturelens.cli.commands.remote import (
+    client,
+    replay,
+    student,
+)
+from lecturelens.cli.commands.session import (
+    export,
+    pause,
+    reprocess,
+    resume,
+    start,
+    stop,
+)
+from lecturelens.cli.commands import session as session_cli
 
 
 class TestHelpers(unittest.TestCase):
@@ -212,21 +236,21 @@ class TestCliCommands(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_plan_agents(self) -> None:
-        full = cli_main.plan_agents("local", False, False)
+        full = plan_agents("local", False, False)
         self.assertEqual(sorted(full), ["audio_agent", "screen_agent", "structuring_agent", "sync_agent"])
-        self.assertNotIn("screen_agent", cli_main.plan_agents("local", False, True))
+        self.assertNotIn("screen_agent", plan_agents("local", False, True))
         self.assertEqual(
-            sorted(cli_main.plan_agents("local", True, False)),
+            sorted(plan_agents("local", True, False)),
             ["audio_agent", "structuring_agent", "sync_agent"]
         )
-        self.assertIn("gateway", cli_main.plan_agents("server", True, False))
-        self.assertNotIn("persister", cli_main.plan_agents("server", True, False))
-        self.assertIn("persister", cli_main.plan_agents("server", True, False, enable_persister=True))
-        self.assertIn("persister", cli_main.plan_agents("local", False, False, enable_persister=True))
+        self.assertIn("gateway", plan_agents("server", True, False))
+        self.assertNotIn("persister", plan_agents("server", True, False))
+        self.assertIn("persister", plan_agents("server", True, False, enable_persister=True))
+        self.assertIn("persister", plan_agents("local", False, False, enable_persister=True))
 
     def test_environment_passes_absolute_paths_and_course(self) -> None:
         settings = Settings()
-        environment = cli_main.build_agent_environment(settings, "lec1", "system", 2, "hybrid", "algorithms")
+        environment = build_agent_environment(settings, "lec1", "system", 2, "hybrid", "algorithms")
         self.assertTrue(Path(environment["LECTURELENS_OUTPUT_DIR"]).is_absolute())
         self.assertTrue(Path(environment["LECTURELENS_ROUTER_CONFIG_PATH"]).is_absolute())
         self.assertEqual(environment["LECTURELENS_AUDIO_SOURCE"], "system")
@@ -245,7 +269,7 @@ class TestCliCommands(unittest.TestCase):
             "GOOGLE_API_KEYS": "k1,k2",
             "OPENROUTER_API_KEYS": "ok1,ok2"
         }):
-            environment = cli_main.build_agent_environment(settings, "lec1", "system", 1, "hybrid", None)
+            environment = build_agent_environment(settings, "lec1", "system", 1, "hybrid", None)
             self.assertEqual(environment["LECTURELENS_UNOROUTER_API_KEY"], "test_uno_key")
             self.assertEqual(environment["LECTURELENS_UNOROUTER_API_KEYS"], "k1,k2")
             self.assertEqual(environment["LECTURELENS_GOOGLE_API_KEYS"], "k1,k2")
@@ -260,36 +284,40 @@ class TestCliCommands(unittest.TestCase):
             self.assertEqual(s.drift_similarity_threshold, 0.65)
 
     def test_module_names(self) -> None:
-        self.assertEqual(cli_main.module_for_agent("gateway"), "lecturelens.gateway.server")
-        self.assertEqual(cli_main.module_for_agent("audio_agent"), "lecturelens.agents.audio_agent")
+        self.assertEqual(module_for_agent("gateway"), "lecturelens.gateway.server")
+        self.assertEqual(module_for_agent("audio_agent"), "lecturelens.agents.audio_agent")
 
     def test_pause_and_resume_toggle_flag(self) -> None:
-        cli_main.pause(session="lec1")
+        pause(session="lec1")
         self.assertTrue(agent_runtime.flag_exists(self.session_dir, agent_runtime.PAUSE_FLAG_NAME))
-        cli_main.resume(session="lec1")
+        resume(session="lec1")
         self.assertFalse(agent_runtime.flag_exists(self.session_dir, agent_runtime.PAUSE_FLAG_NAME))
 
     def test_stop_sets_shutdown_request_without_waiting(self) -> None:
-        cli_main.stop(session="lec1", wait=False, timeout_seconds=1.0)
+        stop(session="lec1", wait=False, timeout_seconds=1.0)
         self.assertTrue(agent_runtime.flag_exists(self.session_dir, agent_runtime.SHUTDOWN_REQUEST_FLAG_NAME))
 
     def test_stop_waits_for_finished_flag(self) -> None:
         agent_runtime.set_flag(self.session_dir, agent_runtime.SESSION_FINISHED_FLAG_NAME)
         with mock.patch.object(agent_runtime, "clear_flag"):
-            with mock.patch.object(cli_main, "clear_flag"):
-                cli_main.stop(session="lec1", wait=True, timeout_seconds=3.0)
+            with mock.patch.object(session_cli, "clear_flag"):
+                stop(session="lec1", wait=True, timeout_seconds=3.0)
 
     def test_stop_times_out_when_session_never_finishes(self) -> None:
         with self.assertRaises(typer.Exit):
-            cli_main.stop(session="lec1", wait=True, timeout_seconds=0.3)
+            stop(session="lec1", wait=True, timeout_seconds=0.3)
 
     def test_cli_options_fall_back_to_the_configured_settings(self) -> None:
         """The option defaults were exported unconditionally, so the values
         configured in .env were always overridden."""
         import inspect
 
-        for command_name in ("client", "ask", "reprocess", "start"):
-            command = getattr(cli_main, command_name)
+        for command_name, command in (
+            ("client", client),
+            ("ask", ask),
+            ("reprocess", reprocess),
+            ("start", start),
+        ):
             signature = inspect.signature(command)
             for parameter_name, parameter in signature.parameters.items():
                 if parameter_name not in ("audio_source", "monitor_index", "llm_mode"):
@@ -305,16 +333,16 @@ class TestCliCommands(unittest.TestCase):
     def test_stop_rejects_non_positive_timeout(self) -> None:
         """A non-positive timeout used to disable the deadline and hang forever."""
         with self.assertRaises(typer.Exit):
-            cli_main.stop(session="lec1", wait=True, timeout_seconds=0)
+            stop(session="lec1", wait=True, timeout_seconds=0)
         with self.assertRaises(typer.Exit):
-            cli_main.stop(session="lec1", wait=True, timeout_seconds=-1.0)
+            stop(session="lec1", wait=True, timeout_seconds=-1.0)
 
     def test_session_id_with_trailing_newline_is_rejected(self) -> None:
         """`$` matched before a trailing newline, so "lec1\n" passed validation."""
         with self.assertRaises(typer.Exit):
-            cli_main.pause(session="lec1\n")
+            pause(session="lec1\n")
         with self.assertRaises(typer.Exit):
-            cli_main.pause(session="lec1\n../../etc")
+            pause(session="lec1\n../../etc")
 
     def test_reprocess_does_not_probe_redis_inside_the_event_loop(self) -> None:
         """reprocess used to call check_redis() (which runs its own asyncio.run)
@@ -351,64 +379,64 @@ class TestCliCommands(unittest.TestCase):
                 processed.append(1)
                 return 3
 
-        with mock.patch.object(cli_main, "check_redis", side_effect=fake_check_redis):
+        with mock.patch.object(session_cli, "check_redis", side_effect=fake_check_redis):
             with mock.patch("lecturelens.agents.structuring_agent.StructuringAgent", FakeStructuringAgent):
                 with mock.patch("lecturelens.router.llm_router.build_router_for_task", return_value=None):
                     with mock.patch("lecturelens.router.llm_router.load_router_config", return_value={}):
-                        cli_main.reprocess(session="lec1")
+                        reprocess(session="lec1")
 
         self.assertEqual(processed, [1])
 
     def test_unknown_or_invalid_sessions_exit_with_error(self) -> None:
         with self.assertRaises(typer.Exit):
-            cli_main.pause(session="does_not_exist")
+            pause(session="does_not_exist")
         with self.assertRaises(typer.Exit):
-            cli_main.pause(session="../etc")
+            pause(session="../etc")
 
     def test_session_defaults_to_latest_instead_of_default_session(self) -> None:
-        cli_main.pause(session=None)
+        pause(session=None)
         self.assertTrue(agent_runtime.flag_exists(self.session_dir, agent_runtime.PAUSE_FLAG_NAME))
 
     def test_export_md_and_rejects_unknown_format(self) -> None:
         destination = self.output / "out"
-        cli_main.export(export_format="md", session="lec1", output=destination)
+        export(export_format="md", session="lec1", output=destination)
         self.assertTrue((destination / "lec1_notes.md").exists())
         with self.assertRaises(typer.Exit):
-            cli_main.export(export_format="docx", session="lec1", output=destination)
+            export(export_format="docx", session="lec1", output=destination)
 
     def test_review_command_executes(self) -> None:
-        cli_main.review(course="algorithms", session=None)
-        cli_main.review(course=None, session="lec1")
+        review(course="algorithms", session=None)
+        review(course=None, session="lec1")
 
     def test_ask_command_accepts_student_id_argument(self) -> None:
         import inspect
-        sig = inspect.signature(cli_main.ask)
+        sig = inspect.signature(ask)
         self.assertIn("student_id", sig.parameters)
 
     def test_start_refuses_existing_session_without_resume(self) -> None:
         with self.assertRaises(typer.Exit):
-            cli_main.start(
+            start(
                 mode="local", audio_source="mic", no_screen=False, audio_only=False,
                 session="lec1", course=None, monitor_index=1, llm_mode="local", resume=False
             )
 
     def test_start_rejects_bad_options_before_touching_anything(self) -> None:
         with self.assertRaises(typer.Exit):
-            cli_main.start(
+            start(
                 mode="local", audio_source="loudspeaker", no_screen=False, audio_only=False,
                 session="fresh", course=None, monitor_index=1, llm_mode="local", resume=False
             )
         with self.assertRaises(typer.Exit):
-            cli_main.start(
+            start(
                 mode="local", audio_source="mic", no_screen=False, audio_only=False,
                 session="../x", course=None, monitor_index=1, llm_mode="local", resume=False
             )
         self.assertFalse((self.output / "fresh").exists())
 
     def test_start_requires_redis(self) -> None:
-        with mock.patch.object(cli_main, "check_redis", return_value=False):
+        with mock.patch.object(session_cli, "check_redis", return_value=False):
             with self.assertRaises(typer.Exit):
-                cli_main.start(
+                start(
                     mode="local", audio_source="mic", no_screen=False, audio_only=False,
                     session="fresh2", course=None, monitor_index=1, llm_mode="local", resume=False
                 )
@@ -417,7 +445,7 @@ class TestCliCommands(unittest.TestCase):
     def test_client_rejects_system_audio_without_loopback(self) -> None:
         with mock.patch("lecturelens.agents.audio_agent.find_loopback_microphone", return_value=(None, "No loopback device")):
             with self.assertRaises(typer.Exit):
-                cli_main.client(
+                client(
                     session="fresh3",
                     server=None,
                     api_key=None,
@@ -437,11 +465,11 @@ class TestCliCommands(unittest.TestCase):
             async def ask_with_sources(self, question: str) -> tuple[str, list]:
                 return "Answer", ["Source 1"]
 
-        with mock.patch("lecturelens.cli.main.check_redis", return_value=False), \
+        with mock.patch("lecturelens.cli.app.check_redis", return_value=False), \
              mock.patch("lecturelens.knowledge.qa_engine.QAEngine", DummyQAEngine):
             session_dir = self.output / "test_qa_sess"
             session_dir.mkdir(parents=True, exist_ok=True)
-            cli_main.ask(question="What is dynamic programming?", session="test_qa_sess", student_id=None)
+            ask(question="What is dynamic programming?", session="test_qa_sess", student_id=None)
             self.assertEqual(captured_kwargs.get("embed_batch_size"), 32)
 
     def test_student_output_dir_uses_sanitized_id(self) -> None:
@@ -449,7 +477,7 @@ class TestCliCommands(unittest.TestCase):
             mock_instance = mock.MagicMock()
             mock_instance.run = mock.AsyncMock()
             MockClient.return_value = mock_instance
-            cli_main.student(
+            student(
                 server="ws://localhost:8765",
                 session="test_sess",
                 student_id="../../escaped_student",
@@ -474,13 +502,13 @@ class TestCliCommands(unittest.TestCase):
 
     def test_replay_cli_invokes_engine_and_reports_counts(self) -> None:
         (self.session_dir / "timeline.jsonl").write_text('{"event_id": "1"}\n', encoding="utf-8")
-        with mock.patch("lecturelens.cli.main.create_redis_bus") as mock_bus_factory, \
+        with mock.patch("lecturelens.cli.commands.remote.create_redis_bus") as mock_bus_factory, \
              mock.patch("lecturelens.core.replay.ReplayEngine.replay", new_callable=mock.AsyncMock) as mock_replay:
             mock_bus = mock.AsyncMock()
             mock_bus_factory.return_value = mock_bus
             mock_replay.return_value = 1
 
-            cli_main.replay(session="lec1", speed=2.0, target_session="target_lec")
+            replay(session="lec1", speed=2.0, target_session="target_lec")
             mock_bus_factory.assert_called_once()
             _, kwargs = mock_bus_factory.call_args
             self.assertEqual(kwargs.get("component_name"), "replay_lec1")

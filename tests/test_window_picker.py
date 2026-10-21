@@ -6,6 +6,10 @@ from lecturelens.cli import window_picker
 from lecturelens.core.window_capture import WindowInfo
 
 
+
+from lecturelens.cli.commands.session import (
+    _remember_window,
+)
 def make_window(handle: int, title: str) -> WindowInfo:
     return WindowInfo(
         handle=handle,
@@ -106,7 +110,6 @@ class TestRememberingTheWindow(unittest.TestCase):
         import tempfile
         from pathlib import Path
 
-        from lecturelens.cli import main as cli_main
         from lecturelens.core.env_file import read_env_value
 
         with tempfile.TemporaryDirectory() as folder:
@@ -120,7 +123,7 @@ class TestRememberingTheWindow(unittest.TestCase):
             with mock.patch(
                 "lecturelens.core.env_file.set_env_value", side_effect=remember
             ):
-                cli_main._remember_window(4321, "Redis Talk")
+                _remember_window(4321, "Redis Talk")
 
             self.assertEqual(read_env_value("LECTURELENS_WINDOW_HANDLE", env_path), "4321")
             self.assertEqual(read_env_value("LECTURELENS_WINDOW_TITLE", env_path), "Redis Talk")
