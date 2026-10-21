@@ -225,7 +225,7 @@ Each student maintains an isolated, private SQLite database (`student_graph.db`)
 
 ## Automated Test Suite (423 Tests)
 
-LectureLens maintains an automated test suite of **457 unit and integration tests** verifying concurrency, resilience, audio processing, screen capture, window capture, Postgres persistence, gateway fan-out, client personalization, and knowledge graphs:
+LectureLens maintains an automated test suite of **470 unit and integration tests** verifying concurrency, resilience, audio processing, screen capture, window capture, Postgres persistence, gateway fan-out, client personalization, and knowledge graphs:
 
 ```
 ================= 423 passed in 69.84s =================
@@ -265,9 +265,10 @@ pytest -q
 | `test_window_capture.py` | **10 tests** | Window listing, matching by number and by title, the shell windows that are not offered, and the check that refuses an empty frame. |
 | `test_clock_and_files.py` | **16 tests** | SessionClock persistence, elapsed duration calculation, accumulated_seconds tracking, atomic file writes, durable append after a torn line. |
 | `test_markdown_formatter.py` | **14 tests** | Code block indentation preservation, equation heading protection, unicode math preservation, display math block normalization. |
-| `test_window_picker.py` | **8 tests** | The question that is asked on the first run, the number and the title that pick a window, the configured window that is used without asking, and the fallback to the whole display. |
+| `test_window_picker.py` | **9 tests** | The question that is asked on the first run, the number and the title that pick a window, the configured window that is used without asking, the fallback to the whole display, and the window that is remembered. |
 | `test_qa_engine.py` | **10 tests** | Vector indexing, pgvector integration with Chroma fallback, semantic search, RAG-grounded question answering with source citations. |
 | `test_student_chat_and_graph.py` | **9 tests** | Student knowledge graph, concept normalization, mastery decay, misconception recording with confidence, timestamp citations in tutor chat. |
+| `test_console_safety.py` | **9 tests** | The console of the machine cannot show every character of a lecture in Urdu, the dashboard text is cleaned up, and the shutdown finishes even when the console fails. |
 | `test_replay.py` | **8 tests** | ReplayEngine timeline playback, speed scaling (instant to real-time), Redis stream publishing. |
 | `test_env_file.py` | **6 tests** | Keeping the chosen window in the .env file: adding, replacing, removing and keeping the rest of the file. |
 | `test_concurrency.py` | **6 tests** | Thread pool and process pool executor allocation, worker limits, safe shutdown, the fallback to a thread when the pool cannot be started, and that a worker that dies is not run in a thread. |
@@ -275,6 +276,7 @@ pytest -q
 | `test_circuit_breaker.py` | **4 tests** | Redis sliding window rate limiter, failure count tracking and TTL cooldown. |
 | `test_integration_failures.py` | **4 tests** | Opt-in failure injection: a crash before the file write, between the file write and the Redis publish, between the append and the state save, and between the state update and the release. |
 | `test_pipeline_integration.py` | **3 tests** | Full integration test from multimodal stream ingestion through sync to general notes synthesis. |
+| `test_settings_isolation.py` | **3 tests** | The .env file of the machine and its variables cannot change the behaviour of the tests. |
 
 To run the complete test suite:
 ```bash
