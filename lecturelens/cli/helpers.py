@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -90,6 +91,43 @@ def tail_last_line(file_path: Path, max_bytes: int = 8192) -> Optional[str]:
     for raw_line in reversed(lines):
         if len(raw_line.strip()) > 0:
             return raw_line.decode("utf-8", errors="replace")
+    return None
+
+
+# A line of a log that says what went wrong: the name of an exception,
+# or a line that was logged as an error.
+ERROR_LINE_PATTERN = re.compile(
+    r"(^[A-Za-z_][A-Za-z0-9_.]*(Error|Exception)\b)|(\bError:\s)|(\bERROR\b)"
+)
+
+
+def agent_failure_reason(log_path: Path, max_bytes: int = 16384) -> Optional[str]:
+    """The reason an agent died, taken from its log.
+
+    An agent that cannot start says so in its log and nowhere else, so
+    the reason was only visible when the log was opened by hand. The
+    last line that says what went wrong is shown instead.
+    """
+    if not log_path.exists():
+        return None
+    size = log_path.stat().st_size
+    if size == 0:
+        return None
+    with open(log_path, "rb") as file_handle:
+        file_handle.seek(max(0, size - max_bytes))
+        data = file_handle.read()
+    for raw_line in reversed(data.split(b"\n")):
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        if len(line) == 0:
+            continue
+        if "Traceback (most recent call last)" in line:
+            continue
+        # The frames of the traceback say where it happened, not what
+        # went wrong.
+        if line.startswith(("File ", "  ", "\t")):
+            continue
+        if ERROR_LINE_PATTERN.search(line):
+            return line
     return None
 
 
@@ -187,6 +225,64 @@ def build_agent_rows(
             stats_text = " ".join(stat_parts)
         rows.append({"agent": name, "status": status, "process": process_status, "stats": stats_text})
     return rows
+
+
+def check_agent_dependencies(agent_names: list[str]) -> list[str]:
+    """Whether the agents can be started at all.
+
+    An agent that cannot import what it needs dies at once, and the
+    reason is only in its log, where nobody looks. The command checks it
+    before it starts, so the reason is shown right away.
+
+    The check runs in a process of its own, because the agent runs in a
+    process of its own. An import that was already done here says
+    nothing about the agent.
+    """
+    import subprocess
+    import sys
+
+    problems: list[str] = []
+    for agent_name in agent_names:
+        module_name = f"lecturelens.agents.{agent_name}"
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", f"import {module_name}"],
+                capture_output=True,
+                text=True,
+                timeout=120
+            )
+        except Exception as error:
+            problems.append(f"{agent_name} could not be checked: {error}")
+            continue
+        if result.returncode == 0:
+            continue
+        missing = _missing_module_name(result.stderr)
+        if missing:
+            problems.append(
+                f"{agent_name} needs the module {missing}, which is not installed. "
+                f"Run: pip install -e \".[full]\""
+            )
+        else:
+            last_line = ""
+            for line in reversed(result.stderr.splitlines()):
+                if line.strip():
+                    last_line = line.strip()
+                    break
+            problems.append(f"{agent_name} cannot be started: {last_line or 'unknown error'}")
+    return problems
+
+
+def _missing_module_name(stderr: str) -> Optional[str]:
+    """The name of the module that is not there, if the log says so."""
+    for line in stderr.splitlines():
+        if "No module named" in line:
+            marker = "No module named"
+            start = line.find(marker)
+            if start < 0:
+                continue
+            remainder = line[start + len(marker):].strip().strip("'\"")
+            return remainder if remainder else None
+    return None
 
 
 def get_free_disk_bytes(directory: Path) -> int:

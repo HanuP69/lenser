@@ -43,6 +43,7 @@ _use_utf_8_output()
 
 from lecturelens.cli.helpers import (
     LineCounter,
+    agent_failure_reason,
     build_agent_rows,
     display_session_output_summary,
     find_latest_session,
@@ -342,6 +343,14 @@ async def collect_snapshot(
     session_dir = settings.get_session_output_dir(session_id)
     heartbeats = read_heartbeats(session_dir)
     rows = build_agent_rows(health, heartbeats, time.time())
+    # An agent that died says why in its log and nowhere else, so the
+    # reason is put next to it.
+    for row in rows:
+        if row.get("status") != "ERROR":
+            continue
+        reason = agent_failure_reason(session_dir / "logs" / f"{row['agent']}.log")
+        if reason:
+            row["stats"] = safe_for_console(reason, 90)
     backlogs = await render_stream_backlogs(bus, session_id)
 
     queue_table = Table(title="Queues")
@@ -642,6 +651,19 @@ def start(
         should_persist = False
 
     planned_agents = plan_agents(mode, audio_only, no_screen, enable_persister=should_persist)
+
+    # An agent that cannot import what it needs dies at once and the
+    # reason is only in its log. The capture goes on and everything is
+    # recorded, but the notes are never written, so the check is done
+    # before the session starts.
+    from lecturelens.cli.helpers import check_agent_dependencies
+
+    dependency_problems = check_agent_dependencies(planned_agents)
+    if dependency_problems:
+        for problem in dependency_problems:
+            console.print(f"[red]{problem}[/red]")
+        fail("The agents cannot be started. Install what is missing and try again.")
+
     session_meta.begin_run(
         session_dir,
         session_id,

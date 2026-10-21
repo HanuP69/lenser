@@ -114,5 +114,57 @@ class TestShutdownSurvivesABrokenConsole(unittest.TestCase):
             self.assertTrue(flag_exists(session_dir, SESSION_FINISHED_FLAG_NAME))
 
 
+class TestAgentFailureReason(unittest.TestCase):
+    def test_a_missing_module_is_found_in_the_log(self) -> None:
+        """The reason an agent died was only in its log.
+
+        The capture went on and everything was recorded, but the notes
+        were never written, because the agent that writes them was dead.
+        """
+        import tempfile
+        from pathlib import Path
+
+        from lecturelens.cli.helpers import agent_failure_reason
+
+        with tempfile.TemporaryDirectory() as folder:
+            log = Path(folder) / "structuring_agent.log"
+            log.write_text(
+                "Traceback (most recent call last):\n"
+                "  File \"x.py\", line 12, in <module>\n"
+                "    from langgraph.graph import END\n"
+                "ModuleNotFoundError: No module named 'langgraph'\n",
+                encoding="utf-8"
+            )
+            reason = agent_failure_reason(log)
+        self.assertIsNotNone(reason)
+        self.assertIn("langgraph", reason)
+
+    def test_a_log_without_an_error_has_no_reason(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from lecturelens.cli.helpers import agent_failure_reason
+
+        with tempfile.TemporaryDirectory() as folder:
+            log = Path(folder) / "audio_agent.log"
+            log.write_text("2026-10-21 21:00:00 INFO everything is fine\n", encoding="utf-8")
+            self.assertIsNone(agent_failure_reason(log))
+
+
+class TestAgentDependencies(unittest.TestCase):
+    def test_the_agents_that_are_there_are_found(self) -> None:
+        from lecturelens.cli.helpers import check_agent_dependencies
+
+        problems = check_agent_dependencies(["audio_agent", "screen_agent", "sync_agent"])
+        self.assertEqual(problems, [])
+
+    def test_an_agent_that_is_not_there_is_reported(self) -> None:
+        from lecturelens.cli.helpers import check_agent_dependencies
+
+        problems = check_agent_dependencies(["not_an_agent"])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("not_an_agent", problems[0])
+
+
 if __name__ == "__main__":
     unittest.main()
