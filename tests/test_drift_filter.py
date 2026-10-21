@@ -49,6 +49,21 @@ class TestDriftFilterMath(unittest.TestCase):
         self.assertTrue(is_refusal_text("no text or diagram was visible"))
         self.assertTrue(is_refusal_text("I need an image of the presentation slide to transcribe"))
         self.assertFalse(is_refusal_text("Quadratic equation roots and discriminant"))
+        # A vision model that never got the image says so in its own words.
+        # The gemini free tier drops the image, and the reply used to be
+        # written into the notes as if it were the slide text.
+        self.assertTrue(is_refusal_text(
+            "It looks like you didn't attach or upload an image! Please provide the image"
+        ))
+        self.assertTrue(is_refusal_text(
+            "It looks like you forgot to attach an image, and I would be happy to help"
+        ))
+        self.assertTrue(is_refusal_text("I can't see any image in your message."))
+        self.assertTrue(is_refusal_text("No image was provided."))
+        # A real transcription is not a refusal.
+        self.assertFalse(is_refusal_text(
+            "LectureLens Slide 1 Binary search divides the search space in half"
+        ))
 
 
 class TestContextDriftFilterBehavior(unittest.TestCase):

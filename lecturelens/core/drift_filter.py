@@ -18,6 +18,16 @@ REFUSAL_SENTENCE_PATTERNS: tuple[re.Pattern, ...] = (
     re.compile(r"^\s*i\s+need\s+an\s+image\s+of\s+the\s+presentation\s+slide", re.IGNORECASE),
     re.compile(r"^\s*no\s+text\s+is\s+currently\s+visible", re.IGNORECASE),
     re.compile(r"^\s*please\s+provide\s+an\s+image", re.IGNORECASE),
+    # A vision model that never received the image says so in its own words.
+    # The gemini free tier drops the image and answers like this, and the
+    # reply used to be written into the notes as if it were the slide text.
+    re.compile(r"^\s*it\s+looks\s+like\s+you\s+(?:didn'?t|did\s+not)\s+(?:attach|upload)", re.IGNORECASE),
+    re.compile(r"^\s*it\s+looks\s+like\s+you\s+forgot\s+to\s+attach", re.IGNORECASE),
+    re.compile(r"^\s*it\s+looks\s+like\s+there\s+(?:is|'?s)\s+no\s+image", re.IGNORECASE),
+    re.compile(r"^\s*no\s+image\s+(?:was\s+)?(?:provided|attached|uploaded)", re.IGNORECASE),
+    re.compile(r"^\s*the\s+image\s+(?:was\s+not|isn'?t)\s+(?:provided|attached|uploaded|received)", re.IGNORECASE),
+    re.compile(r"^\s*i\s+(?:can'?t|cannot)\s+see\s+(?:any\s+)?image", re.IGNORECASE),
+    re.compile(r"^\s*i\s+do\s+not\s+see\s+(?:an?\s+)?image", re.IGNORECASE),
 )
 
 TEMPLATE_PLACEHOLDER_REGEX: re.Pattern = re.compile(

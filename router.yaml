@@ -1,4 +1,112 @@
 providers:
+  # The UnoRouter free tier allows one request per minute per model, and the
+  # budget is per model. Listing several models in one chain multiplies the
+  # effective rate: a 429 is a provider failure, so the chain falls through
+  # to the next model, which has its own budget.
+  #
+  # The gemini free models do not forward the image to gemini, they answer
+  # that no image was attached, so they are only used for the text tasks.
+
+  # Vision models that were verified to receive the image.
+  unorouter_vl_qwen:
+    type: openai_compatible
+    cloud: true
+    base_url: "https://api.unorouter.com/v1"
+    model: "qwen2.5-vl-7b-instruct-awq:free"
+    api_key_env: "UNOROUTER_API_KEY"
+    timeout_seconds: 120
+    rate_limit:
+      max_rpm: 1
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 1
+      cooldown_seconds: 60
+
+  unorouter_vl_llama:
+    type: openai_compatible
+    cloud: true
+    base_url: "https://api.unorouter.com/v1"
+    model: "llama-3.2-11b-vision:free"
+    api_key_env: "UNOROUTER_API_KEY"
+    timeout_seconds: 120
+    rate_limit:
+      max_rpm: 1
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 1
+      cooldown_seconds: 60
+
+  unorouter_vl_gemma:
+    type: openai_compatible
+    cloud: true
+    base_url: "https://api.unorouter.com/v1"
+    model: "gemma-4-26b:free"
+    api_key_env: "UNOROUTER_API_KEY"
+    timeout_seconds: 120
+    rate_limit:
+      max_rpm: 1
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 1
+      cooldown_seconds: 60
+
+  # Text models.
+  unorouter_structuring:
+    type: openai_compatible
+    cloud: true
+    base_url: "https://api.unorouter.com/v1"
+    model: "qwen3.6-35b-a3b:free"
+    api_key_env: "UNOROUTER_API_KEY"
+    timeout_seconds: 120
+    rate_limit:
+      max_rpm: 1
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 1
+      cooldown_seconds: 60
+
+  unorouter:
+    type: openai_compatible
+    cloud: true
+    base_url: "https://api.unorouter.com/v1"
+    model: "gemini-3.6-flash:free"
+    api_key_env: "UNOROUTER_API_KEY"
+    timeout_seconds: 120
+    rate_limit:
+      max_rpm: 1
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 1
+      cooldown_seconds: 60
+
+  unorouter_qa:
+    type: openai_compatible
+    cloud: true
+    base_url: "https://api.unorouter.com/v1"
+    model: "gemini-3.5-flash-lite:free"
+    api_key_env: "UNOROUTER_API_KEY"
+    timeout_seconds: 90
+    rate_limit:
+      max_rpm: 1
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 1
+      cooldown_seconds: 60
+
+  unorouter_glm:
+    type: openai_compatible
+    cloud: true
+    base_url: "https://api.unorouter.com/v1"
+    model: "glm-4.5-flash:free"
+    api_key_env: "UNOROUTER_API_KEY"
+    timeout_seconds: 90
+    rate_limit:
+      max_rpm: 1
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 1
+      cooldown_seconds: 60
+
   gemma:
     type: ollama
     cloud: false
@@ -12,60 +120,6 @@ providers:
     circuit_breaker:
       failure_threshold: 3
       cooldown_seconds: 30
-
-  unorouter:
-    type: openai_compatible
-    cloud: true
-    base_url: "https://api.unorouter.com/v1"
-    model: "gemini-3.6-flash:free"
-    api_key_env: "UNOROUTER_API_KEY"
-    timeout_seconds: 120
-    rate_limit:
-      # The UnoRouter free tier allows one request per minute per model.
-      max_rpm: 1
-      window_seconds: 60
-    circuit_breaker:
-      # A 429 is a provider failure, so a single burst is enough to open the
-      # breaker. It is closed for a minute so the next request can go
-      # through.
-      failure_threshold: 1
-      cooldown_seconds: 60
-
-  unorouter_structuring:
-    type: openai_compatible
-    cloud: true
-    base_url: "https://api.unorouter.com/v1"
-    model: "qwen3.6-35b-a3b:free"
-    api_key_env: "UNOROUTER_API_KEY"
-    timeout_seconds: 120
-    rate_limit:
-      # The UnoRouter free tier allows one request per minute per model.
-      max_rpm: 1
-      window_seconds: 60
-    circuit_breaker:
-      # A 429 is a provider failure, so a single burst is enough to open the
-      # breaker. It is closed for a minute so the next request can go
-      # through.
-      failure_threshold: 1
-      cooldown_seconds: 60
-
-  unorouter_qa:
-    type: openai_compatible
-    cloud: true
-    base_url: "https://api.unorouter.com/v1"
-    model: "gemini-3.5-flash-lite:free"
-    api_key_env: "UNOROUTER_API_KEY"
-    timeout_seconds: 90
-    rate_limit:
-      # The UnoRouter free tier allows one request per minute per model.
-      max_rpm: 1
-      window_seconds: 60
-    circuit_breaker:
-      # A 429 is a provider failure, so a single burst is enough to open the
-      # breaker. It is closed for a minute so the next request can go
-      # through.
-      failure_threshold: 1
-      cooldown_seconds: 60
 
   openrouter:
     type: openai_compatible
@@ -95,20 +149,26 @@ providers:
       cooldown_seconds: 60
 
 task_routing:
+  # The vision models come first. The gemini models do not receive the image
+  # through this endpoint, so they are not used for the slides.
   screen_ocr:
-    - unorouter
+    - unorouter_vl_qwen
+    - unorouter_vl_llama
+    - unorouter_vl_gemma
     - gemma
     - openrouter
     - gemini
   structuring:
     - unorouter_structuring
     - unorouter
+    - unorouter_glm
     - gemma
     - openrouter
     - gemini
   qa:
     - unorouter_qa
-    - gemma
     - unorouter
+    - unorouter_glm
+    - gemma
     - openrouter
     - gemini
