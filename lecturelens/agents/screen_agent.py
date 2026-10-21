@@ -143,6 +143,8 @@ class ScreenAgent:
         self.slide_texts: dict[int, str] = {}
         self.consecutive_capture_errors: int = 0
         self.retry_tasks: set[asyncio.Task] = set()
+        # How many slides are still waiting for their text.
+        self._pending_text_extractions: int = 0
 
     def find_revisited_slide(self, difference_hash: int, small_thumbnail: np.ndarray) -> int:
         for slide_number, stored_hash, stored_thumbnail in reversed(self.slide_hashes):
@@ -246,7 +248,11 @@ class ScreenAgent:
                 slide_number, image_path, capture_timestamp, difference_hash,
                 small_thumbnail, png_bytes
             )
-            self.control.increment_stat("slides_awaiting_text")
+            self._pending_text_extractions += 1
+            # A gauge, not a counter: it shows how many slides are still
+            # waiting for their text, which is the backlog the provider
+            # budget decides.
+            self.control.set_stat("slides_awaiting_text", self._pending_text_extractions)
             return slide_event
 
         published_id = await self.redis_bus.publish_resilient(self.stream_name, slide_event)
@@ -297,7 +303,12 @@ class ScreenAgent:
         small_thumbnail: np.ndarray,
         png_bytes: bytes
     ) -> None:
-        """Recover the text of a slide in the background and publish it once."""
+        """Recover the text of a slide in the background and publish it once.
+
+        The image is read back from the file for every attempt instead of
+        being held in memory. A backlog of pending slides would otherwise keep
+        every screenshot alive for the whole retry schedule.
+        """
         recovered_text = ""
         delays = [0.0] + list(self.settings.vision_retry_delays_seconds)
         for index, delay_seconds in enumerate(delays):
@@ -305,12 +316,10 @@ class ScreenAgent:
                 await asyncio.sleep(delay_seconds)
             if self.control.stop_requested():
                 return
-            payload = png_bytes
-            if index > 0:
-                try:
-                    payload = await run_in_thread_pool(Path(image_path).read_bytes)
-                except OSError:
-                    return
+            try:
+                payload = await run_in_thread_pool(Path(image_path).read_bytes)
+            except OSError:
+                return
             recovered_text = await self.run_vision_fallback(payload, max_retries=1)
             if len(recovered_text.strip()) > 0:
                 break
@@ -321,6 +330,8 @@ class ScreenAgent:
         else:
             logger.warning("slide %d text could not be recovered after retries", slide_number)
             self.control.increment_stat("slide_text_unrecovered")
+        self._pending_text_extractions = max(0, self._pending_text_extractions - 1)
+        self.control.set_stat("slides_awaiting_text", self._pending_text_extractions)
 
         update_event = SlideCaptured(
             session_id=self.session_id,

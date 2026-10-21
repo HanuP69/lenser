@@ -58,7 +58,14 @@ class Settings(BaseSettings):
 
     screenshot_interval_seconds: float = Field(default=1.0)
     slide_diff_threshold: float = Field(default=0.004)
-    vision_retry_delays_seconds: list[float] = Field(default_factory=lambda: [15.0, 45.0, 120.0])
+    # The slide text is extracted by a vision model, so the number of slides
+    # that can be transcribed is bounded by the provider's budget. The retries
+    # are patient so a backlog of detected slides drains at the rate the
+    # provider allows instead of being given up on. The slide images are
+    # always saved, so nothing visual is lost either way.
+    vision_retry_delays_seconds: list[float] = Field(
+        default_factory=lambda: [10.0, 30.0, 60.0, 120.0, 180.0, 240.0]
+    )
     slide_pixel_delta: int = Field(default=25)
     slide_min_interval_seconds: float = Field(default=5.0)
     slide_thumbnail_width: int = Field(default=640)
