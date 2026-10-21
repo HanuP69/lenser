@@ -3,6 +3,8 @@ export_output/
 yt_test_v2_export/
 eval/readings/
 eval/data/
+.venv/
+venv/
 *.egg-info/
 __pycache__/
 *.pyc
