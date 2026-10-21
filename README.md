@@ -468,3 +468,17 @@ pip install -e ".[full]"
 ```bash
 lecturelens start --session "my_first_lecture" --course "algorithms"
 ```
+
+### 4. Test Without a Browser
+`play_video.py` plays a local video file the way a browser plays it: the
+audio goes to the default output device, so the system audio capture
+hears it, and the frames are shown in a window, so the window capture
+sees them.
+```bash
+# Play the file and record it in another terminal
+python play_video.py "input_video/Redis-This-can-SnapYT.App.mp4" --seconds 120
+
+# The window of the player can be recorded by name
+lecturelens start --session "test" --course "cs101" \
+    --audio-source system --window lecturelens-playback
+```

@@ -1,8 +1,16 @@
 """Play a local video file the way a browser would: audio to the default
-output device (so the loopback hears it) and the frames fullscreen on the
-primary monitor (so the screen capture sees them).
+output device (so the loopback hears it) and the frames in a window (so
+the window capture sees them).
 
     python play_video.py <file> [--seconds N] [--start N]
+
+The window is titled "lecturelens-playback", so it can be picked with
+
+    lecturelens start --window lecturelens-playback
+
+The window capture asks the window to draw itself, so the video does not
+have to be on top of the other windows. It is put on top anyway, because
+the screen capture of the whole display needs it.
 """
 import argparse
 import sys
@@ -15,9 +23,24 @@ import sounddevice as sd
 import cv2
 
 WINDOW = "lecturelens-playback"
-# The geometry of the display that is being captured. The screen agent
-# captures the primary monitor, so the video has to be shown there.
-DISPLAY = (0, 0, 1920, 1080)
+
+
+def primary_display() -> tuple[int, int, int, int]:
+    """The geometry of the primary display."""
+    try:
+        import mss
+
+        with mss.mss() as screen_capturer:
+            monitors = screen_capturer.monitors
+            primary = monitors[1] if len(monitors) > 1 else monitors[0]
+            return (
+                int(primary["left"]),
+                int(primary["top"]),
+                int(primary["width"]),
+                int(primary["height"]),
+            )
+    except Exception:
+        return (0, 0, 1920, 1080)
 
 
 def decode_audio(path: str, start: float, seconds: float):
@@ -81,18 +104,19 @@ def main() -> int:
     # puts it on whichever display the window manager picks, which is not
     # necessarily the one the screen capture reads, and then the capture
     # records the terminal instead of the video.
+    display = primary_display()
     cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
     try:
-        cv2.moveWindow(WINDOW, DISPLAY[0], DISPLAY[1])
-        cv2.resizeWindow(WINDOW, DISPLAY[2], DISPLAY[3])
+        cv2.moveWindow(WINDOW, display[0], display[1])
+        cv2.resizeWindow(WINDOW, display[2], display[3])
     except Exception:
         pass
     started = time.monotonic()
     print("playing", flush=True)
     sd.play(audio, samplerate=device_rate, blocking=False)
 
-    # Keep the window above the other windows, otherwise the screen capture
-    # records whatever is in front of it.
+    # Keep the window above the other windows, otherwise the capture of
+    # the whole display records whatever is in front of it.
     def raise_to_front() -> None:
         try:
             hwnd = cv2.getWindowProperty(WINDOW, cv2.WND_PROP_HWND)
@@ -102,7 +126,7 @@ def main() -> int:
 
             # HWND_TOPMOST = -1, SWP_NOMOVE | SWP_NOSIZE = 0x0043
             ctypes.windll.user32.SetWindowPos(
-                int(hwnd), -1, DISPLAY[0], DISPLAY[1], DISPLAY[2], DISPLAY[3], 0x0043
+                int(hwnd), -1, display[0], display[1], display[2], display[3], 0x0043
             )
         except Exception:
             pass
