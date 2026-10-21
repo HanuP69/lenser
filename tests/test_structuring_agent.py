@@ -159,6 +159,28 @@ class TestStructuringBasics(StructuringTestBase):
         self.assertIn("Today we cover binary search.", self.notes_text())
         self.assertGreater(agent.load_state()["timeline_byte_offset"], 0)
 
+    async def test_retry_counter_survives_a_restart(self) -> None:
+        """The counter lives in its own file, so the retry cap also applies
+        across restarts. The reprocess command restores context.json from a
+        backup when a run fails, which would otherwise wipe the counter."""
+        agent = self.make_agent()
+        agent.max_batch_retries = 1
+
+        original_invoke = agent.graph.ainvoke
+
+        async def empty_invoke(state: Any) -> dict:
+            result = await original_invoke(state)
+            return {**result, "summary": ""}
+
+        agent.graph.ainvoke = empty_invoke  # type: ignore[assignment]
+
+        with self.assertRaises(StructuringBatchError):
+            await agent.process_batch()
+
+        restarted = self.make_agent()
+        self.assertEqual(restarted._batch_attempts, agent._batch_attempts)
+        self.assertEqual(sum(restarted._batch_attempts.values()), 1)
+
     async def test_correlated_events_reach_the_llm_as_one_unit(self) -> None:
         await self.make_agent().process_batch()
         prompt = self.router.summary_prompts()[0]

@@ -413,17 +413,18 @@ class StructuringAgent:
         self.notes_path: Path = session_dir / "notes.md"
         self.context_path: Path = session_dir / "context.json"
         self.notes_marker_path: Path = session_dir / "notes_marker.json"
+        self.batch_attempts_path: Path = session_dir / "batch_attempts.json"
         self.control: AgentControl = AgentControl(session_dir, "structuring_agent", FINALIZE_FLAG_NAME)
 
         self.graph: Any = create_structuring_graph(llm_router)
         self.consecutive_failures: int = 0
         self.max_batch_retries: int = MAX_BATCH_RETRIES
         self.max_consecutive_failures: int = MAX_CONSECUTIVE_PASS_FAILURES
-        self._batch_attempts: dict[int, int] = {}
         # The notes are timestamped with the elapsed lecture time, not with
         # the wall clock time of the moment.
         self.session_clock: SessionClock = SessionClock.load_or_create(self.session_dir / "clock.json")
         initial_state_data = self.load_state()
+        self._batch_attempts: dict[int, int] = self.load_batch_attempts()
         self.current_overlap: list[dict[str, Any]] = list(initial_state_data.get("overlap_entries", []))
         self.sequence_number: int = int(initial_state_data.get("sequence_number", 0))
 
@@ -482,6 +483,35 @@ class StructuringAgent:
         if self.drift_filter is not None:
             payload["drift_filter_state"] = self.drift_filter.to_dict()
         atomic_write_text(self.context_path, json.dumps(payload, indent=2))
+
+    def persist_batch_attempts(self) -> None:
+        """Persist the attempt counter without advancing the byte offset.
+
+        The counter lives in its own file: the reprocess command restores
+        context.json from a backup when a run fails, which would wipe the
+        counter and make the retry cap restart from zero every time.
+        """
+        atomic_write_text(
+            self.batch_attempts_path,
+            json.dumps({str(key): value for key, value in self._batch_attempts.items()})
+        )
+
+    def load_batch_attempts(self) -> dict[int, int]:
+        if not self.batch_attempts_path.exists():
+            return {}
+        try:
+            raw = json.loads(self.batch_attempts_path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        attempts: dict[int, int] = {}
+        for key, value in raw.items():
+            try:
+                attempts[int(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        return attempts
 
     def read_pending_batches(self) -> list[SliceBatch]:
         if not self.timeline_path.exists():
@@ -637,6 +667,10 @@ class StructuringAgent:
             # timeline content is used so the lecture material is never lost.
             attempts = self._batch_attempts.get(batch.end_offset, 0) + 1
             self._batch_attempts[batch.end_offset] = attempts
+            # The attempt counter is persisted, so the cap also applies across
+            # restarts and across separate reprocess invocations. The byte
+            # offset is deliberately left untouched.
+            self.persist_batch_attempts()
             reason = synthesis_error if synthesis_error is not None else "empty summary"
             if attempts <= self.max_batch_retries:
                 logger.error(
@@ -748,11 +782,14 @@ class StructuringAgent:
         return await self.process_all_pending()
 
     def reset_outputs(self) -> None:
-        for path in (self.notes_path, self.context_path, self.notes_marker_path):
+        for path in (self.notes_path, self.context_path, self.notes_marker_path, self.batch_attempts_path):
             if path.exists():
                 path.unlink()
         self.current_overlap = []
         self.sequence_number = 0
+        # A deliberate rebuild starts from scratch, so the retry counter is
+        # cleared as well.
+        self._batch_attempts = {}
         if self.drift_filter is not None:
             self.drift_filter.reset()
 
