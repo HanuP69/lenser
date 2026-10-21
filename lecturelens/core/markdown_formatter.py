@@ -33,6 +33,47 @@ VARIABLE_EQUATION_PATTERN: re.Pattern = re.compile(r"^\$[A-Za-z0-9_]+\s*=\s*[^$]
 
 PARAMETER_COLON_PATTERN: re.Pattern = re.compile(r"^(\$[A-Za-z0-9_]+\$|[A-Za-z0-9_]+)\s*:\s*(.+)$")
 
+# A line that is indented by four spaces is a code block in markdown,
+# unless it is a continuation of a paragraph. The model writes a
+# continuation of a numbered item like this:
+#
+#     3.  **Mapping:** the index is computed like this:
+#
+#         *(where $M$ is the size of the table)*.
+#
+# The indented line became a code block, so the asterisks of the
+# emphasis were shown as they are.
+INDENTED_EMPHASIS_PATTERN: re.Pattern = re.compile(r"^(\s{4,})(\*[^*\s].*)$")
+
+
+def fix_indented_continuations(text: str) -> str:
+    """Take the indented lines that are not code out of their indent.
+
+    Only a line that starts an emphasis is moved. A line that starts a
+    list is a nested list and stays where it is, and a real code block
+    starts with something else.
+    """
+    lines = text.split("\n")
+    result: list[str] = []
+    in_code_block = False
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            result.append(line)
+            continue
+        if in_code_block:
+            result.append(line)
+            continue
+        match = INDENTED_EMPHASIS_PATTERN.match(line)
+        if match:
+            result.append(match.group(2))
+            continue
+        result.append(line)
+
+    return "\n".join(result)
+
 
 def clean_mojibake_and_emojis(text: str) -> str:
     cleaned = text
@@ -225,5 +266,6 @@ def format_clean_markdown(text: str) -> str:
     cleaned = normalize_math_blocks(cleaned)
     cleaned = normalize_headings(cleaned)
     cleaned = normalize_lists_and_definitions(cleaned)
+    cleaned = fix_indented_continuations(cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip() + "\n"

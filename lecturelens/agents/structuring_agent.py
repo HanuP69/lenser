@@ -250,7 +250,105 @@ def split_entries_into_batches(
     return batches
 
 
-def create_structuring_graph(llm_router: Any) -> Any:
+LATEX_ENFORCEMENT_PROMPT = """
+You are a LaTeX formatter for lecture notes. Rewrite the markdown below so that
+every mathematical expression is written in LaTeX.
+
+RULES:
+- Inline math goes between single dollar signs: $O(1)$, $H(x)$, $n \\log n$, $64.8\\%$.
+- Display math goes between double dollar signs, each on its own line:
+  $$
+  \\text{Index} = H(\\text{Key}) \\mod M
+  $$
+- A bare expression such as O(1), O(log n), H(x), 2^n, n^2, 64.8% or a symbol
+  used as a variable has to be written in LaTeX.
+- A word that is not mathematics stays as it is. Do not put a word into
+  dollar signs.
+- Keep every heading, list, table, code block and every word of the text
+  exactly as it is. Change only the mathematics.
+- Do not add anything that is not in the text.
+- Reply with the rewritten markdown only. No commentary, no code fence around
+  the whole answer.
+
+TEXT:
+{summary}
+"""
+
+
+# Things in a text that show that there is mathematics in it. The pass
+# that writes the mathematics in LaTeX is only worth its request when
+# there is something to write.
+MATHEMATICS_MARKERS: tuple[str, ...] = (
+    "O(",
+    "$",
+    "^",
+    "%",
+    "log",
+    "mod ",
+    "sqrt",
+    "ln(",
+    "sum",
+    "∫",
+    "≤",
+    "≥",
+    "≠",
+    "≈",
+    "×",
+    "÷",
+    "π",
+    "∈",
+    "⊂",
+    "∞",
+    "λ",
+    "α",
+    "β",
+    "θ",
+    "Δ",
+    "Σ",
+)
+
+# A letter followed by a bracket, such as H(x) or f(n), is a function.
+FUNCTION_MARKER = re.compile(r"\b[A-Za-z]\([A-Za-z0-9_]")
+
+
+def text_has_mathematics(text: str) -> bool:
+    """Whether the text has something in it that is mathematics."""
+    if FUNCTION_MARKER.search(text):
+        return True
+    lowered = text.lower()
+    return any(marker in text or marker in lowered for marker in MATHEMATICS_MARKERS)
+
+
+# A heading at the start of a line, so the count is right for a heading
+# that is the first thing in the text as well.
+HEADING_PATTERN = re.compile(r"^#{1,6}\s", re.MULTILINE)
+
+
+def latex_result_is_usable(original: str, rewritten: str) -> bool:
+    """Whether the rewritten text can be used.
+
+    The pass rewrites the notes of a section, so a reply that lost the
+    headings or most of the text is not used. The notes that are already
+    there are worth more than a broken rewrite.
+    """
+    candidate = rewritten.strip()
+    if len(candidate) < 20:
+        return False
+    original_length = len(original.strip())
+    if original_length == 0:
+        return False
+    if len(candidate) < original_length * 0.6:
+        return False
+    if len(candidate) > original_length * 2.0:
+        return False
+    # Every heading of the section has to be there.
+    original_headings = len(HEADING_PATTERN.findall(original))
+    if len(HEADING_PATTERN.findall(candidate)) < original_headings:
+        return False
+    return True
+
+
+def create_structuring_graph(llm_router: Any, enforce_latex: bool = True) -> Any:
     async def call_llm(prompt: str) -> str:
         response = await llm_router.ainvoke([HumanMessage(content=prompt)])
         return response_to_text(response)
@@ -306,6 +404,42 @@ CURRENT LECTURE EVENTS:
 """
         summary_text = await call_llm(prompt)
         return {"summary": summary_text}
+
+    async def enforce_latex_node(state: StructuringState) -> dict[str, Any]:
+        """Write every formula of the section in LaTeX.
+
+        The model is asked for LaTeX, but it does not always do it. A
+        formula such as O(1) or H(x) is then left as plain text, and a
+        viewer that draws formulas shows nothing at that place. The
+        section is handed to the model once more, and only the
+        mathematics is changed.
+        """
+        summary_text = str(state.get("summary", "")).strip()
+        if len(summary_text) == 0:
+            return {}
+        if not text_has_mathematics(summary_text):
+            # There is no mathematics in the section. The pass would only
+            # cost a request.
+            return {}
+        try:
+            rewritten = await call_llm(
+                LATEX_ENFORCEMENT_PROMPT.format(summary=summary_text)
+            )
+        except Exception as error:
+            logger.warning("the latex pass failed, the notes are kept as they are: %s", error)
+            return {}
+        cleaned = rewritten.strip()
+        # The model sometimes wraps the whole answer in a code fence.
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```[a-zA-Z]*\n", "", cleaned)
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3].rstrip()
+        if not latex_result_is_usable(summary_text, cleaned):
+            logger.warning(
+                "the latex pass did not keep the notes, they are kept as they are"
+            )
+            return {}
+        return {"summary": cleaned}
 
     async def extract_definitions_node(state: StructuringState) -> dict[str, Any]:
         summary_text = state.get("summary", "")
@@ -405,7 +539,17 @@ NEW NOTES:
 
     graph_builder.add_edge(START, "group_correlated_events")
     graph_builder.add_edge("group_correlated_events", "summarize_slice")
-    graph_builder.add_edge("summarize_slice", "extract_definitions")
+
+    if enforce_latex:
+        # The pass that writes the mathematics in LaTeX sits between the
+        # summary and everything that reads it, so the definitions and the
+        # key points are taken from the text with the formulas in it.
+        graph_builder.add_node("enforce_latex", enforce_latex_node)
+        graph_builder.add_edge("summarize_slice", "enforce_latex")
+        graph_builder.add_edge("enforce_latex", "extract_definitions")
+    else:
+        graph_builder.add_edge("summarize_slice", "extract_definitions")
+
     graph_builder.add_edge("extract_definitions", "extract_action_items")
     graph_builder.add_edge("extract_action_items", "extract_key_points")
     graph_builder.add_edge("extract_key_points", "update_running_context")
@@ -458,7 +602,9 @@ class StructuringAgent:
         self.quarantine_path: Path = session_dir / "timeline_quarantine.jsonl"
         self.control: AgentControl = AgentControl(session_dir, "structuring_agent", FINALIZE_FLAG_NAME)
 
-        self.graph: Any = create_structuring_graph(llm_router)
+        self.graph: Any = create_structuring_graph(
+            llm_router, enforce_latex=settings.structuring_latex_pass
+        )
         self.consecutive_failures: int = 0
         self.max_batch_retries: int = MAX_BATCH_RETRIES
         self.max_consecutive_failures: int = MAX_CONSECUTIVE_PASS_FAILURES

@@ -384,6 +384,12 @@ can be read without any other program. The Markdown file itself is
 written the way GitHub writes it, with the `$$` of a formula on its own
 line, so GitHub and the viewers that follow it draw them as well.
 
+The formulas are written in LaTeX by a second pass over the notes of a
+section, because the model does not always do it when it is asked to.
+The pass only changes the mathematics, and a reply that lost the text
+or the headings is not used. It can be switched off with
+`LECTURELENS_STRUCTURING_LATEX_PASS=false`.
+
 ### 9. `lecturelens ask`
 Interactive question-answering over indexed lecture knowledge with source citations and student misconception tracking:
 ```bash

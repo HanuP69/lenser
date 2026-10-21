@@ -95,6 +95,10 @@ class Settings(BaseSettings):
     postgres_query_limit: int = Field(default=1000)
 
     structuring_interval_seconds: int = Field(default=120)
+    # Whether a second pass writes the mathematics of a section in
+    # LaTeX. The model is asked for LaTeX, but it does not always do it,
+    # and a formula that is left as plain text is not drawn by a viewer.
+    structuring_latex_pass: bool = Field(default=True)
     # How much of the timeline goes into one request to the model. The
     # free providers put a limit on the length of a single message, and a
     # batch that is too long is refused with an error that leaves the
