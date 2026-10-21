@@ -84,6 +84,41 @@ class TestCircuitBreaker(unittest.IsolatedAsyncioTestCase):
         ttl = await self.redis_client.ttl(limiter.generate_window_key()) if hasattr(self.redis_client, "ttl") else 1
         self.assertGreater(ttl, 0)
 
+    async def test_rate_limiter_slides_instead_of_using_a_fixed_window(self) -> None:
+        """The fixed window counted the requests in the wall clock aligned
+        bucket, so a burst around a bucket boundary was allowed in full. The
+        provider sees the window from the last request, so the limiter has to
+        slide."""
+        if not self.redis_available:
+            self.skipTest("Redis not available on localhost:6379")
+        clock = {"now": 9.5}
+        limiter = RedisRateLimiter(
+            redis_client=self.redis_client,
+            provider_name="test_sliding_provider",
+            max_requests_per_window=2,
+            window_seconds=10,
+            time_provider=lambda: clock["now"]
+        )
+        try:
+            # One request at the end of a wall clock minute.
+            self.assertTrue(await limiter.is_allowed())
+            # Another one just past the minute boundary. Only one request is
+            # inside the last ten seconds, so it is allowed.
+            clock["now"] = 10.5
+            self.assertTrue(await limiter.is_allowed())
+            # A third one a second later. All three are inside the last ten
+            # seconds now, so it has to be denied. The fixed window allowed
+            # it, because it had already moved to the next bucket.
+            clock["now"] = 10.6
+            self.assertFalse(await limiter.is_allowed())
+
+            # Once the old requests fall out of the window, it is allowed
+            # again.
+            clock["now"] = 21.0
+            self.assertTrue(await limiter.is_allowed())
+        finally:
+            await self.redis_client.delete(limiter.generate_window_key())
+
 
 if __name__ == "__main__":
     unittest.main()
