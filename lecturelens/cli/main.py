@@ -18,6 +18,29 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
+
+def _use_utf_8_output() -> None:
+    """Let the console print any script.
+
+    The Windows console uses the code page of the machine, which is
+    cp1252 on most of them. A lecture in Urdu or Hindi puts characters
+    into the dashboard that cp1252 cannot encode, and the whole command
+    died with an encoding error. The notes are written before the
+    dashboard is shown, so the notes were there, but the session was
+    never marked as finished and the stop waited for the full timeout.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_use_utf_8_output()
+
 from lecturelens.cli.helpers import (
     LineCounter,
     build_agent_rows,
@@ -51,12 +74,14 @@ from lecturelens.core.agent_runtime import (
     set_flag
 )
 from lecturelens.core.clock import SessionClock
+from lecturelens.core.logging_setup import get_logger
 from lecturelens.core.process_manager import AgentProcessManager as AgentMonitor
 from lecturelens.core.redis_bus import RedisBus
 from lecturelens.core.validation import is_valid_course_name, is_valid_session_id
 
 app = typer.Typer(help="LectureLens - local-first multimodal lecture note taking")
 console = Console()
+logger = get_logger("lecturelens.cli")
 
 CAPTURE_AGENT_NAMES: tuple[str, ...] = ("audio_agent", "screen_agent")
 
@@ -407,14 +432,24 @@ def run_shutdown(monitor: AgentMonitor, session_dir: Path, planned_agents: list[
         (["structuring_agent"], FINALIZE_FLAG_NAME, 300.0),
         (["persister"], PERSISTER_STOP_FLAG_NAME, 30.0)
     ]
-    with console.status("[bold cyan]Stopping agents, flushing timeline, and generating final notes with LLM...[/bold cyan]", spinner="dots"):
-        outcomes = monitor.run_shutdown_sequence(session_dir, phases)
-    unfinished = [name for name, clean in outcomes.items() if not clean]
-    if unfinished:
-        console.print(
-            "[yellow]These agents did not finish in time and their remaining work was "
-            f"discarded: {', '.join(sorted(unfinished))}[/yellow]"
-        )
+    unfinished: list[str] = []
+    try:
+        with console.status("[bold cyan]Stopping agents, flushing timeline, and generating final notes with LLM...[/bold cyan]", spinner="dots"):
+            outcomes = monitor.run_shutdown_sequence(session_dir, phases)
+        unfinished = [name for name, clean in outcomes.items() if not clean]
+    except Exception as error:
+        # The shutdown is the cleanup path. When it fails the agents are
+        # left running and the session is never marked as finished, so the
+        # stop command waits for the whole timeout for nothing.
+        logger.error("the shutdown sequence failed: %s", error)
+    try:
+        if unfinished:
+            console.print(
+                "[yellow]These agents did not finish in time and their remaining work was "
+                f"discarded: {', '.join(sorted(unfinished))}[/yellow]"
+            )
+    except Exception:
+        pass
     clock_path = session_dir / "clock.json"
     if clock_path.exists():
         try:
@@ -422,14 +457,22 @@ def run_shutdown(monitor: AgentMonitor, session_dir: Path, planned_agents: list[
             clock.save_to_file(clock_path)
         except Exception:
             pass
-    session_meta.finish_run(session_dir)
+    try:
+        session_meta.finish_run(session_dir)
+    except Exception as error:
+        logger.error("the session metadata could not be closed: %s", error)
+    # The flag is set before anything is printed, because a console that
+    # cannot show a character must not keep the session from finishing.
     set_flag(session_dir, SESSION_FINISHED_FLAG_NAME)
     notes_file = session_dir / "notes.md"
-    if notes_file.exists() and notes_file.stat().st_size > 0:
-        console.print("[green]Session stopped. Notes saved.[/green]")
-    else:
-        console.print("[yellow]Session stopped. Final notes not generated or empty.[/yellow]")
-    display_session_output_summary(session_dir, console)
+    try:
+        if notes_file.exists() and notes_file.stat().st_size > 0:
+            console.print("[green]Session stopped. Notes saved.[/green]")
+        else:
+            console.print("[yellow]Session stopped. Final notes not generated or empty.[/yellow]")
+        display_session_output_summary(session_dir, console)
+    except Exception as error:
+        logger.error("the session summary could not be shown: %s", error)
 
 
 @app.command("windows")
@@ -656,6 +699,57 @@ def session_has_live_agents(session_dir: Path) -> bool:
     return False
 
 
+def agents_are_gone(session_dir: Path) -> bool:
+    """Whether every agent of the session has stopped.
+
+    The heartbeat files hold the process id of each agent. When none of
+    them is running any more the session cannot make any more progress,
+    so waiting for it is pointless. This happens when the process that
+    owns the session dies.
+    """
+    heartbeats = read_heartbeats(session_dir)
+    if not heartbeats:
+        return False
+    pids: list[int] = []
+    for payload in heartbeats.values():
+        try:
+            pids.append(int(payload.get("pid", 0)))
+        except (TypeError, ValueError):
+            continue
+    pids = [pid for pid in pids if pid > 0]
+    if not pids:
+        return False
+    return not any(_process_is_alive(pid) for pid in pids)
+
+
+def _process_is_alive(pid: int) -> bool:
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
+            if not handle:
+                return False
+            try:
+                exit_code = ctypes.c_ulong()
+                if ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return exit_code.value == 259
+                return True
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
 @app.command()
 def stop(
     session: Optional[str] = typer.Option(None, "--session"),
@@ -678,6 +772,14 @@ def stop(
             console.print("[green]Session stopped.[/green]")
             display_session_output_summary(session_dir, console)
             return
+        if agents_are_gone(session_dir):
+            # Nothing is running any more, so the session cannot finish on
+            # its own. Waiting for the whole timeout would be pointless.
+            console.print(
+                "[yellow]The agents of the session are not running any more, "
+                "so the session cannot be finished.[/yellow]"
+            )
+            break
         time.sleep(1.0)
     # The session is not killed by the timeout. The agents keep running and
     # the notes are written when the final structuring pass is done, which

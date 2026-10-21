@@ -1,4 +1,5 @@
 import json
+import sys
 from pathlib import Path
 from typing import Any, Optional
 
@@ -92,6 +93,31 @@ def tail_last_line(file_path: Path, max_bytes: int = 8192) -> Optional[str]:
     return None
 
 
+def safe_for_console(text: str, limit: Optional[int] = None) -> str:
+    """Text that the console is able to print.
+
+    The console of a machine uses the code page of the machine, and a
+    lecture in Urdu or Hindi has characters that cp1252 cannot encode.
+    Printing one of them ends the command with an encoding error, which
+    took the whole session down. The characters that cannot be shown are
+    dropped instead.
+    """
+    if not text:
+        return ""
+    cleaned = text
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        cleaned.encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        cleaned = cleaned.encode(encoding, errors="ignore").decode(encoding, errors="ignore")
+    cleaned = "".join(
+        character for character in cleaned if character == "\n" or character >= " "
+    )
+    if limit is not None and len(cleaned) > limit:
+        cleaned = cleaned[:limit] + "..."
+    return cleaned
+
+
 def last_transcript_snippet(timeline_path: Path, max_characters: int = 120) -> str:
     if not timeline_path.exists():
         return ""
@@ -109,9 +135,7 @@ def last_transcript_snippet(timeline_path: Path, max_characters: int = 120) -> s
             continue
         if entry.get("source_type") == "transcript":
             snippet = str(entry.get("content", ""))
-    if len(snippet) > max_characters:
-        return snippet[:max_characters] + "..."
-    return snippet
+    return safe_for_console(snippet, max_characters)
 
 
 class LineCounter:
