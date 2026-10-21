@@ -232,6 +232,25 @@ class TestStructuringBasics(StructuringTestBase):
         self.assertEqual(len(lines), 1)
         self.assertIn("sponsored by", lines[0]["content"])
 
+    async def test_raw_fallback_is_counted_in_the_stats(self) -> None:
+        """The raw text fallback has to be visible, otherwise the unedited
+        parts of the notes are invisible to the operator."""
+        agent = self.make_agent()
+        agent.max_batch_retries = 1
+
+        async def failing_invoke(state: Any) -> dict:
+            raise RuntimeError("llm is down")
+
+        agent.graph.ainvoke = failing_invoke  # type: ignore[assignment]
+
+        with self.assertRaises(StructuringBatchError):
+            await agent.process_batch()
+        self.assertNotIn("raw_fallback_batches", agent.control.stats)
+
+        await agent.process_batch()
+        self.assertEqual(agent.control.stats.get("raw_fallback_batches"), 1)
+        self.assertIsNotNone(agent.control.stats.get("raw_fallback_offset"))
+
     async def test_reset_outputs_clears_the_quarantine_file(self) -> None:
         """The quarantine belongs to the run, so a reprocess must not append
         to the file of the previous run."""

@@ -12,7 +12,7 @@
 4. [Redis vs. Postgres: Durability & Replay](#redis-vs-postgres-durability--replay)
 5. [Thin Student Client & Personalization Engine](#thin-student-client--personalization-engine)
 6. [Student Knowledge Graph (`student_graph.db`)](#student-knowledge-graph-student_graphdb)
-7. [Automated Test Suite (422 Tests)](#automated-test-suite-422-tests)
+7. [Automated Test Suite (423 Tests)](#automated-test-suite-423-tests)
 8. [CLI Command Reference](#cli-command-reference)
 9. [Configuration & Environment Variables](#configuration--environment-variables)
 10. [Docker Compose & Getting Started](#docker-compose--getting-started)
@@ -223,25 +223,27 @@ Each student maintains an isolated, private SQLite database (`student_graph.db`)
 
 ---
 
-## Automated Test Suite (422 Tests)
+## Automated Test Suite (423 Tests)
 
-LectureLens maintains an automated test suite of **422 unit and integration tests** verifying concurrency, resilience, audio processing, screen capture, Postgres persistence, gateway fan-out, client personalization, and knowledge graphs:
+LectureLens maintains an automated test suite of **423 unit and integration tests** verifying concurrency, resilience, audio processing, screen capture, Postgres persistence, gateway fan-out, client personalization, and knowledge graphs:
 
 ```
-================= 418 passed, 4 skipped in 59.78s =================
+================= 423 passed in 69.84s =================
 ```
 
-The four skipped tests are the failure injection tests. They need a live Redis
-and are only run when it is configured. The variable holds the **Redis URL**, it
-is not a flag, so `LECTURELENS_INTEGRATION_REDIS=1` would try to connect to a
-host called "1":
+The live service tests need a Redis and a Postgres. The failure injection
+tests are skipped without a Redis, and the live Postgres tests without a
+Postgres. Both are wired up in CI, so a plain `pytest` run without the
+services reports them as skipped:
 
 ```bash
-LECTURELENS_INTEGRATION_REDIS=redis://127.0.0.1:6379 pytest tests/test_integration_failures.py
+LECTURELENS_INTEGRATION_REDIS=redis://127.0.0.1:6379 \
+POSTGRES_TEST_URL=postgresql://postgres:postgres@127.0.0.1:5433/lecturelens \
+pytest -q
 ```
 
-The live Postgres tests need `POSTGRES_TEST_URL` (or a reachable
-`LECTURELENS_POSTGRES_URL`) and are skipped without it.
+`LECTURELENS_INTEGRATION_REDIS` holds the **Redis URL**, it is not a flag, so
+`LECTURELENS_INTEGRATION_REDIS=1` would try to connect to a host called "1".
 
 ### Module Breakdown:
 
@@ -261,7 +263,7 @@ The live Postgres tests need `POSTGRES_TEST_URL` (or a reachable
 | `test_llm_router.py` | **17 tests** | Multimodal task routing, OpenAI-compatible provider, Google GenAI, Ollama, circuit breaker rate-limiting, retries, per-task breaker scoping. |
 | `test_clock_and_files.py` | **16 tests** | SessionClock persistence, elapsed duration calculation, accumulated_seconds tracking, atomic file writes, durable append after a torn line. |
 | `test_markdown_formatter.py` | **14 tests** | Code block indentation preservation, equation heading protection, unicode math preservation, display math block normalization. |
-| `test_structuring_agent.py` | **16 tests** | LangGraph pipeline, rolling window, 20s context overlap, byte-offset tracking, robust JSON extraction, crash rollback, empty-summary retry and raw fallback, quarantine writes. |
+| `test_structuring_agent.py` | **17 tests** | LangGraph pipeline, rolling window, 20s context overlap, byte-offset tracking, robust JSON extraction, crash rollback, empty-summary retry and raw fallback, quarantine writes, raw fallback stats. |
 | `test_qa_engine.py` | **10 tests** | Vector indexing, pgvector integration with Chroma fallback, semantic search, RAG-grounded question answering with source citations. |
 | `test_student_chat_and_graph.py` | **9 tests** | Student knowledge graph, concept normalization, mastery decay, misconception recording with confidence, timestamp citations in tutor chat. |
 | `test_replay.py` | **8 tests** | ReplayEngine timeline playback, speed scaling (instant to real-time), Redis stream publishing. |

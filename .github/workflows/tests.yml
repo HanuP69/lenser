@@ -1,0 +1,83 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: lecturelens
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      # The failure injection tests kill a child process on purpose, so they
+      # only run when the services are reachable. The value is a URL, not a
+      # flag.
+      LECTURELENS_INTEGRATION_REDIS: redis://127.0.0.1:6379
+      POSTGRES_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5433/lecturelens
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Cache the vision embedder model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/lecturelens/models
+          key: vision-model-${{ runner.os }}-1eeff551a67ae8d565ca33b572fc4b66e3ef357b0eb2863bb9ff47a918cc4088
+
+      - name: Install the project and the test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # The base install plus the packages the test suite imports. The
+          # audio hardware extras are not installed: they need portaudio and
+          # the tests do not use the capture devices.
+          python -m pip install -e .
+          python -m pip install \
+            "pytest>=7.0" \
+            "langchain-core>=0.3" \
+            "langgraph>=0.2" \
+            "langchain-ollama>=0.2" \
+            "chromadb>=0.5" \
+            "onnxruntime>=1.15.0" \
+            "Pillow>=10.0"
+
+      - name: Run the test suite
+        run: pytest -q
+
+      - name: Run the failure injection tests explicitly
+        run: pytest -q tests/test_integration_failures.py
+
+      - name: Lint
+        run: |
+          python -m pip install pyflakes
+          pyflakes lecturelens tests benchmark_reproducible.py
