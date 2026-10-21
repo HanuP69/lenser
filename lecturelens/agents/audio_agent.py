@@ -2,6 +2,7 @@ import asyncio
 from collections import deque
 import io
 import queue
+import sys
 import threading
 import time
 import unicodedata
@@ -443,6 +444,50 @@ class MicBlockSource:
         self.start()
 
 
+def initialize_com_in_current_thread() -> bool:
+    """Initialise COM in the calling thread.
+
+    soundcard initialises COM once, in the thread that imported it, through
+    a module level singleton. The system audio capture runs in a background
+    thread, and a COM call from a thread without an apartment fails with
+    CO_E_NOTINITIALIZED (0x800401f0), so the recorder never opened and the
+    capture produced nothing at all.
+
+    Returns True when an apartment was initialised here, so the caller can
+    balance it with CoUninitialize.
+    """
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import ctypes
+
+        ole32 = ctypes.WinDLL("ole32")
+        # COINIT_MULTITHREADED
+        result = ole32.CoInitializeEx(None, 0x2)
+        if result >= 0:
+            return True
+        # RPC_E_CHANGED_MODE: the thread is already in a single threaded
+        # apartment, which is usable as it is.
+        if (result & 0xFFFFFFFF) == 0x80010106:
+            return False
+        logger.debug("CoInitializeEx failed: %s", hex(result & 0xFFFFFFFF))
+    except Exception as error:
+        logger.debug("could not initialise COM in the recording thread: %s", error)
+    return False
+
+
+def uninitialize_com_in_current_thread(initialized_here: bool) -> None:
+    """Balance the COM initialisation of the recording thread."""
+    if not initialized_here or not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+
+        ctypes.WinDLL("ole32").CoUninitialize()
+    except Exception:
+        pass
+
+
 def find_loopback_microphone() -> tuple[Optional[Any], Optional[str]]:
     import sys
     try:
@@ -488,6 +533,7 @@ class SystemBlockSource:
         self.device_error: Optional[str] = None
 
     def _record_loop(self) -> None:
+        com_initialized_here = False
         try:
             if self.mic is None:
                 frame_interval = float(self.block_frames) / float(self.sample_rate)
@@ -500,6 +546,10 @@ class SystemBlockSource:
                         self.dropped_blocks += 1
                 return
 
+            # The recorder is opened in this thread, so this thread needs a
+            # COM apartment of its own.
+            com_initialized_here = initialize_com_in_current_thread()
+
             with self.mic.recorder(samplerate=self.sample_rate, channels=1) as recorder:
                 while self.is_running:
                     data = recorder.record(numframes=self.block_frames)
@@ -510,7 +560,11 @@ class SystemBlockSource:
                         except queue.Full:
                             self.dropped_blocks += 1
         except Exception as error:
-            logger.error("System audio capture error: %s", error)
+            # The traceback is logged, a bare message does not say why the
+            # capture stopped.
+            logger.error("System audio capture error: %s", error, exc_info=True)
+        finally:
+            uninitialize_com_in_current_thread(com_initialized_here)
 
     def start(self) -> None:
         self.mic, self.device_error = find_loopback_microphone()

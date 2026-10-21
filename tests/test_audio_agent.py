@@ -127,6 +127,22 @@ class TestSpeechSegmenter(unittest.TestCase):
 
 
 class TestAudioHelpers(unittest.TestCase):
+    def test_the_recording_thread_initialises_com(self) -> None:
+        """soundcard initialises COM once, in the thread that imported it. The
+        recorder is opened in a background thread, and a COM call from a thread
+        without an apartment fails with CO_E_NOTINITIALIZED, so the system
+        audio capture never produced anything."""
+        from lecturelens.agents import audio_agent
+
+        initialized = audio_agent.initialize_com_in_current_thread()
+        try:
+            # The call must not raise, whatever the apartment was.
+            self.assertIn(initialized, (True, False))
+            # Balancing it must not raise either.
+            audio_agent.uninitialize_com_in_current_thread(initialized)
+        except Exception as error:
+            self.fail(f"COM initialisation raised: {error}")
+
     def test_hallucination_filter(self) -> None:
         self.assertTrue(is_hallucinated_text("Thank you."))
         self.assertTrue(is_hallucinated_text("  you  "))
