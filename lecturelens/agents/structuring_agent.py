@@ -271,7 +271,7 @@ RULES:
   the whole answer.
 
 TEXT:
-{summary}
+%%SUMMARY%%
 """
 
 
@@ -422,8 +422,11 @@ CURRENT LECTURE EVENTS:
             # cost a request.
             return {}
         try:
+            # The prompt holds LaTeX with braces in it, so it is not put
+            # together with str.format, which would read {Index} as a
+            # field and fail.
             rewritten = await call_llm(
-                LATEX_ENFORCEMENT_PROMPT.format(summary=summary_text)
+                LATEX_ENFORCEMENT_PROMPT.replace("%%SUMMARY%%", summary_text)
             )
         except Exception as error:
             logger.warning("the latex pass failed, the notes are kept as they are: %s", error)

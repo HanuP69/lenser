@@ -1,10 +1,24 @@
 import unittest
 
 from lecturelens.agents.structuring_agent import (
+    LATEX_ENFORCEMENT_PROMPT,
     latex_result_is_usable,
     text_has_mathematics
 )
 from lecturelens.core.markdown_formatter import format_clean_markdown
+
+
+class TestLatexPrompt(unittest.TestCase):
+    def test_the_prompt_can_hold_a_summary(self) -> None:
+        """The prompt holds LaTeX with braces in it.
+
+        Putting it together with str.format read {Index} as a field and
+        the pass failed for every section that had a formula in it.
+        """
+        summary = "## A section\n\nThe cost is O(1) per lookup."
+        prompt = LATEX_ENFORCEMENT_PROMPT.replace("%%SUMMARY%%", summary)
+        self.assertIn(summary, prompt)
+        self.assertIn("\\text{Index}", prompt)
 
 
 class TestLatexDetection(unittest.TestCase):
