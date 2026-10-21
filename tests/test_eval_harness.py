@@ -1,9 +1,7 @@
-import json
 import unittest
 from pathlib import Path
 
 from eval import score
-from eval.extract_readings import frame_at, read_frame
 
 
 class TestTheManifest(unittest.TestCase):

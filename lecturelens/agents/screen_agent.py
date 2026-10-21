@@ -333,20 +333,6 @@ class ScreenAgent:
         self.retry_tasks.add(task)
         task.add_done_callback(self.retry_tasks.discard)
 
-    def schedule_text_retry(
-        self,
-        slide_number: int,
-        image_path: str,
-        capture_timestamp: float,
-        difference_hash: int,
-        small_thumbnail: np.ndarray
-    ) -> None:
-        task = asyncio.create_task(
-            self.retry_slide_text(slide_number, image_path, capture_timestamp, difference_hash, small_thumbnail)
-        )
-        self.retry_tasks.add(task)
-        task.add_done_callback(self.retry_tasks.discard)
-
     async def extract_and_publish_slide_text(
         self,
         slide_number: int,

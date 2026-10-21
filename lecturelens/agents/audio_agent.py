@@ -110,10 +110,6 @@ def compute_rms_energy(audio_buffer: np.ndarray) -> float:
     return float(np.sqrt(np.mean(squared)))
 
 
-def is_speech_detected(audio_buffer: np.ndarray, energy_threshold: float) -> bool:
-    return compute_rms_energy(audio_buffer) >= energy_threshold
-
-
 def convert_numpy_to_wav_bytes(audio_buffer: np.ndarray, sample_rate: int) -> bytes:
     clipped = np.clip(audio_buffer.astype(np.float32), -1.0, 1.0)
     int16_samples = (clipped * 32767.0).astype(np.int16)

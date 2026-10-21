@@ -173,12 +173,6 @@ class QAEngine:
                     embeddings.append(vector)
         return embeddings
 
-    async def generate_embedding(self, text: str, purpose: str = "query") -> list[float]:
-        vectors = await self.generate_embeddings([text], purpose=purpose)
-        if len(vectors) == 0:
-            raise ValueError("the embedding model returned no vectors")
-        return vectors[0]
-
     def collect_timeline_chunks(self) -> list[IndexedChunk]:
         chunks: list[IndexedChunk] = []
         if not self.timeline_path.exists():

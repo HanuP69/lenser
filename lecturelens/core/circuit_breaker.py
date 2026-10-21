@@ -145,12 +145,6 @@ class RedisCircuitBreaker:
             return True
         return False
 
-    async def get_failure_count(self) -> int:
-        value = await self.redis_client.get(self.get_failure_key())
-        if value is None:
-            return 0
-        return int(value)
-
     async def record_success(self) -> None:
         failure_key = self.get_failure_key()
         breaker_key = self.get_breaker_key()

@@ -10,8 +10,6 @@ from typing import Optional
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings
 
-from lecturelens.core.validation import sanitize_file_stem
-
 
 def project_root() -> Path:
     """The folder of the project, where the .env file is."""
@@ -231,12 +229,6 @@ class Settings(BaseSettings):
     def get_session_output_dir(self, session_id: str) -> Path:
         session_dir = self.output_dir / session_id
         return session_dir
-
-    def get_course_database_path(self, course_name: Optional[str]) -> Path:
-        stem = "_default"
-        if course_name is not None and len(course_name.strip()) > 0:
-            stem = sanitize_file_stem(course_name)
-        return self.output_dir / "_courses" / f"{stem}.db"
 
     def create_session_directories(self, session_id: str) -> Path:
         session_dir = self.get_session_output_dir(session_id)

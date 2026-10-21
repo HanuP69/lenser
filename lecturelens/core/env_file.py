@@ -5,10 +5,8 @@ is recorded. Writing them into the .env file means the question is only
 asked the first time.
 """
 
-import os
 from pathlib import Path
 from typing import Optional
-
 from lecturelens.core.logging_setup import get_logger
 
 logger = get_logger("lecturelens.env_file")
@@ -124,7 +122,3 @@ def env_file_location() -> str:
     if target is None:
         return str(Path.cwd() / ".env")
     return str(target)
-
-
-def current_working_directory() -> str:
-    return os.getcwd()
