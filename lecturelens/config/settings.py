@@ -1,4 +1,9 @@
-from lecturelens.config.defaults import DEFAULT_EMBEDDING_MODEL, DEFAULT_LOCAL_MODEL
+from lecturelens.config.defaults import (
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_LOCAL_MODEL,
+    SYNC_CONSUMER_GROUP,
+    SYNC_CONSUMER_PREFIX
+)
 from pathlib import Path
 from typing import Optional
 
@@ -98,6 +103,14 @@ class Settings(BaseSettings):
     redis_backlog_drain_budget_seconds: float = Field(default=60.0)
     redis_socket_connect_timeout_seconds: float = Field(default=5.0)
     redis_socket_timeout_seconds: float = Field(default=30.0)
+    capture_spool_max_size: int = Field(default=500)
+    capture_spool_append_timeout_seconds: float = Field(default=5.0)
+    # What to do when the capture spool is full and stays full: "drop_oldest"
+    # keeps the capture going and loses the oldest pending capture,
+    # "raise" loses nothing but the capture itself fails.
+    capture_spool_on_full: str = Field(default="drop_oldest")
+    sync_consumer_group: str = Field(default=SYNC_CONSUMER_GROUP)
+    sync_consumer_prefix: str = Field(default=SYNC_CONSUMER_PREFIX)
 
     llm_mode: str = Field(default="local")
     llm_timeout_seconds: float = Field(default=120.0)

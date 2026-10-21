@@ -795,6 +795,41 @@ class TestRemoteClientSendAndWait(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(spool.count(), 0)
             self.assertEqual(mock_ws.send.await_count, 2)
 
+    async def test_capture_spool_raise_policy_drops_nothing(self) -> None:
+        """With the raise policy nothing is evicted, the capture fails
+        instead."""
+        from lecturelens.client.remote_client import CaptureSpool, CaptureSpoolFull
+        with tempfile.TemporaryDirectory() as td:
+            spool_file = Path(td) / "spool.db"
+            spool = CaptureSpool(
+                spool_file, max_size=2, append_timeout_seconds=0.1, on_full="raise"
+            )
+            await spool.append("c1", "one")
+            await spool.append("c2", "two")
+
+            with self.assertRaises(CaptureSpoolFull):
+                await spool.append("c3", "three")
+
+            # Nothing was evicted.
+            self.assertEqual(spool.dropped_count, 0)
+            self.assertEqual(spool.count(), 2)
+            self.assertEqual(spool.get_pending(limit=10)[0][0], "c1")
+
+    async def test_capture_spool_drop_policy_evicts_the_oldest(self) -> None:
+        from lecturelens.client.remote_client import CaptureSpool
+        with tempfile.TemporaryDirectory() as td:
+            spool_file = Path(td) / "spool.db"
+            spool = CaptureSpool(
+                spool_file, max_size=2, append_timeout_seconds=0.1, on_full="drop_oldest"
+            )
+            await spool.append("c1", "one")
+            await spool.append("c2", "two")
+            await spool.append("c3", "three")
+
+            self.assertEqual(spool.dropped_count, 1)
+            pending = [capture_id for capture_id, _ in spool.get_pending(limit=10)]
+            self.assertEqual(pending, ["c2", "c3"])
+
     async def test_capture_spool_backpressure_does_not_drop_when_space_frees(self) -> None:
         """The backpressure wait used to block a thread pool worker, so the
         acknowledgements that free the space could not run."""

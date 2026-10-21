@@ -223,9 +223,10 @@ def module_for_agent(agent_name: str) -> str:
 
 async def render_stream_backlogs(bus: RedisBus, session_id: str) -> dict[str, int]:
     backlogs: dict[str, int] = {}
+    consumer_group = getattr(Settings(), "sync_consumer_group", SYNC_CONSUMER_GROUP)
     for source_type in ("transcript", "slide"):
         stream_name = f"lecturelens:{session_id}:stream:{source_type}"
-        backlogs[source_type] = await bus.get_group_backlog(stream_name, SYNC_CONSUMER_GROUP)
+        backlogs[source_type] = await bus.get_group_backlog(stream_name, consumer_group)
     return backlogs
 
 

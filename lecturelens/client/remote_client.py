@@ -43,16 +43,25 @@ def encode_message(
     })
 
 
+class CaptureSpoolFull(RuntimeError):
+    """Raised when the capture spool is full and the policy is to fail."""
+
+
 class CaptureSpool:
     def __init__(
         self,
         spool_path: Path,
         max_size: int = 500,
-        append_timeout_seconds: float = 5.0
+        append_timeout_seconds: float = 5.0,
+        on_full: str = "drop_oldest"
     ) -> None:
         self.spool_path = spool_path
         self.max_size = max_size
         self.append_timeout_seconds = append_timeout_seconds
+        # "drop_oldest" keeps the capture running and loses the oldest
+        # pending capture. "raise" loses nothing but the capture itself
+        # fails, so the caller can decide what to do.
+        self.on_full = on_full
         self.dropped_count = 0
         self.spool_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
@@ -127,8 +136,17 @@ class CaptureSpool:
             # instead of dropping the capture.
             await asyncio.sleep(0.05)
 
-        # The spool stayed full. Dropping the oldest undelivered capture
-        # would lose lecture audio, so the failure is explicit and counted.
+        # The spool stayed full.
+        if self.on_full == "raise":
+            # Nothing is dropped: the capture itself fails, so the caller can
+            # decide whether to keep the audio or stop the capture.
+            raise CaptureSpoolFull(
+                f"capture spool {self.spool_path} is full ({self.max_size} captures) "
+                f"after {self.append_timeout_seconds:.1f}s"
+            )
+
+        # Dropping the oldest undelivered capture would lose lecture audio,
+        # so the failure is explicit and counted.
         self.dropped_count += 1
         logger.error(
             "capture spool %s is full (%d captures) after %.1fs; dropping the "
@@ -319,7 +337,14 @@ async def stream_audio(
                 cap_id = uuid.uuid4().hex
                 msg_text = encode_message("audio", "wav_b64", wav_bytes, time.time(), capture_id=cap_id)
                 if spool is not None:
-                    await spool.append(cap_id, msg_text)
+                    try:
+                        await spool.append(cap_id, msg_text)
+                    except CaptureSpoolFull as spool_error:
+                        # The spool is full and the policy is to lose
+                        # nothing, so the capture is dropped instead of the
+                        # oldest pending one.
+                        logger.error("dropping a capture, the spool is full: %s", spool_error)
+                        continue
                 try:
                     await send_and_wait(websocket, msg_text, stop_event=stop_event)
                     if spool is not None:
@@ -360,7 +385,14 @@ async def stream_screen(
                 cap_id = uuid.uuid4().hex
                 msg_text = encode_message("screen", "png_b64", png_bytes, captured_at, capture_id=cap_id)
                 if spool is not None:
-                    await spool.append(cap_id, msg_text)
+                    try:
+                        await spool.append(cap_id, msg_text)
+                    except CaptureSpoolFull as spool_error:
+                        # The spool is full and the policy is to lose
+                        # nothing, so the capture is dropped instead of the
+                        # oldest pending one.
+                        logger.error("dropping a capture, the spool is full: %s", spool_error)
+                        continue
                 await send_and_wait(websocket, msg_text, stop_event=stop_event)
                 if spool is not None:
                     await run_in_thread_pool(spool.acknowledge, cap_id)
@@ -410,8 +442,18 @@ async def run_remote_client(
         stop_event = asyncio.Event()
 
     session_dir = settings.get_session_output_dir(session_id)
-    audio_spool = CaptureSpool(session_dir / "capture_spool_audio.db")
-    screen_spool = CaptureSpool(session_dir / "capture_spool_screen.db")
+    audio_spool = CaptureSpool(
+        session_dir / "capture_spool_audio.db",
+        max_size=getattr(settings, "capture_spool_max_size", 500),
+        append_timeout_seconds=getattr(settings, "capture_spool_append_timeout_seconds", 5.0),
+        on_full=getattr(settings, "capture_spool_on_full", "drop_oldest")
+    )
+    screen_spool = CaptureSpool(
+        session_dir / "capture_spool_screen.db",
+        max_size=getattr(settings, "capture_spool_max_size", 500),
+        append_timeout_seconds=getattr(settings, "capture_spool_append_timeout_seconds", 5.0),
+        on_full=getattr(settings, "capture_spool_on_full", "drop_oldest")
+    )
 
     while not stop_event.is_set():
         tasks: list[asyncio.Task] = []

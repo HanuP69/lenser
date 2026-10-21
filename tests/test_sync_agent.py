@@ -342,6 +342,40 @@ class TestSyncEndToEnd(SyncTestBase):
             self.assertNotIn("partial 0", published)
             self.assertNotIn("partial 1", published)
 
+    async def test_the_flush_state_file_is_removed_when_nothing_is_pending(self) -> None:
+        """A stale state file made the next start believe that an entry was
+        only written to the file and never published, so it was published a
+        second time."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.output_dir = Path(temp_dir)
+            settings.sync_merge_window_seconds = 0.0
+            agent = SyncAgent(settings, self.bus, SessionClock(), "sync_stale_state_session")
+            agent.acknowledge = mock.AsyncMock()
+            agent.pending_buffer.append(BufferedEntry(
+                entry=entry(100.0, "transcript", "stale state"),
+                arrival_monotonic=time.monotonic() - 10.0,
+                stream_name="s",
+                group_name="g",
+                message_id="1-0",
+            ))
+
+            published: list[object] = []
+            agent.redis_bus.publish_resilient = mock.AsyncMock(
+                side_effect=lambda stream, item: published.append(item) or "1-0"
+            )
+            flushed = await agent.flush_ready_entries(force=True)
+            self.assertEqual(flushed, 1)
+            self.assertFalse(
+                agent.flush_state_path.exists(),
+                "the flush state file has to be removed once nothing is pending"
+            )
+
+            # A restart must not treat the entry as unpublished.
+            restarted = SyncAgent(settings, self.bus, SessionClock(), "sync_stale_state_session")
+            self.assertFalse(restarted.flush_state_tracked)
+            self.assertEqual(restarted.flush_states, {})
+
     async def test_crash_after_the_file_write_republishes_to_redis(self) -> None:
         """A crash between the file write and the Redis publish used to lose
         the entry: the restart restored the fingerprint from timeline.jsonl and

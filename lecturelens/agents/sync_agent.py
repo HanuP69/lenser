@@ -94,6 +94,14 @@ class SyncAgent:
         self.buffer_lock: asyncio.Lock = asyncio.Lock()
         self.entries_written: int = 0
         self.fingerprint_history_limit: int = getattr(settings, "sync_fingerprint_history_limit", getattr(settings, "fingerprint_history_limit", FINGERPRINT_HISTORY_LIMIT))
+        # The consumer group and the consumer names are configurable, so two
+        # deployments can share one Redis without splitting the group.
+        self.consumer_group: str = getattr(
+            settings, "sync_consumer_group", SYNC_CONSUMER_GROUP
+        )
+        self.consumer_prefix: str = getattr(
+            settings, "sync_consumer_prefix", SYNC_CONSUMER_PREFIX
+        )
         # The flush state has to be loaded first: it tells the fingerprint
         # loader which entries really reached Redis.
         self.load_flush_states()
@@ -121,8 +129,18 @@ class SyncAgent:
         self.flush_state_tracked = True
 
     def save_flush_states(self) -> None:
-        """Persist the per sink state."""
+        """Persist the per sink state.
+
+        The file is removed when nothing is pending. A stale file would make
+        the next start believe that an entry was only written to the file
+        and never published, so it would be published a second time.
+        """
         if not self.flush_states:
+            try:
+                if self.flush_state_path.exists():
+                    self.flush_state_path.unlink()
+            except OSError as error:
+                logger.warning("could not remove the timeline flush state: %s", error)
             return
         try:
             atomic_write_text(
@@ -307,14 +325,14 @@ class SyncAgent:
             await self.add_entry(
                 entry,
                 stream_name=stream_name,
-                group_name=SYNC_CONSUMER_GROUP,
+                group_name=self.consumer_group,
                 message_id=message_id
             )
 
         await self.redis_bus.consume(
             stream_name=stream_name,
-            group_name=SYNC_CONSUMER_GROUP,
-            consumer_name=f"{SYNC_CONSUMER_PREFIX}:{source_type}",
+            group_name=self.consumer_group,
+            consumer_name=f"{self.consumer_prefix}:{source_type}",
             handler=handle_message,
             batch_size=self.settings.redis_consumer_batch_size,
             block_ms=self.settings.redis_consumer_block_ms,
@@ -549,6 +567,9 @@ class SyncAgent:
                     self.pending_message_ids.discard((buffered.stream_name or "", buffered.message_id))
                 await self.acknowledge(buffered.stream_name, buffered.group_name, buffered.message_id)
             self.remove_flushed_entries(flushed)
+            # The state is written after the entries are released, so the file
+            # is removed once nothing is pending.
+            self.save_flush_states()
             self.entries_written += len(flushed)
             self.control.set_stat("timeline_entries_written", self.entries_written)
             self.control.set_stat("buffered_entries", len(self.pending_buffer))
