@@ -104,11 +104,17 @@ async def run_in_process_pool(
 ) -> Any:
     loop = asyncio.get_running_loop()
     last_error: Optional[BaseException] = None
+    # Whether the last failure was the worker itself dying. A worker that
+    # dies takes the work down with it, for example when it exits the
+    # process, and running that work in a thread would take the parent
+    # process down too.
+    last_failure_was_broken_pool = False
     for attempt_number in range(max_attempts):
         try:
             pool = get_process_pool(max_workers)
         except Exception as error:
             last_error = error
+            last_failure_was_broken_pool = False
             logger.error("could not create the process pool: %s", error)
             break
         try:
@@ -116,6 +122,7 @@ async def run_in_process_pool(
             return result
         except BrokenProcessPool as error:
             last_error = error
+            last_failure_was_broken_pool = True
             logger.error(
                 "process pool broke on attempt %d, rebuilding: %s",
                 attempt_number + 1,
@@ -123,18 +130,20 @@ async def run_in_process_pool(
             )
             reset_process_pool()
         except Exception as error:
-            # The worker died in a way that is not a broken pool, for example
-            # a spawn failure after a native crash in the parent. Without this
-            # the whole feature stops working, because the pool is never
-            # usable again.
+            # The pool infrastructure failed, for example the worker could
+            # not be started after a native crash in the parent. Without
+            # this the whole feature stops working, because the pool is
+            # never usable again.
             last_error = error
+            last_failure_was_broken_pool = False
             logger.error(
                 "process pool worker failed on attempt %d: %s",
                 attempt_number + 1,
                 error
             )
             reset_process_pool()
-    if allow_thread_fallback:
+            break
+    if allow_thread_fallback and not last_failure_was_broken_pool:
         # The work still gets done, it is just slower because it shares the
         # process with the event loop. A dead pool is worse than a slow one.
         logger.warning(

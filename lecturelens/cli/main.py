@@ -66,6 +66,25 @@ def fail(message: str) -> None:
     raise typer.Exit(code=1)
 
 
+def option_value(value: Any, fallback: Any = None) -> Any:
+    """The value of a command option.
+
+    Typer hands the option object itself to the function when the command
+    is called directly instead of through the command line, for example in
+    a test. The value that was asked for is the default in that case.
+    """
+    if value is None:
+        return fallback
+    if isinstance(value, typer.models.OptionInfo):
+        default = value.default
+        if default is None or isinstance(default, (list, dict)):
+            return fallback
+        return default
+    if isinstance(value, typer.models.ArgumentInfo):
+        return fallback
+    return value
+
+
 def resolve_session(settings: Settings, session: Optional[str]) -> str:
     if session is not None and len(session) > 0:
         if not is_valid_session_id(session):
@@ -133,7 +152,9 @@ def build_agent_environment(
     audio_source: str,
     monitor_index: int,
     llm_mode: str,
-    course: Optional[str]
+    course: Optional[str],
+    window_handle: Optional[int] = None,
+    window_title: Optional[str] = None
 ) -> dict[str, str]:
     environment = os.environ.copy()
     environment["LECTURELENS_SESSION_NAME"] = session_id
@@ -143,6 +164,11 @@ def build_agent_environment(
     environment["LECTURELENS_OUTPUT_DIR"] = str(settings.output_dir.resolve())
     environment["LECTURELENS_ROUTER_CONFIG_PATH"] = str(settings.router_config_path.resolve())
     environment["PYTHONUNBUFFERED"] = "1"
+    if window_handle is not None:
+        environment["LECTURELENS_CAPTURE_TARGET"] = "window"
+        environment["LECTURELENS_WINDOW_HANDLE"] = str(window_handle)
+        if window_title:
+            environment["LECTURELENS_WINDOW_TITLE"] = window_title
     if course:
         environment["LECTURELENS_COURSE_NAME"] = course
     if settings.postgres_url:
@@ -406,6 +432,60 @@ def run_shutdown(monitor: AgentMonitor, session_dir: Path, planned_agents: list[
     display_session_output_summary(session_dir, console)
 
 
+@app.command("windows")
+def list_windows_command(
+    set_window: Optional[str] = typer.Option(
+        None,
+        "--set",
+        help="Remember this window (by number or title) as the one to record."
+    ),
+    clear: bool = typer.Option(False, "--clear", help="Forget the window and record the whole screen again."),
+) -> None:
+    """Show the windows that can be recorded."""
+    from lecturelens.cli.window_picker import format_window_table
+    from lecturelens.core.env_file import env_file_location, remove_env_value, set_env_value
+    from lecturelens.core.window_capture import (
+        WindowCaptureUnavailable,
+        find_window,
+        list_windows,
+    )
+
+    try:
+        windows = list_windows()
+    except WindowCaptureUnavailable as error:
+        fail(str(error))
+        return
+    except Exception as error:
+        fail(f"The windows of the desktop could not be listed: {error}")
+        return
+
+    if not windows:
+        console.print("[yellow]No window is open to record.[/yellow]")
+        return
+
+    format_window_table(windows, console)
+
+    if clear:
+        remove_env_value("LECTURELENS_WINDOW_HANDLE")
+        remove_env_value("LECTURELENS_WINDOW_TITLE")
+        remove_env_value("LECTURELENS_CAPTURE_TARGET")
+        console.print(f"[green]The whole screen is recorded again.[/green] ({env_file_location()})")
+        return
+
+    if set_window:
+        window = find_window(set_window, windows)
+        if window is None:
+            fail(f"No window matches {set_window!r}.")
+            return
+        set_env_value("LECTURELENS_CAPTURE_TARGET", "window")
+        set_env_value("LECTURELENS_WINDOW_HANDLE", str(window.handle))
+        set_env_value("LECTURELENS_WINDOW_TITLE", window.title)
+        console.print(
+            f"[green]The window[/green] {window.title!r} [green]is recorded from now on.[/green]"
+            f" ({env_file_location()})"
+        )
+
+
 @app.command()
 def start(
     mode: str = typer.Option("local", help="local or server"),
@@ -416,6 +496,11 @@ def start(
     session: Optional[str] = typer.Option(None, "--session"),
     course: Optional[str] = typer.Option(None, "--course"),
     monitor_index: Optional[int] = typer.Option(None, "--monitor"),
+    window: Optional[str] = typer.Option(
+        None,
+        "--window",
+        help="The window to record, by number or by title. Without it the whole screen is recorded."
+    ),
     llm_mode: Optional[str] = typer.Option(None, "--llm-mode", help="local, hybrid or cloud"),
     resume: bool = typer.Option(False, "--resume", help="continue an existing session"),
 ) -> None:
@@ -425,6 +510,10 @@ def start(
     # so a value configured in .env (for example LECTURELENS_AUDIO_SOURCE)
     # was always overridden by the CLI default. The options now default to
     # None and fall back to the configured settings.
+    audio_source = option_value(audio_source)
+    monitor_index = option_value(monitor_index)
+    llm_mode = option_value(llm_mode)
+    window = option_value(window)
     resolved_audio_source = audio_source if audio_source is not None else settings.audio_source
     resolved_monitor_index = monitor_index if monitor_index is not None else settings.monitor_index
     resolved_llm_mode = llm_mode if llm_mode is not None else settings.llm_mode
@@ -440,6 +529,26 @@ def start(
             fail(f"Cannot use '--audio-source system': {loopback_err}")
     if course is not None and not is_valid_course_name(course):
         fail(f"Invalid course name: {course}")
+
+    # The window that is recorded is chosen before the session starts, so
+    # the screen agent records the right thing from the first frame. The
+    # question is only asked when nothing has been chosen yet.
+    capture_target = "screen"
+    window_handle: Optional[int] = None
+    window_title: Optional[str] = None
+    if not no_screen and not audio_only:
+        from lecturelens.cli.window_picker import resolve_capture_target
+
+        capture_target, window_handle, window_title = resolve_capture_target(
+            console,
+            window_query=window,
+            configured_handle=settings.window_handle,
+            configured_title=settings.window_title,
+        )
+        if capture_target == "window" and window_handle is not None:
+            settings.capture_target = "window"
+            settings.window_handle = window_handle
+            settings.window_title = window_title
 
     session_id = session or datetime.now().strftime("%Y-%m-%d_%H%M%S")
     if not is_valid_session_id(session_id):
@@ -486,6 +595,8 @@ def start(
             "mode": mode,
             "audio_source": resolved_audio_source,
             "monitor_index": resolved_monitor_index,
+            "capture_target": capture_target,
+            "window_title": window_title,
             "llm_mode": resolved_llm_mode,
             "audio_only": audio_only,
             "no_screen": no_screen,
@@ -495,7 +606,14 @@ def start(
     )
 
     environment = build_agent_environment(
-        settings, session_id, resolved_audio_source, resolved_monitor_index, resolved_llm_mode, course
+        settings,
+        session_id,
+        resolved_audio_source,
+        resolved_monitor_index,
+        resolved_llm_mode,
+        course,
+        window_handle=window_handle,
+        window_title=window_title
     )
     monitor = AgentMonitor()
     for agent_name in planned_agents:

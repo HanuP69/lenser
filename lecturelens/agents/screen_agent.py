@@ -67,19 +67,34 @@ def shrink_thumbnail(thumbnail: np.ndarray, target_width: int) -> np.ndarray:
     return np.array(image.resize((target_width, target_height), Image.BILINEAR), dtype=np.uint8)
 
 
-def capture_screen_frame(monitor_index: int, thumbnail_width: int) -> ScreenFrame:
-    import mss
-    with mss.mss() as screen_capturer:
-        monitors = screen_capturer.monitors
-        selected_index = monitor_index
-        if selected_index >= len(monitors):
-            selected_index = len(monitors) - 1
-        if selected_index < 0:
-            selected_index = 0
-        screenshot = screen_capturer.grab(monitors[selected_index])
-        raw_bgra = bytes(screenshot.bgra)
-        width = screenshot.width
-        height = screenshot.height
+def capture_screen_frame(
+    monitor_index: int,
+    thumbnail_width: int,
+    capture_target: str = "screen",
+    window_handle: Optional[int] = None
+) -> ScreenFrame:
+    """Take one frame of what is being recorded.
+
+    With ``capture_target`` set to "window" the single window with that
+    handle is recorded, and the rest of the desktop is left alone.
+    """
+    if capture_target == "window" and window_handle:
+        from lecturelens.core.window_capture import capture_window_bgra
+
+        raw_bgra, width, height = capture_window_bgra(window_handle)
+    else:
+        import mss
+        with mss.mss() as screen_capturer:
+            monitors = screen_capturer.monitors
+            selected_index = monitor_index
+            if selected_index >= len(monitors):
+                selected_index = len(monitors) - 1
+            if selected_index < 0:
+                selected_index = 0
+            screenshot = screen_capturer.grab(monitors[selected_index])
+            raw_bgra = bytes(screenshot.bgra)
+            width = screenshot.width
+            height = screenshot.height
     image = Image.frombuffer("RGBA", (width, height), raw_bgra, "raw", "BGRA", 0, 1)
     thumbnail = build_gray_thumbnail(image, thumbnail_width)
     return ScreenFrame(raw_bgra=raw_bgra, width=width, height=height, thumbnail=thumbnail)
@@ -145,6 +160,44 @@ class ScreenAgent:
         self.retry_tasks: set[asyncio.Task] = set()
         # How many slides are still waiting for their text.
         self._pending_text_extractions: int = 0
+        # The window that is recorded, when a single window is recorded.
+        self.capture_target: str = getattr(settings, "capture_target", "screen") or "screen"
+        self.window_handle: Optional[int] = getattr(settings, "window_handle", None)
+
+    def resolve_window_handle(self) -> Optional[int]:
+        """Find the window that is recorded.
+
+        The handle is used when the window is still there. Otherwise the
+        title is looked up again, because the window may have been closed
+        and opened again, which gives it a new handle.
+        """
+        if self.capture_target != "window":
+            return None
+        from lecturelens.core.window_capture import find_window, is_window_alive
+
+        handle = self.window_handle
+        if handle and is_window_alive(handle):
+            return handle
+
+        title = getattr(self.settings, "window_title", None)
+        if not title:
+            logger.error(
+                "the window that was recorded is gone and no title is known, "
+                "falling back to the whole screen"
+            )
+            self.capture_target = "screen"
+            return None
+
+        window = find_window(title)
+        if window is None:
+            logger.error(
+                "the window %r is gone, falling back to the whole screen", title
+            )
+            self.capture_target = "screen"
+            return None
+        logger.info("the window %r was reopened, using its new handle", title)
+        self.window_handle = window.handle
+        return window.handle
 
     def find_revisited_slide(self, difference_hash: int, small_thumbnail: np.ndarray) -> int:
         for slide_number, stored_hash, stored_thumbnail in reversed(self.slide_hashes):
@@ -368,6 +421,12 @@ class ScreenAgent:
     async def run(self) -> None:
         self.is_running = True
         interval = self.settings.screenshot_interval_seconds
+        if self.capture_target == "window":
+            resolved = await run_in_thread_pool(self.resolve_window_handle)
+            if resolved:
+                logger.info("recording the window %s", resolved)
+            else:
+                logger.info("recording the whole screen")
         while self.is_running and not self.control.stop_requested():
             if self.control.is_paused():
                 await asyncio.sleep(interval)
@@ -376,7 +435,9 @@ class ScreenAgent:
                 frame = await run_in_thread_pool(
                     capture_screen_frame,
                     self.settings.monitor_index,
-                    self.settings.slide_thumbnail_width
+                    self.settings.slide_thumbnail_width,
+                    self.capture_target,
+                    self.window_handle
                 )
                 self.consecutive_capture_errors = 0
             except Exception as error:

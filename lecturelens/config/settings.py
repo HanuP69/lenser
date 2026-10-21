@@ -71,6 +71,18 @@ class Settings(BaseSettings):
     slide_thumbnail_width: int = Field(default=640)
     slide_revisit_hamming_distance: int = Field(default=3)
     monitor_index: int = Field(default=1)
+    # What is recorded. "screen" is the whole display, "window" is a single
+    # window on the desktop. A window is the better choice, because the rest
+    # of the desktop belongs to other work, and a video call that happens to
+    # be on the same display would put the faces of the participants into
+    # the notes instead of the slides.
+    capture_target: str = Field(default="screen")
+    # The window that is recorded. The handle is what the agent uses, the
+    # query is what the user typed, and the title is kept so a window that
+    # was closed can be found again.
+    window_handle: Optional[int] = Field(default=None)
+    window_title: Optional[str] = Field(default=None)
+    window_query: Optional[str] = Field(default=None)
 
     low_disk_bytes: int = Field(default=2 * 1024 * 1024 * 1024)
     sync_fingerprint_history_limit: int = Field(default=5000)

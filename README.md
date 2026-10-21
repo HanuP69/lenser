@@ -290,7 +290,33 @@ lecturelens start --session "cs101_01" --course "cs101" --audio-source mic
 
 # Start in server mode with gateway and persister enabled
 lecturelens start --mode server --session "cs101_01" --course "cs101"
+
+# Record one window instead of the whole display
+lecturelens start --session "cs101_01" --course "cs101" --window "Redis Talk"
 ```
+
+### 1a. `lecturelens windows`
+Shows the windows on the desktop that can be recorded, and remembers the
+one that was chosen.
+```bash
+# See the windows that can be recorded
+lecturelens windows
+
+# Remember window number 3, or a window by title, for every later run
+lecturelens windows --set 3
+lecturelens windows --set "Redis Talk"
+
+# Go back to recording the whole display
+lecturelens windows --clear
+```
+
+Recording a single window is the better choice. The rest of the desktop
+belongs to other work, and a video call that happens to be on the same
+display would put the faces of the participants into the notes instead of
+the slides. The window is asked to draw itself, so it is recorded even
+when it is behind other windows. When nothing has been chosen yet,
+`lecturelens start` asks which window to record and keeps the answer for
+the next run.
 
 ### 2. `lecturelens student`
 Subscribes to live lecture notes from the gateway and personalizes them locally:

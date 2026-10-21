@@ -18,6 +18,32 @@ logger = get_logger("lecturelens.router")
 NON_PROVIDER_ERROR_TYPES: tuple[type, ...] = (ValueError, TypeError, KeyError, AttributeError)
 NON_PROVIDER_STATUS_CODES: tuple[int, ...] = (400, 404, 413, 422)
 
+# The words a provider uses when the request budget is used up.
+RATE_LIMIT_SIGNATURES: tuple[str, ...] = (
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+    "quota",
+    "requests per minute",
+    "requests per second",
+    "resource_exhausted",
+)
+
+
+def is_rate_limit_error(error: BaseException) -> bool:
+    """Whether the provider refused the call because the budget was used up.
+
+    A rate limit is not an outage, so it must not trip the circuit breaker.
+    The sliding window rate limiter is the tool for that, and the breaker
+    would take the best model away for the whole cooldown after a single
+    answer that the limit was reached.
+    """
+    status_code = getattr(error, "status_code", None)
+    if status_code == 429:
+        return True
+    message = str(error).lower()
+    return any(signature in message for signature in RATE_LIMIT_SIGNATURES)
+
 
 class ProviderUnavailableError(RuntimeError):
     pass
@@ -391,10 +417,17 @@ def wrap_model_with_circuit_breaker(
                     f"{provider_name} is misconfigured: {invocation_error}"
                 ) from invocation_error
             if is_provider_failure(invocation_error):
-                try:
-                    await circuit_breaker.record_failure()
-                except Exception as guard_error:
-                    logger.warning("failure not recorded for %s: %s", provider_name, guard_error)
+                if not is_rate_limit_error(invocation_error):
+                    try:
+                        await circuit_breaker.record_failure()
+                    except Exception as guard_error:
+                        logger.warning("failure not recorded for %s: %s", provider_name, guard_error)
+                else:
+                    # The budget was used up, the provider is still healthy.
+                    logger.info(
+                        "%s reached its request limit, moving on without tripping the breaker",
+                        provider_name
+                    )
                 raise ProviderUnavailableError(
                     f"{provider_name} failed: {invocation_error}"
                 ) from invocation_error

@@ -373,6 +373,31 @@ class TestBatchHelpers(unittest.TestCase):
         self.assertEqual(len(batches[1].entries), 1)
         self.assertEqual(batches[1].end_offset, 300)
 
+    def test_the_start_of_a_batch_does_not_move_when_more_events_arrive(self) -> None:
+        """The retry counter is keyed by the start of the batch.
+
+        Keyed by the end of the batch it always looked like the first
+        attempt, because the end moves when a new event arrives. The raw
+        content fallback then never happened and the lecture material was
+        lost.
+        """
+        entries = [
+            {"content": "a" * 100, "_line_start_offset": 10, "_line_end_offset": 100},
+            {"content": "b" * 50, "_line_start_offset": 100, "_line_end_offset": 200}
+        ]
+        first = split_entries_into_batches(entries, max_characters=1000, final_offset=200)
+        self.assertEqual(len(first), 1)
+
+        # A new event arrives, so the batch now ends further along.
+        entries.append(
+            {"content": "c" * 50, "_line_start_offset": 200, "_line_end_offset": 300}
+        )
+        second = split_entries_into_batches(entries, max_characters=1000, final_offset=300)
+
+        self.assertEqual(len(second), 1)
+        self.assertEqual(first[0].start_offset, second[0].start_offset)
+        self.assertNotEqual(first[0].end_offset, second[0].end_offset)
+
 
 if __name__ == "__main__":
     unittest.main()

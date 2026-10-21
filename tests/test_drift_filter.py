@@ -247,6 +247,40 @@ class TestContextDriftFilterBehavior(unittest.TestCase):
         self.assertEqual(quarantined[0]["event_id"], "ad-1")
         self.assertIn("sponsored by", quarantined[0]["content"])
 
+    def test_the_embedding_endpoint_is_not_retried_forever(self) -> None:
+        """The local model is often not running when the cloud providers are
+        used. Trying the endpoint for every entry cost seconds each time and
+        stalled the shutdown."""
+        from lecturelens.core import drift_filter
+
+        calls = {"count": 0}
+
+        class FailingUrlopen:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                calls["count"] += 1
+
+            def __enter__(self) -> "FailingUrlopen":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+        original = drift_filter.urllib.request.urlopen
+        drift_filter.urllib.request.urlopen = FailingUrlopen
+        try:
+            filt = ContextDriftFilter(drift_threshold=0.5, min_words=1)
+            for _ in range(20):
+                filt.embed_text("some lecture text that is long enough")
+        finally:
+            drift_filter.urllib.request.urlopen = original
+
+        self.assertLessEqual(
+            calls["count"],
+            drift_filter.EMBEDDING_FAILURE_LIMIT,
+            "the endpoint must not be retried once it is known to be unreachable"
+        )
+        self.assertTrue(filt._embedding_endpoint_unavailable)
+
     def test_refusal_text_is_dropped_outright(self) -> None:
         """A refusal is a vision-model artefact. It used to be quarantined
         like a topic drift and could be released back into the notes when an

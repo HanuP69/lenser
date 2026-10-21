@@ -15,6 +15,7 @@ from lecturelens.router.llm_router import (
     build_router_for_task,
     get_router_status,
     is_provider_failure,
+    is_rate_limit_error,
     wrap_model_with_circuit_breaker
 )
 from lecturelens.router.messages import (
@@ -97,6 +98,21 @@ class TestFailureClassification(unittest.TestCase):
         self.assertFalse(is_provider_failure(StatusError(400)))
         self.assertFalse(is_provider_failure(ValueError("bad prompt")))
         self.assertFalse(is_provider_failure(KeyError("k")))
+
+    def test_a_rate_limit_is_not_an_outage(self) -> None:
+        """A used up budget must not take the provider away.
+
+        The rate limiter is the tool for the budget. The circuit breaker
+        would disable the best model for the whole cooldown after a single
+        answer that the limit was reached.
+        """
+        self.assertTrue(is_rate_limit_error(StatusError(429)))
+        self.assertTrue(is_rate_limit_error(Exception("Rate limit exceeded for model")))
+        self.assertTrue(is_rate_limit_error(Exception("quota exceeded")))
+        self.assertTrue(is_rate_limit_error(Exception("Too Many Requests")))
+        self.assertFalse(is_rate_limit_error(StatusError(500)))
+        self.assertFalse(is_rate_limit_error(ConnectionError("down")))
+        self.assertFalse(is_rate_limit_error(ValueError("bad prompt")))
 
 
 class TestRouter(RouterTestBase):
@@ -203,6 +219,34 @@ class TestRouter(RouterTestBase):
         limiter = RedisRateLimiter(self.client, "t_provider", 10, 60)
         breaker = RedisCircuitBreaker(self.client, "t_provider", 1, 60)
         wrapped = wrap_model_with_circuit_breaker(model, "t_provider", limiter, breaker, timeout_seconds=0.05)
+        with self.assertRaises(ProviderUnavailableError):
+            await wrapped.ainvoke([HumanMessage(content="a")])
+        self.assertTrue(await breaker.is_open())
+
+    async def test_a_rate_limit_from_the_provider_keeps_the_breaker_closed(self) -> None:
+        """The budget being used up is not an outage of the provider.
+
+        The breaker used to open after the first rate limit, which took the
+        best model away for the whole cooldown and left the session with
+        nothing to write the notes with.
+        """
+        if not self.redis_available:
+            self.skipTest("Redis not available")
+        model = FakeModel("t_provider", error=StatusError(429))
+        limiter = RedisRateLimiter(self.client, "t_provider", 10, 60)
+        breaker = RedisCircuitBreaker(self.client, "t_provider", 1, 60)
+        wrapped = wrap_model_with_circuit_breaker(model, "t_provider", limiter, breaker)
+        with self.assertRaises(ProviderUnavailableError):
+            await wrapped.ainvoke([HumanMessage(content="a")])
+        self.assertFalse(await breaker.is_open())
+
+    async def test_a_real_failure_still_trips_the_breaker(self) -> None:
+        if not self.redis_available:
+            self.skipTest("Redis not available")
+        model = FakeModel("t_provider", error=StatusError(500))
+        limiter = RedisRateLimiter(self.client, "t_provider", 10, 60)
+        breaker = RedisCircuitBreaker(self.client, "t_provider", 1, 60)
+        wrapped = wrap_model_with_circuit_breaker(model, "t_provider", limiter, breaker)
         with self.assertRaises(ProviderUnavailableError):
             await wrapped.ainvoke([HumanMessage(content="a")])
         self.assertTrue(await breaker.is_open())

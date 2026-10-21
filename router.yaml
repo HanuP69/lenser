@@ -1,4 +1,4 @@
-providers:
+﻿providers:
   # The UnoRouter free tier limits each model separately, so listing several
   # models in one route multiplies the effective rate: a 429 is a provider
   # failure, so the chain moves on to the next model, which has its own
@@ -21,7 +21,7 @@ providers:
       max_rpm: 1
       window_seconds: 60
     circuit_breaker:
-      failure_threshold: 1
+      failure_threshold: 2
       cooldown_seconds: 60
 
   unorouter_vl_sealion:
@@ -35,7 +35,7 @@ providers:
       max_rpm: 1
       window_seconds: 60
     circuit_breaker:
-      failure_threshold: 1
+      failure_threshold: 2
       cooldown_seconds: 60
 
   unorouter_vl_qwen25:
@@ -49,7 +49,7 @@ providers:
       max_rpm: 1
       window_seconds: 60
     circuit_breaker:
-      failure_threshold: 1
+      failure_threshold: 2
       cooldown_seconds: 60
 
   # Text. gemma-4-26b allows five requests per minute, five times the
@@ -65,7 +65,7 @@ providers:
       max_rpm: 5
       window_seconds: 60
     circuit_breaker:
-      failure_threshold: 1
+      failure_threshold: 2
       cooldown_seconds: 60
 
   unorouter_structuring:
@@ -79,7 +79,7 @@ providers:
       max_rpm: 1
       window_seconds: 60
     circuit_breaker:
-      failure_threshold: 1
+      failure_threshold: 2
       cooldown_seconds: 60
 
   unorouter:
@@ -93,7 +93,7 @@ providers:
       max_rpm: 1
       window_seconds: 60
     circuit_breaker:
-      failure_threshold: 1
+      failure_threshold: 2
       cooldown_seconds: 60
 
   unorouter_qa:
@@ -107,7 +107,7 @@ providers:
       max_rpm: 1
       window_seconds: 60
     circuit_breaker:
-      failure_threshold: 1
+      failure_threshold: 2
       cooldown_seconds: 60
 
   unorouter_glm:
@@ -121,7 +121,7 @@ providers:
       max_rpm: 1
       window_seconds: 60
     circuit_breaker:
-      failure_threshold: 1
+      failure_threshold: 2
       cooldown_seconds: 60
 
   # The local Ollama model. It is skipped in cloud mode.

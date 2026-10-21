@@ -88,6 +88,11 @@ def extract_overlap_entries(
 class SliceBatch:
     entries: list[dict[str, Any]]
     end_offset: int
+    # Where the batch starts in the timeline file. It does not change when
+    # more events arrive, so it identifies the batch across retries. The end
+    # offset does change, because the last event of the batch may be a new
+    # one, and a counter keyed by it never reached the retry limit.
+    start_offset: int = 0
 
 
 def extract_json_payload(raw_output: str, expect_list: bool = True) -> Any:
@@ -197,7 +202,8 @@ def split_entries_into_batches(
         if current_length + content_length > max_characters and len(current_entries) > 0:
             batches.append(SliceBatch(
                 entries=current_entries,
-                end_offset=int(current_entries[-1].get("_line_end_offset", final_offset))
+                end_offset=int(current_entries[-1].get("_line_end_offset", final_offset)),
+                start_offset=int(current_entries[0].get("_line_start_offset", 0))
             ))
             current_entries = []
             current_length = 0
@@ -207,7 +213,8 @@ def split_entries_into_batches(
     if len(current_entries) > 0:
         batches.append(SliceBatch(
             entries=current_entries,
-            end_offset=final_offset
+            end_offset=final_offset,
+            start_offset=int(current_entries[0].get("_line_start_offset", 0))
         ))
     return batches
 
@@ -540,6 +547,7 @@ class StructuringAgent:
                 try:
                     record = json.loads(stripped)
                     record["_line_end_offset"] = line_end
+                    record["_line_start_offset"] = line_start
                     records.append(record)
                     final_offset = line_end
                 except ValueError:
@@ -744,8 +752,14 @@ class StructuringAgent:
             # would drop the batch, so the batch is retried instead. The
             # attempt counter bounds the retries: once it is exhausted the raw
             # timeline content is used so the lecture material is never lost.
-            attempts = self._batch_attempts.get(batch.end_offset, 0) + 1
-            self._batch_attempts[batch.end_offset] = attempts
+            # The counter is keyed by where the batch starts, so it keeps
+            # counting across retries even when more events arrived and the
+            # end of the batch moved. Keyed by the end offset it always
+            # looked like the first attempt, and the raw content fallback
+            # never happened.
+            attempt_key = batch.start_offset
+            attempts = self._batch_attempts.get(attempt_key, 0) + 1
+            self._batch_attempts[attempt_key] = attempts
             # The attempt counter is persisted, so the cap also applies across
             # restarts and across separate reprocess invocations. The byte
             # offset is deliberately left untouched.
@@ -797,6 +811,7 @@ class StructuringAgent:
             self.save_notes_marker(batch.end_offset)
 
         self.sequence_number += 1
+        self._batch_attempts.pop(batch.start_offset, None)
         self._batch_attempts.pop(batch.end_offset, None)
         # The batch is finished, so the quarantined entries are written now.
         # Writing them before the synthesis would append them again on every

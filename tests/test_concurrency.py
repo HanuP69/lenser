@@ -58,6 +58,36 @@ class TestProcessPoolRecovery(unittest.IsolatedAsyncioTestCase):
         shutdown_pools()
         concurrency.configure_pools(4, 2)
 
+    async def test_an_unusable_pool_falls_back_to_a_thread(self) -> None:
+        """A pool that cannot even be started must not stop the work.
+
+        The worker could not be started once, for example because a native
+        crash in the parent left the handles in a bad state. The work itself
+        is fine, so it runs in a thread instead.
+        """
+        from lecturelens.core import concurrency
+
+        def refuse_to_start(*args: object, **kwargs: object) -> object:
+            raise OSError("the worker could not be started")
+
+        original = concurrency.get_process_pool
+        concurrency.get_process_pool = refuse_to_start
+        try:
+            result = await run_in_process_pool(sample_cpu_task, 100)
+        finally:
+            concurrency.get_process_pool = original
+
+        self.assertEqual(result, sum(range(100)))
+
+    async def test_a_crashed_worker_is_not_run_in_a_thread(self) -> None:
+        """A worker that dies takes the work down with it.
+
+        Running it in a thread would take the parent process down too, so
+        the failure is reported instead.
+        """
+        with self.assertRaises(Exception):
+            await run_in_process_pool(crash_worker_process, max_attempts=1)
+
 
 if __name__ == "__main__":
     unittest.main()

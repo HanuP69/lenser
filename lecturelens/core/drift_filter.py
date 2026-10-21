@@ -11,6 +11,9 @@ from lecturelens.core.logging_setup import get_logger
 logger = get_logger("lecturelens.drift_filter")
 
 MAX_BATCH_SNAPSHOTS = 16
+# How many embedding failures are tolerated before the endpoint is treated as
+# unreachable.
+EMBEDDING_FAILURE_LIMIT = 3
 
 REFUSAL_SENTENCE_PATTERNS: tuple[re.Pattern, ...] = (
     re.compile(r"^\s*please\s+provide\s+(?:the\s+)?presentation\s+slide", re.IGNORECASE),
@@ -93,6 +96,12 @@ class ContextDriftFilter:
         # drift flag. They are kept so a false positive does not lose the
         # content.
         self.quarantined_entries: list[dict[str, Any]] = []
+        # The embedding endpoint is often not running, because the cloud
+        # providers are used instead of the local model. After a few failures
+        # the drift filter stops trying, so it does not cost seconds per
+        # entry.
+        self._embedding_failures: int = 0
+        self._embedding_endpoint_unavailable: bool = False
         self.accepted_count: int = 0
         self.drift_count: int = 0
         self._batch_snapshots: dict[str, dict[str, Any]] = {}
@@ -188,6 +197,13 @@ class ContextDriftFilter:
                 logger.warning("custom embedder failed: %s", embed_err)
                 return None
 
+        if self._embedding_endpoint_unavailable:
+            # The endpoint was already found to be unreachable. Trying it
+            # again for every entry cost seconds each time and stalled the
+            # shutdown, because the local model is often not running at all
+            # when the cloud providers are used.
+            return None
+
         endpoint = f"{self.ollama_url}/api/embeddings"
         prompt_text = clean_text
         if "nomic" in self.embed_model.lower() and not clean_text.startswith("search_"):
@@ -205,7 +221,17 @@ class ContextDriftFilter:
                 if embedding and isinstance(embedding, list):
                     return normalize_vector(np.asarray(embedding, dtype=np.float32))
         except Exception as error:
-            logger.warning("ollama embedding call failed or timed out: %s", error)
+            self._embedding_failures += 1
+            if self._embedding_failures >= EMBEDDING_FAILURE_LIMIT:
+                if not self._embedding_endpoint_unavailable:
+                    logger.warning(
+                        "the embedding endpoint %s is unreachable (%s); the drift filter "
+                        "will not try again, so the entries are kept as they are",
+                        endpoint, error
+                    )
+                self._embedding_endpoint_unavailable = True
+            else:
+                logger.warning("ollama embedding call failed or timed out: %s", error)
         return None
 
     def check_entry_with_shift(

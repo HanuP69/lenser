@@ -15,7 +15,9 @@ import sounddevice as sd
 import cv2
 
 WINDOW = "lecturelens-playback"
-PRIMARY = (0, 0, 1920, 1080)
+# The geometry of the display that is being captured. The screen agent
+# captures the primary monitor, so the video has to be shown there.
+DISPLAY = (0, 0, 1920, 1080)
 
 
 def decode_audio(path: str, start: float, seconds: float):
@@ -74,31 +76,36 @@ def main() -> int:
         return 1
     container.seek(int(args.start / float(video_stream.time_base)), stream=video_stream)
 
-    cv2.namedWindow(WINDOW, cv2.WINDOW_FULLSCREEN)
+    # The window is created as a normal window and positioned over the
+    # display that is being captured. Creating it with WINDOW_FULLSCREEN
+    # puts it on whichever display the window manager picks, which is not
+    # necessarily the one the screen capture reads, and then the capture
+    # records the terminal instead of the video.
+    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
     try:
-        cv2.setWindowProperty(WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        cv2.moveWindow(WINDOW, DISPLAY[0], DISPLAY[1])
+        cv2.resizeWindow(WINDOW, DISPLAY[2], DISPLAY[3])
     except Exception:
         pass
-    try:
-        cv2.moveWindow(WINDOW, PRIMARY[0], PRIMARY[1])
-        cv2.resizeWindow(WINDOW, PRIMARY[2], PRIMARY[3])
-    except Exception:
-        pass
-    # Keep the window on top of everything else, otherwise the screen capture
-    # records whatever is in front of it.
-    try:
-        import ctypes
-
-        hwnd = ctypes.windll.user32.GetForegroundWindow()
-        ctypes.windll.user32.SetWindowPos(
-            ctypes.windll.user32.GetParent(hwnd) or hwnd, 0, 0, 0, 0, 0x0001 | 0x0002
-        )
-    except Exception:
-        pass
-
     started = time.monotonic()
     print("playing", flush=True)
     sd.play(audio, samplerate=device_rate, blocking=False)
+
+    # Keep the window above the other windows, otherwise the screen capture
+    # records whatever is in front of it.
+    def raise_to_front() -> None:
+        try:
+            hwnd = cv2.getWindowProperty(WINDOW, cv2.WND_PROP_HWND)
+            if not hwnd:
+                return
+            import ctypes
+
+            # HWND_TOPMOST = -1, SWP_NOMOVE | SWP_NOSIZE = 0x0043
+            ctypes.windll.user32.SetWindowPos(
+                int(hwnd), -1, DISPLAY[0], DISPLAY[1], DISPLAY[2], DISPLAY[3], 0x0043
+            )
+        except Exception:
+            pass
 
     frame_index = 0
     for frame in container.decode(video_stream):
@@ -107,6 +114,10 @@ def main() -> int:
             break
         image = frame.to_ndarray(format="bgr24")
         cv2.imshow(WINDOW, image)
+        # The focus can be stolen, so the window is put on top again
+        # periodically.
+        if frame_index % 10 == 0:
+            raise_to_front()
         key = cv2.waitKey(1) & 0xFF
         if key in (27, ord("q")):
             break
