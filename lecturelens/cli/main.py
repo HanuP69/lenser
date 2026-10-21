@@ -679,7 +679,17 @@ def stop(
             display_session_output_summary(session_dir, console)
             return
         time.sleep(1.0)
-    fail("Timed out waiting for the session to finish.")
+    # The session is not killed by the timeout. The agents keep running and
+    # the notes are written when the final structuring pass is done, which
+    # takes a while when the provider is on a free tier.
+    console.print(
+        "[yellow]The session is still finishing. The notes are written when the "
+        "final structuring pass is done.[/yellow]"
+    )
+    console.print(
+        f"[yellow]Check it with: lecturelens status --session {session_id}[/yellow]"
+    )
+    raise typer.Exit(code=1)
 
 
 @app.command()
