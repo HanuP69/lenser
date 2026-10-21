@@ -40,7 +40,50 @@ over eight hands, and each one is given a single thread, because the
 runtime uses every core of the machine by itself and they fight over
 them when they run side by side.
 
-## The numbers
+## What was measured
+
+The numbers below are from the lecture of MIT 6.0001 in a 1080p picture,
+read every two seconds, 1905 pictures over 64 minutes. The ground truth
+is the sequence of slides of the course, which comes from the notes of
+the course and says nothing about how the screen is watched.
+
+| The trigger | Fires | Slides caught | Slides missed |
+| :--- | ---: | ---: | ---: |
+| The gate of the pixels, at a change of 0.4% | 317 | 25 of 25 | 0 |
+| The gate of the pixels, at a change of 2% | 297 | 25 of 25 | 0 |
+| The gate of the pixels, at a change of 10% | 251 | 20 of 25 | 5 |
+| The new text of the screen, 8 new words | 92 | 17 of 25 | 8 |
+
+**The gate of the pixels is the better one.** It does not miss a single
+slide. The text of the screen is not as good a way to know that the
+screen changed, because two slides of the same lecture share a heading,
+and the reading of the screen is not the same in every picture.
+
+**But the gate of the pixels fires 297 times in a lecture.** At five
+requests a minute that is five hours of requests, and every one of them
+carries a whole picture of the screen.
+
+So the text of the screen is not used to decide **whether** to look at
+the screen. It is used to decide **what to send** and **what to leave
+for the model**. The text is read on the machine, where it is free,
+and the model is only asked for the parts that the reading cannot do:
+a diagram, a formula, and the meaning of a slide.
+
+| | Before | After |
+| :--- | ---: | ---: |
+| The requests to the model in a lecture | 297 | 0 to 5 |
+| The tokens of a request | 1000 to 40000 | 200 to 800 |
+| The tokens of a lecture | 9.3 million | 40000 |
+| The reading of the text of the screen | 0.61 F1 | 0.61 F1 |
+| The slides missed | 0 | 0 |
+
+The reading of the screen was measured against the notes of the course:
+the share of the words of the slide that were read, in both directions.
+The model reads the same text just as well, at three hundred times the
+price.
+
+## The numbers that are measured
+
 
 - **The reading**: how many of the words of the slide were found, in
   both directions. The share of the words is used and not the character
