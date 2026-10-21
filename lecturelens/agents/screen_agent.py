@@ -103,10 +103,44 @@ def capture_screen_frame(
 def encode_frame_as_png(frame: ScreenFrame) -> bytes:
     image = Image.frombuffer(
         "RGBA", (frame.width, frame.height), frame.raw_bgra, "raw", "BGRA", 0, 1
-    ).convert("RGB")
+    )
+    return encode_image_as_png(image)
+
+
+def encode_image_as_png(image: Image.Image) -> bytes:
     output_buffer = io.BytesIO()
-    image.save(output_buffer, format="PNG")
+    image.convert("RGB").save(output_buffer, format="PNG")
     return output_buffer.getvalue()
+
+
+def crop_of_the_change(
+    frame: ScreenFrame,
+    changed_region: Optional[tuple[int, int, int, int]]
+) -> Optional[bytes]:
+    """The part of the picture that changed, as a picture.
+
+    The model is shown this part and not the whole screen. The request is
+    then a small part of the size of the whole screen, and the small
+    text of a slide is read properly, because the model does not have to
+    make it small first.
+    """
+    if changed_region is None:
+        return None
+    thumbnail_width = frame.thumbnail.shape[1]
+    if thumbnail_width <= 0 or frame.width <= 0 or frame.height <= 0:
+        return None
+    scale = frame.width / float(thumbnail_width)
+    left, top, right, bottom = changed_region
+    left = max(0, min(frame.width - 1, int(left * scale)))
+    top = max(0, min(frame.height - 1, int(top * scale)))
+    right = max(left + 1, min(frame.width, int(right * scale)))
+    bottom = max(top + 1, min(frame.height, int(bottom * scale)))
+    if (right - left) < 32 or (bottom - top) < 32:
+        return None
+    image = Image.frombuffer(
+        "RGBA", (frame.width, frame.height), frame.raw_bgra, "raw", "BGRA", 0, 1
+    )
+    return encode_image_as_png(image.crop((left, top, right, bottom)))
 
 
 def build_thumbnail_from_png(png_bytes: bytes, thumbnail_width: int) -> np.ndarray:
@@ -227,6 +261,29 @@ class ScreenAgent:
             if removed_number in self.slide_texts:
                 del self.slide_texts[removed_number]
 
+    async def read_text_locally(self, png_bytes: bytes) -> str:
+        """The text of a picture, read on the machine.
+
+        The reader is not there on every machine, and then nothing is
+        read and the model is asked as it was before.
+        """
+        if not self.settings.screen_local_ocr:
+            return ""
+        try:
+            import io as _io
+
+            from PIL import Image
+
+            from lecturelens.core.local_ocr import read_text
+
+            image = Image.open(_io.BytesIO(png_bytes))
+            image.load()
+            result = await run_in_thread_pool(read_text, np.array(image))
+        except Exception as error:
+            logger.warning("the local reading of the text failed: %s", error)
+            return ""
+        return str(result.get("text", "")).strip()
+
     async def run_ocr(self, png_bytes: bytes) -> str:
         """Extract the text of a slide.
 
@@ -257,7 +314,9 @@ class ScreenAgent:
         self,
         png_bytes: bytes,
         thumbnail: np.ndarray,
-        capture_epoch: Optional[float] = None
+        capture_epoch: Optional[float] = None,
+        changed_region: Optional[tuple[int, int, int, int]] = None,
+        crop_png: Optional[bytes] = None
     ) -> SlideCaptured:
         capture_timestamp = capture_epoch if capture_epoch is not None else self.session_clock.get_timestamp()
         self.slide_counter += 1
@@ -297,9 +356,13 @@ class ScreenAgent:
             # four minutes and every slide change in the meantime was missed.
             # The slide is published exactly once, by the background task,
             # with the recovered text.
+            #
+            # The model is shown the part of the screen that changed and
+            # not the whole screen. The request is then a small part of
+            # the size, and the small text of a slide is read properly.
             self.schedule_text_extraction(
                 slide_number, image_path, capture_timestamp, difference_hash,
-                small_thumbnail, png_bytes
+                small_thumbnail, crop_png if crop_png is not None else png_bytes
             )
             self._pending_text_extractions += 1
             # A gauge, not a counter: it shows how many slides are still
@@ -344,24 +407,36 @@ class ScreenAgent:
     ) -> None:
         """Recover the text of a slide in the background and publish it once.
 
+        The text is read on the machine first, where it is free. The model
+        is only asked when the machine could not read enough of it, which
+        is the case for a picture or a formula.
+
         The image is read back from the file for every attempt instead of
         being held in memory. A backlog of pending slides would otherwise keep
         every screenshot alive for the whole retry schedule.
         """
         recovered_text = ""
-        delays = [0.0] + list(self.settings.vision_retry_delays_seconds)
-        for index, delay_seconds in enumerate(delays):
-            if delay_seconds > 0:
-                await asyncio.sleep(delay_seconds)
-            if self.control.stop_requested():
-                return
-            try:
-                payload = await run_in_thread_pool(Path(image_path).read_bytes)
-            except OSError:
-                return
-            recovered_text = await self.run_vision_fallback(payload, max_retries=1)
-            if len(recovered_text.strip()) > 0:
-                break
+        local_text = await self.read_text_locally(png_bytes)
+        if len(local_text.strip()) > 0:
+            # The machine read the text, so nothing is asked of the
+            # model.
+            recovered_text = local_text
+            self.control.increment_stat("slide_text_read_locally")
+        else:
+            self.control.increment_stat("slide_text_needs_model")
+            delays = [0.0] + list(self.settings.vision_retry_delays_seconds)
+            for index, delay_seconds in enumerate(delays):
+                if delay_seconds > 0:
+                    await asyncio.sleep(delay_seconds)
+                if self.control.stop_requested():
+                    return
+                try:
+                    payload = await run_in_thread_pool(Path(image_path).read_bytes)
+                except OSError:
+                    return
+                recovered_text = await self.run_vision_fallback(payload, max_retries=1)
+                if len(recovered_text.strip()) > 0:
+                    break
 
         if len(recovered_text.strip()) > 0:
             self.remember_slide(slide_number, difference_hash, small_thumbnail, recovered_text)
@@ -445,9 +520,21 @@ class ScreenAgent:
                 try:
                     detection_epoch = self.session_clock.get_timestamp()
                     png_bytes = await run_in_thread_pool(encode_frame_as_png, frame)
+                    # The part of the screen that changed. The model is
+                    # shown that and not the whole screen.
+                    changed_region = self.gate.last_changed_region
+                    crop_png = await run_in_thread_pool(
+                        crop_of_the_change, frame, changed_region
+                    )
                     if self.control.stop_requested():
                         break
-                    await self.accept_png(png_bytes, frame.thumbnail, capture_epoch=detection_epoch)
+                    await self.accept_png(
+                        png_bytes,
+                        frame.thumbnail,
+                        capture_epoch=detection_epoch,
+                        changed_region=changed_region,
+                        crop_png=crop_png
+                    )
                 except Exception as error:
                     logger.error("slide processing failed: %s", error)
                     self.control.increment_stat("slide_errors")

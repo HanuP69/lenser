@@ -2,6 +2,11 @@ from typing import Any, Optional
 
 import numpy as np
 
+# The parts of the screen that are compared to find out where it
+# changed. More parts than the ones that decide whether it changed, so
+# that the part is found more closely.
+CHANGED_REGION_GRID: tuple[int, int] = (12, 16)
+
 
 def compute_changed_fraction(
     first_gray: np.ndarray,
@@ -17,13 +22,20 @@ def compute_changed_fraction(
     return changed_pixels / float(difference.size)
 
 
-def compute_spatial_block_similarity(
+def compute_block_similarities(
     first_gray: np.ndarray,
     second_gray: np.ndarray,
     grid: tuple[int, int] = (6, 8)
-) -> float:
+) -> list[float]:
+    """How alike every part of two pictures is.
+
+    The middle value of the parts is what tells whether the pictures
+    changed at all. The parts themselves say **where** they changed,
+    which is what the model needs, because a small part of a picture is
+    enough to tell it about the part that changed.
+    """
     if first_gray.shape != second_gray.shape or first_gray.size == 0:
-        return 0.0
+        return []
     grid_rows, grid_cols = grid
     height, width = first_gray.shape
     block_h = height // grid_rows
@@ -34,10 +46,10 @@ def compute_spatial_block_similarity(
         norm1 = float(np.linalg.norm(b1))
         norm2 = float(np.linalg.norm(b2))
         if norm1 == 0.0 and norm2 == 0.0:
-            return 1.0
+            return [1.0]
         if norm1 == 0.0 or norm2 == 0.0:
-            return 0.0
-        return float(np.dot(b1, b2) / (norm1 * norm2))
+            return [0.0]
+        return [float(np.dot(b1, b2) / (norm1 * norm2))]
     similarities: list[float] = []
     for r in range(grid_rows):
         for c in range(grid_cols):
@@ -51,7 +63,105 @@ def compute_spatial_block_similarity(
                 similarities.append(0.0)
             else:
                 similarities.append(float(np.dot(b1, b2) / (norm1 * norm2)))
+    return similarities
+
+
+def compute_spatial_block_similarity(
+    first_gray: np.ndarray,
+    second_gray: np.ndarray,
+    grid: tuple[int, int] = (6, 8)
+) -> float:
+    similarities = compute_block_similarities(first_gray, second_gray, grid)
+    if not similarities:
+        return 0.0
     return float(np.median(similarities)) if similarities else 1.0
+
+
+def changed_region(
+    first_gray: np.ndarray,
+    second_gray: np.ndarray,
+    grid: tuple[int, int] = (12, 16),
+    similarity_limit: float = 0.98,
+    padding_blocks: int = 1
+) -> Optional[tuple[int, int, int, int]]:
+    """The part of the picture that changed, as a box.
+
+    The box is in the coordinates of the picture that was given, so a
+    small box can be cut out of the whole picture. The model is then shown
+    that part and not the whole screen, which is what makes the request
+    small and the small text readable.
+
+    The parts of the picture are found first, and then the exact pixels
+    that changed are looked for inside them. A part on its own is big,
+    and the request would still be a large part of the screen.
+
+    None is returned when nothing changed, or when the whole picture
+    changed, because then the whole picture is the part that changed.
+    """
+    if first_gray.shape != second_gray.shape or first_gray.size == 0:
+        return None
+    similarities = compute_block_similarities(first_gray, second_gray, grid)
+    if not similarities:
+        return None
+    grid_rows, grid_cols = grid
+    changed = [
+        index for index, value in enumerate(similarities) if value < similarity_limit
+    ]
+    if not changed:
+        return None
+    if len(changed) == len(similarities):
+        # Everything changed, so the whole picture is the part that
+        # changed.
+        return None
+
+    height, width = first_gray.shape
+    block_h = max(1, height // grid_rows)
+    block_w = max(1, width // grid_cols)
+
+    rows = [index // grid_cols for index in changed]
+    columns = [index % grid_cols for index in changed]
+    top = max(0, (min(rows) - padding_blocks) * block_h)
+    bottom = min(height, (max(rows) + padding_blocks + 1) * block_h)
+    left = max(0, (min(columns) - padding_blocks) * block_w)
+    right = min(width, (max(columns) + padding_blocks + 1) * block_w)
+
+    exact = _exact_changed_box(first_gray, second_gray, top, bottom, left, right)
+    if exact is not None:
+        return exact
+    return (left, top, right, bottom)
+
+
+def _exact_changed_box(
+    first_gray: np.ndarray,
+    second_gray: np.ndarray,
+    top: int,
+    bottom: int,
+    left: int,
+    right: int
+) -> Optional[tuple[int, int, int, int]]:
+    """The exact pixels that changed, as a box.
+
+    The pixels are looked for inside the parts that changed, so the box
+    is as small as the change and not as big as the part it is in.
+    """
+    first = first_gray[top:bottom, left:right].astype(np.int16)
+    second = second_gray[top:bottom, left:right].astype(np.int16)
+    if first.size == 0:
+        return None
+    difference = np.abs(first - second)
+    rows = np.any(difference > 8, axis=1)
+    columns = np.any(difference > 8, axis=0)
+    if not rows.any() or not columns.any():
+        return None
+    row_indexes = np.flatnonzero(rows)
+    column_indexes = np.flatnonzero(columns)
+    return (
+        left + int(column_indexes[0]),
+        top + int(row_indexes[0]),
+        left + int(column_indexes[-1]) + 1,
+        top + int(row_indexes[-1]) + 1
+    )
+
 
 
 def compute_difference_hash(gray_thumbnail: np.ndarray) -> int:
@@ -95,6 +205,10 @@ class SlideChangeGate:
         self.settle_polls: int = 0
         self.detection_timestamp: float = 0.0
         self._last_observed_time: Optional[float] = None
+        # The part of the picture that changed, in the coordinates of the
+        # small picture. The model is shown that part and not the whole
+        # screen.
+        self.last_changed_region: Optional[tuple[int, int, int, int]] = None
 
     def evaluate(self, thumbnail: np.ndarray, now_seconds: float) -> bool:
         previous_poll = self.previous_poll
@@ -145,6 +259,12 @@ class SlideChangeGate:
         now_seconds: float,
         embedding: Optional[np.ndarray] = None
     ) -> bool:
+        if self.last_accepted is not None:
+            self.last_changed_region = changed_region(
+                self.last_accepted, thumbnail, CHANGED_REGION_GRID
+            )
+        else:
+            self.last_changed_region = None
         self.last_accepted = thumbnail
         if embedding is not None:
             self.last_accepted_embedding = embedding

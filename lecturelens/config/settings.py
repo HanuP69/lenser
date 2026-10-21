@@ -74,6 +74,11 @@ class Settings(BaseSettings):
     whisper_hallucination_phrases: list[str] = Field(default_factory=list)
 
     screenshot_interval_seconds: float = Field(default=1.0)
+    # Whether the text of the screen is read on the machine. The reader
+    # runs on the processor and costs nothing, and it reads the text of a
+    # slide as well as a model does over the network. The model is then
+    # only asked for the parts the reader cannot do.
+    screen_local_ocr: bool = Field(default=True)
     slide_diff_threshold: float = Field(default=0.004)
     # The slide text is extracted by a vision model, so the number of slides
     # that can be transcribed is bounded by the provider's budget. The retries

@@ -46,6 +46,9 @@ full = [
     "faster-whisper>=1.0",
     "mss>=9.0",
     "Pillow>=10.0",
+    # The text of the screen is read on the machine, where it is free.
+    "rapidocr>=3.0",
+    "onnxruntime>=1.15.0",
     "langchain-core>=1.4.7,<2.0",
     "langchain-ollama>=1.0,<2.0",
     "langchain-openai>=1.0,<2.0",
