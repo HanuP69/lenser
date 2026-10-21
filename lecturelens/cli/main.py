@@ -862,12 +862,12 @@ def status(session: Optional[str] = typer.Option(None, "--session")) -> None:
 
 @app.command()
 def export(
-    export_format: str = typer.Option("md", "--format", help="Export format (md)"),
+    export_format: str = typer.Option("md", "--format", help="Export format (md, html)"),
     session: Optional[str] = typer.Option(None, "--session"),
     output: Optional[Path] = typer.Option(None, "--output"),
 ) -> None:
     try:
-        validate_export_format(export_format)
+        export_format = validate_export_format(export_format)
     except ValueError as error:
         fail(str(error))
     settings = Settings()
@@ -877,12 +877,26 @@ def export(
     target_dir.mkdir(parents=True, exist_ok=True)
 
     notes_path = session_dir / "notes.md"
-    if notes_path.exists():
-        destination = target_dir / f"{session_id}_notes.md"
-        destination.write_bytes(notes_path.read_bytes())
-        console.print(f"Markdown: {destination}")
-    else:
+    if not notes_path.exists():
         console.print("[yellow]No notes.md yet.[/yellow]")
+        return
+
+    if export_format == "html":
+        from lecturelens.core.notes_html import render_notes_html
+
+        destination = target_dir / f"{session_id}_notes.html"
+        notes_text = notes_path.read_text(encoding="utf-8")
+        destination.write_text(
+            render_notes_html(notes_text, title=f"Lecture Notes - {session_id}"),
+            encoding="utf-8"
+        )
+        console.print(f"HTML: {destination}")
+        console.print("[yellow]Open it in a browser to see the formulas.[/yellow]")
+        return
+
+    destination = target_dir / f"{session_id}_notes.md"
+    destination.write_bytes(notes_path.read_bytes())
+    console.print(f"Markdown: {destination}")
 
 
 @app.command()

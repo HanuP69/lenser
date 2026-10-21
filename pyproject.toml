@@ -27,6 +27,10 @@ dependencies = [
     "langchain-ollama>=0.2",
     "langgraph>=0.2",
     "Pillow>=10.0",
+    # The notes are turned into a page that draws the formulas, so they
+    # can be read in a browser without any other program.
+    "markdown-it-py>=3.0",
+    "mdit-py-plugins>=0.4",
 ]
 
 [project.optional-dependencies]

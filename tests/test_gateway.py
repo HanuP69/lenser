@@ -704,7 +704,11 @@ class TestRemoteClientShutdown(unittest.IsolatedAsyncioTestCase):
             start_t = time.monotonic()
             await asyncio.gather(task, return_exceptions=True)
             elapsed = time.monotonic() - start_t
-            self.assertLess(elapsed, 1.0)
+            # The socket hangs for a minute, so a return in a few seconds
+            # still shows that the cancellation was not waited for. The
+            # budget has to be generous, because the event loop of a
+            # machine that is busy with the other tests is slow.
+            self.assertLess(elapsed, 5.0)
             self.assertTrue(ctx_instance.exited)
 
 

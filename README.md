@@ -369,10 +369,20 @@ lecturelens status --session "cs101_01"
 ```
 
 ### 8. `lecturelens export`
-Exports clean structured Markdown lecture notes:
+Exports clean structured lecture notes:
 ```bash
+# Markdown, with the formulas as LaTeX
 lecturelens export --session "cs101_01" --format md --output ./exports
+
+# A page that draws the formulas, open it in any browser
+lecturelens export --session "cs101_01" --format html --output ./exports
 ```
+
+Most Markdown viewers show the formulas as the LaTeX they are written in,
+because they do not draw them. The HTML export draws them, so the notes
+can be read without any other program. The Markdown file itself is
+written the way GitHub writes it, with the `$$` of a formula on its own
+line, so GitHub and the viewers that follow it draw them as well.
 
 ### 9. `lecturelens ask`
 Interactive question-answering over indexed lecture knowledge with source citations and student misconception tracking:

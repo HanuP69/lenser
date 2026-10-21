@@ -6,7 +6,7 @@ COURSE_NAME_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.\- ]{0,63}\Z")
 VALID_AUDIO_SOURCES: tuple[str, ...] = ("mic", "system", "both")
 VALID_LLM_MODES: tuple[str, ...] = ("local", "hybrid", "cloud")
 VALID_RUN_MODES: tuple[str, ...] = ("local", "server")
-VALID_EXPORT_FORMATS: tuple[str, ...] = ("md",)
+VALID_EXPORT_FORMATS: tuple[str, ...] = ("md", "html")
 
 
 def is_valid_session_id(session_id: str) -> bool:

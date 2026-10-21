@@ -449,6 +449,9 @@ class StructuringAgent:
         self.session_dir: Path = session_dir
         self.timeline_path: Path = session_dir / "timeline.jsonl"
         self.notes_path: Path = session_dir / "notes.md"
+        # The same notes as a page that draws the formulas. Most Markdown
+        # viewers only show the LaTeX as it is written.
+        self.notes_html_path: Path = session_dir / "notes.html"
         self.context_path: Path = session_dir / "context.json"
         self.notes_marker_path: Path = session_dir / "notes_marker.json"
         self.batch_attempts_path: Path = session_dir / "batch_attempts.json"
@@ -809,6 +812,26 @@ class StructuringAgent:
         finally:
             self._split_depth -= 1
 
+    def write_html_notes(self) -> None:
+        """Write the notes as a page that draws the formulas.
+
+        Most Markdown viewers show a formula as the LaTeX it is written
+        in, because they do not draw it. The page draws it, so the notes
+        can be read in a browser without any other program.
+        """
+        if not self.notes_path.exists():
+            return
+        try:
+            from lecturelens.core.notes_html import render_notes_html
+
+            notes_text = self.notes_path.read_text(encoding="utf-8")
+            self.notes_html_path.write_text(
+                render_notes_html(notes_text, title=f"Lecture Notes - {self.session_id}"),
+                encoding="utf-8"
+            )
+        except Exception as error:
+            logger.warning("the html notes could not be written: %s", error)
+
     async def process_single_batch(self, batch: SliceBatch, running_context: str) -> str:
         entries = batch.entries
         if self.drift_filter is not None:
@@ -928,6 +951,7 @@ class StructuringAgent:
             with open(self.notes_path, "a", encoding="utf-8", newline="\n") as file_handle:
                 file_handle.write(section_text)
             self.save_notes_marker(batch.end_offset)
+            self.write_html_notes()
 
         self.sequence_number += 1
         self._batch_attempts.pop(batch.start_offset, None)
@@ -1006,6 +1030,7 @@ class StructuringAgent:
     def reset_outputs(self) -> None:
         for path in (
             self.notes_path,
+            self.notes_html_path,
             self.context_path,
             self.notes_marker_path,
             self.batch_attempts_path,
