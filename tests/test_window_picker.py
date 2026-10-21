@@ -1,4 +1,5 @@
 import unittest
+from typing import Any
 from unittest import mock
 
 from lecturelens.cli import window_picker
@@ -97,6 +98,33 @@ class TestWindowPicker(unittest.TestCase):
             )
         self.assertEqual(target, "screen")
         self.assertIsNone(handle)
+
+
+class TestRememberingTheWindow(unittest.TestCase):
+    def test_the_chosen_window_is_kept_for_the_next_run(self) -> None:
+        """The question is only asked the first time."""
+        import tempfile
+        from pathlib import Path
+
+        from lecturelens.cli import main as cli_main
+        from lecturelens.core.env_file import read_env_value
+
+        with tempfile.TemporaryDirectory() as folder:
+            env_path = Path(folder) / ".env"
+
+            def remember(name: str, value: str, path: Any = None) -> bool:
+                with open(env_path, "a", encoding="utf-8") as handle:
+                    handle.write(f"{name}={value}\n")
+                return True
+
+            with mock.patch(
+                "lecturelens.core.env_file.set_env_value", side_effect=remember
+            ):
+                cli_main._remember_window(4321, "Redis Talk")
+
+            self.assertEqual(read_env_value("LECTURELENS_WINDOW_HANDLE", env_path), "4321")
+            self.assertEqual(read_env_value("LECTURELENS_WINDOW_TITLE", env_path), "Redis Talk")
+            self.assertEqual(read_env_value("LECTURELENS_CAPTURE_TARGET", env_path), "window")
 
 
 if __name__ == "__main__":

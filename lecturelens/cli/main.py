@@ -598,6 +598,10 @@ def start(
             settings.capture_target = "window"
             settings.window_handle = window_handle
             settings.window_title = window_title
+            if window is None:
+                # The window was chosen by answering the question, so it is
+                # remembered. The question is only asked once.
+                _remember_window(window_handle, window_title)
 
     session_id = session or datetime.now().strftime("%Y-%m-%d_%H%M%S")
     if not is_valid_session_id(session_id):
@@ -703,6 +707,19 @@ def session_has_live_agents(session_dir: Path) -> bool:
         if now - float(heartbeat.get("time", 0.0)) <= LIVE_HEARTBEAT_MAX_AGE_SECONDS:
             return True
     return False
+
+
+def _remember_window(window_handle: int, window_title: Optional[str]) -> None:
+    """Keep the window that was chosen, so the question is asked once."""
+    from lecturelens.core.env_file import set_env_value
+
+    try:
+        set_env_value("LECTURELENS_CAPTURE_TARGET", "window")
+        set_env_value("LECTURELENS_WINDOW_HANDLE", str(window_handle))
+        if window_title:
+            set_env_value("LECTURELENS_WINDOW_TITLE", window_title)
+    except Exception as error:
+        logger.warning("the chosen window could not be remembered: %s", error)
 
 
 def agents_are_gone(session_dir: Path) -> bool:
