@@ -155,6 +155,33 @@ class TestRouter(RouterTestBase):
         self.assertEqual(models["local"].calls, 2)
         self.assertEqual(models["cloud_a"].calls, 4)
 
+    async def test_a_misconfigured_model_falls_through_without_tripping_the_breaker(self) -> None:
+        """A wrong model name is a configuration problem: the chain has to
+        move on to the next provider, but the circuit breaker must not be
+        tripped because the provider is not unhealthy."""
+        if not self.redis_available:
+            self.skipTest("Redis not available")
+
+        class NotFoundError(Exception):
+            def __init__(self) -> None:
+                super().__init__("model 'does-not-exist' not found")
+                self.status_code = 404
+
+        models = {
+            "local": FakeModel("local", error=NotFoundError()),
+            "cloud_a": FakeModel("cloud_a")
+        }
+        with self.install_models(models):
+            router = build_router_for_task("structuring", self.client, CONFIG, llm_mode="hybrid")
+            await router.ainvoke([HumanMessage(content="hi")])
+
+        # The chain fell through to the next provider.
+        self.assertEqual(models["cloud_a"].calls, 1)
+
+        # The breaker was not tripped by the configuration error.
+        breaker = RedisCircuitBreaker(self.client, "structuring:local", 1, 60)
+        self.assertFalse(await breaker.is_open())
+
     async def test_rate_limit_denial_does_not_count_as_failure(self) -> None:
         if not self.redis_available:
             self.skipTest("Redis not available")

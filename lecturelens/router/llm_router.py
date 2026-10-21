@@ -23,6 +23,20 @@ class ProviderUnavailableError(RuntimeError):
     pass
 
 
+def is_configuration_error(error: BaseException) -> bool:
+    """Whether the failure is a configuration problem rather than an outage.
+
+    A wrong model name, a bad request or a payload that is too large are
+    configuration problems. They must not trip the circuit breaker, because
+    the provider is not unhealthy, but the chain still has to move on to the
+    next provider instead of failing the whole task.
+    """
+    status_code = getattr(error, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code in NON_PROVIDER_STATUS_CODES
+    return False
+
+
 def is_provider_failure(error: BaseException) -> bool:
     status_code = getattr(error, "status_code", None)
     if isinstance(status_code, int):
@@ -368,6 +382,14 @@ def wrap_model_with_circuit_breaker(
         except asyncio.CancelledError:
             raise
         except Exception as invocation_error:
+            if is_configuration_error(invocation_error):
+                # A misconfigured model is not an outage, so the circuit
+                # breaker is left alone, but the chain has to move on to the
+                # next provider. Raising the original error here would skip
+                # every fallback and fail the whole task.
+                raise ProviderUnavailableError(
+                    f"{provider_name} is misconfigured: {invocation_error}"
+                ) from invocation_error
             if is_provider_failure(invocation_error):
                 try:
                     await circuit_breaker.record_failure()
