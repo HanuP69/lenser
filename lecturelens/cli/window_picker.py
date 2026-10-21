@@ -13,6 +13,18 @@ from lecturelens.core.logging_setup import get_logger
 logger = get_logger("lecturelens.window_picker")
 
 
+def describe_window(window: Any) -> str:
+    """A line that says which window it is, without any doubt.
+
+    The number of a window is only right for the list that was shown, so
+    the title, the size and the place of the window are shown as well.
+    """
+    return (
+        f"{window.title!r} ({window.width}x{window.height} at "
+        f"({window.left}, {window.top}))"
+    )
+
+
 def _can_ask() -> bool:
     """Whether there is somebody to answer the question.
 
@@ -129,7 +141,7 @@ def resolve_capture_target(
         if window is None:
             console.print(f"[red]No window matches {window_query!r}.[/red]")
             return "screen", None, None
-        console.print(f"[green]Recording the window[/green] {window.title!r}")
+        console.print(f"[green]Recording the window[/green] {describe_window(window)}")
         return "window", window.handle, window.title
 
     if configured_handle and is_window_alive(configured_handle):
@@ -156,5 +168,5 @@ def resolve_capture_target(
     if window is None:
         console.print("[yellow]Recording the whole screen.[/yellow]")
         return "screen", None, None
-    console.print(f"[green]Recording the window[/green] {window.title!r}")
+    console.print(f"[green]Recording the window[/green] {describe_window(window)}")
     return "window", window.handle, window.title

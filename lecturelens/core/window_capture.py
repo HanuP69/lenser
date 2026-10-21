@@ -174,20 +174,36 @@ def is_window_alive(handle: int) -> bool:
         return False
 
 
-def find_window(query: str, windows: Optional[list[WindowInfo]] = None) -> Optional[WindowInfo]:
+def find_window(
+    query: str,
+    windows: Optional[list[WindowInfo]] = None,
+    include_minimized: bool = False
+) -> Optional[WindowInfo]:
     """Find the window the user meant.
 
     The query is either the number from the listing or part of the title.
+
+    The number is looked for in the same list that the listing shows, so
+    the number the user saw is the window that is found. The list used
+    to have the minimized windows in it as well, so the numbers were off
+    by however many minimized windows there were, and the window that
+    was recorded was not the one on the screen.
     """
     cleaned = (query or "").strip()
     if not cleaned:
         return None
-    available = windows if windows is not None else list_windows(include_minimized=True)
+    available = windows if windows is not None else list_windows()
 
     if cleaned.isdigit():
         index = int(cleaned) - 1
         if 0 <= index < len(available):
             return available[index]
+        # The window may have been closed between the listing and the
+        # start. A minimized window is still a window the user can mean.
+        if include_minimized:
+            with_minimized = list_windows(include_minimized=True)
+            if 0 <= index < len(with_minimized):
+                return with_minimized[index]
         return None
 
     lowered = cleaned.lower()

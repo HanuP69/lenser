@@ -579,6 +579,16 @@ def start(
     if course is not None and not is_valid_course_name(course):
         fail(f"Invalid course name: {course}")
 
+    session_id = session or datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    if not is_valid_session_id(session_id):
+        fail(f"Invalid session name: {session_id}")
+
+    session_dir = settings.get_session_output_dir(session_id)
+    if (session_dir / "session_meta.json").exists() and not resume:
+        # The check is done before the window is chosen, so a name that is
+        # already taken does not throw the choice of the window away.
+        fail(f"Session '{session_id}' already exists. Use --resume to continue it or pick another name.")
+
     # The window that is recorded is chosen before the session starts, so
     # the screen agent records the right thing from the first frame. The
     # question is only asked when nothing has been chosen yet.
@@ -602,14 +612,6 @@ def start(
                 # The window was chosen by answering the question, so it is
                 # remembered. The question is only asked once.
                 _remember_window(window_handle, window_title)
-
-    session_id = session or datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    if not is_valid_session_id(session_id):
-        fail(f"Invalid session name: {session_id}")
-
-    session_dir = settings.get_session_output_dir(session_id)
-    if (session_dir / "session_meta.json").exists() and not resume:
-        fail(f"Session '{session_id}' already exists. Use --resume to continue it or pick another name.")
 
     if not check_redis(settings):
         fail(f"Redis is not reachable at {settings.redis_url}")

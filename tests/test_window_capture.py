@@ -50,6 +50,31 @@ class TestWindowListing(unittest.TestCase):
     def test_an_empty_query_finds_nothing(self) -> None:
         self.assertIsNone(find_window("  ", [make_window(10, "Alpha")]))
 
+    def test_the_number_is_the_one_the_listing_showed(self) -> None:
+        """The number has to mean the same window in both places.
+
+        The list that the lookup used had the minimized windows in it as
+        well, so the number the user saw was off by however many
+        minimized windows there were. The window that was recorded was
+        not the one on the screen.
+        """
+        visible = [make_window(10, "Alpha"), make_window(11, "Beta")]
+        with mock.patch.object(window_capture, "list_windows", return_value=visible):
+            found = find_window("2")
+        self.assertIsNotNone(found)
+        self.assertEqual(found.handle, 11)
+
+    def test_a_minimized_window_is_still_found_by_its_number(self) -> None:
+        visible = [make_window(10, "Alpha")]
+        minimized = [make_window(10, "Alpha"), make_window(12, "Hidden")]
+        with mock.patch.object(window_capture, "list_windows", return_value=visible):
+            with mock.patch.object(
+                window_capture, "list_windows", return_value=minimized
+            ):
+                found = find_window("2", include_minimized=True)
+        self.assertIsNotNone(found)
+        self.assertEqual(found.handle, 12)
+
     def test_the_shell_windows_are_not_offered(self) -> None:
         # The desktop itself is never what a lecture is about.
         self.assertIn("program manager", IGNORED_WINDOW_TITLES)
