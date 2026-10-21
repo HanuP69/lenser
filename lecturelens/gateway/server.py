@@ -5,7 +5,6 @@ import hmac
 import inspect
 import json
 import secrets
-import sys
 import time
 import uuid
 from dataclasses import dataclass, field

@@ -6,7 +6,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from lecturelens.config.defaults import SYNC_CONSUMER_GROUP, SYNC_CONSUMER_PREFIX
 from lecturelens.config.settings import Settings
@@ -19,7 +19,7 @@ from lecturelens.core.agent_runtime import (
 )
 from lecturelens.core.clock import SessionClock
 from lecturelens.core.concurrency import run_in_thread_pool
-from lecturelens.core.fileio import append_text_durably
+from lecturelens.core.fileio import append_text_durably, atomic_write_text
 from lecturelens.core.logging_setup import get_logger
 from lecturelens.core.redis_bus import RedisBus
 from lecturelens.schemas.events import (
@@ -36,7 +36,8 @@ FINGERPRINT_HISTORY_LIMIT: int = 5000
 
 def entry_fingerprint(entry: TimelineEntry) -> str:
     raw = f"{entry.source_type}|{entry.timestamp_epoch:.6f}|{entry.content}"
-    return hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()
+    # The fingerprint is a de-duplication key, not a security primitive.
+    return hashlib.sha1(raw.encode("utf-8", errors="replace"), usedforsecurity=False).hexdigest()
 
 
 @dataclass
@@ -72,13 +73,19 @@ class SyncAgent:
 
         session_dir = settings.create_session_directories(session_id)
         self.timeline_path: Path = session_dir / "timeline.jsonl"
+        self.flush_state_path: Path = session_dir / "timeline_flush_state.json"
         self.control: AgentControl = AgentControl(session_dir, "sync_agent", SYNC_STOP_FLAG_NAME)
         self.pending_buffer: list[BufferedEntry] = []
         self.pending_message_ids: set[tuple[str, str]] = set()
         self.written_fingerprints: set[str] = set()
+        # The fingerprints and event ids that are in timeline.jsonl. Being in
+        # the file only proves the local write, not the publish.
+        self.file_fingerprints: set[str] = set()
+        self.file_event_ids: set[str] = set()
         # Tracks how far each entry made it into the two sinks, so a failure
         # in one of them does not make the other one run twice.
         self.flush_states: dict[str, str] = {}
+        self.flush_state_tracked: bool = False
         self.written_event_ids: set[str] = set()
         self.fingerprint_order: deque = deque()
         self.event_id_order: deque = deque()
@@ -87,7 +94,44 @@ class SyncAgent:
         self.buffer_lock: asyncio.Lock = asyncio.Lock()
         self.entries_written: int = 0
         self.fingerprint_history_limit: int = getattr(settings, "sync_fingerprint_history_limit", getattr(settings, "fingerprint_history_limit", FINGERPRINT_HISTORY_LIMIT))
+        # The flush state has to be loaded first: it tells the fingerprint
+        # loader which entries really reached Redis.
+        self.load_flush_states()
         self.load_written_fingerprints()
+
+    def load_flush_states(self) -> None:
+        """Restore the per sink state from disk.
+
+        The state has to survive a restart. Without it, an entry that was
+        written to timeline.jsonl but not published to Redis before a crash
+        would be treated as done on the next start, so the persister and
+        Postgres would never see it.
+        """
+        if not self.flush_state_path.exists():
+            return
+        try:
+            raw = json.loads(self.flush_state_path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            return
+        if not isinstance(raw, dict):
+            return
+        for fingerprint, state in raw.items():
+            if isinstance(fingerprint, str) and isinstance(state, str):
+                self.flush_states[fingerprint] = state
+        self.flush_state_tracked = True
+
+    def save_flush_states(self) -> None:
+        """Persist the per sink state."""
+        if not self.flush_states:
+            return
+        try:
+            atomic_write_text(
+                self.flush_state_path,
+                json.dumps(self.flush_states)
+            )
+            self.flush_state_tracked = True
+        except OSError as error:
+            logger.warning("could not persist the timeline flush state: %s", error)
 
     def load_written_fingerprints(self) -> None:
         if not self.timeline_path.exists():
@@ -105,9 +149,19 @@ class SyncAgent:
                 restored = TimelineEntry(**json.loads(raw_line))
             except (ValueError, TypeError):
                 continue
-            self.remember_fingerprint(entry_fingerprint(restored))
+            fingerprint = entry_fingerprint(restored)
+            # Being in the file only proves the local write. The entry is
+            # only fully flushed once it was published to Redis as well.
+            self.file_fingerprints.add(fingerprint)
+            if not self.flush_state_tracked:
+                # There is no state file, so there is no way to tell whether
+                # the entry was published. The old behaviour is kept so an
+                # existing session is not republished wholesale.
+                self.remember_fingerprint(fingerprint)
             if restored.event_id:
-                self.remember_event_id(restored.event_id)
+                self.file_event_ids.add(restored.event_id)
+                if not self.flush_state_tracked:
+                    self.remember_event_id(restored.event_id)
 
     def remember_fingerprint(self, fingerprint: str) -> None:
         if fingerprint in self.written_fingerprints:
@@ -195,12 +249,15 @@ class SyncAgent:
                 self.duplicates_skipped += 1
                 await self.acknowledge(stream_name, group_name, message_id)
                 return
-            if entry.event_id and entry.event_id in self.written_event_ids:
+            fp = entry_fingerprint(entry)
+            if self.is_fully_flushed(entry, fp):
                 self.duplicates_skipped += 1
                 await self.acknowledge(stream_name, group_name, message_id)
                 return
-            fp = entry_fingerprint(entry)
-            if fp in self.written_fingerprints:
+            if fp in self.file_fingerprints and self.flush_states.get(fp, "") != "file":
+                # The entry is in the file but the publish state is unknown,
+                # so it is assumed to be done. This only happens for
+                # sessions that were written before the state file existed.
                 self.duplicates_skipped += 1
                 await self.acknowledge(stream_name, group_name, message_id)
                 return
@@ -209,6 +266,25 @@ class SyncAgent:
             self.pending_buffer.append(
                 BufferedEntry(entry, time.monotonic(), stream_name, group_name, message_id)
             )
+
+    def is_fully_flushed(self, entry: TimelineEntry, fingerprint: str) -> bool:
+        """Whether the entry reached both sinks.
+
+        An entry that was written to timeline.jsonl but never published to
+        Redis is not fully flushed. Treating it as done would mean the
+        persister and Postgres never see it.
+        """
+        if fingerprint in self.written_fingerprints:
+            return True
+        if self.flush_state_tracked:
+            if self.flush_states.get(fingerprint, "") == "both":
+                return True
+            if entry.event_id and entry.event_id in self.written_event_ids:
+                return True
+            return False
+        if entry.event_id and entry.event_id in self.written_event_ids:
+            return True
+        return False
 
     async def acknowledge(
         self,
@@ -434,18 +510,29 @@ class SyncAgent:
                     fingerprint = entry_fingerprint(buffered.entry)
                     previous = self.flush_states.get(fingerprint, "")
                     self.flush_states[fingerprint] = "both" if previous == "redis" else "file"
+                # The state is persisted before the publish, so a crash in
+                # between does not make the next start treat the entry as
+                # fully flushed.
+                self.save_flush_states()
 
             if len(needs_redis) > 0:
-                try:
-                    for buffered in needs_redis:
-                        await self.redis_bus.publish_resilient(timeline_stream, buffered.entry)
-                except Exception as pub_error:
-                    logger.error("publishing timeline entry failed, keeping buffer unacknowledged: %s", pub_error)
-                    return 0
                 for buffered in needs_redis:
+                    try:
+                        await self.redis_bus.publish_resilient(timeline_stream, buffered.entry)
+                    except Exception as pub_error:
+                        logger.error(
+                            "publishing timeline entry failed, keeping buffer unacknowledged: %s",
+                            pub_error
+                        )
+                        # The state is updated per entry, so the entries that
+                        # were published before the failure are not published
+                        # again on the retry.
+                        self.save_flush_states()
+                        return 0
                     fingerprint = entry_fingerprint(buffered.entry)
                     previous = self.flush_states.get(fingerprint, "")
                     self.flush_states[fingerprint] = "both" if previous == "file" else "redis"
+                self.save_flush_states()
 
             flushed: list[BufferedEntry] = []
             for buffered, fingerprint in zip(ready, fingerprints):

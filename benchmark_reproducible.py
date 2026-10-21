@@ -2,7 +2,6 @@ import glob
 import io
 import json
 import math
-import os
 import struct
 import time
 import wave
@@ -13,8 +12,7 @@ import numpy as np
 from lecturelens.agents.audio_agent import transcribe_audio_chunk
 from lecturelens.core.image_utils import (
     SlideChangeGate,
-    compute_difference_hash,
-    hamming_distance
+    compute_difference_hash
 )
 from lecturelens.agents.screen_agent import build_gray_thumbnail
 from lecturelens.core.markdown_formatter import format_clean_markdown
@@ -70,7 +68,7 @@ def resolve_slide_sample() -> tuple[Image.Image, bool]:
     return img, True
 
 audio_bytes, audio_duration_sec, audio_is_synthetic = resolve_audio_sample()
-print(f"\n[1] AUDIO TRANSCRIPTION (ASR) BENCHMARK")
+print("\n[1] AUDIO TRANSCRIPTION (ASR) BENCHMARK")
 print(f"    Audio Duration: {audio_duration_sec:.2f} seconds")
 if audio_is_synthetic:
     print("    WARNING: no recorded audio found in ./output/**/raw/audio. Using a synthetic 440 Hz tone.")
@@ -109,7 +107,7 @@ try:
 except Exception as asr_error:
     print(f"    ASR benchmark skipped: {type(asr_error).__name__}: {asr_error}")
 
-print(f"\n[2] SCREEN CHANGE DETECTION (VISION) BENCHMARK")
+print("\n[2] SCREEN CHANGE DETECTION (VISION) BENCHMARK")
 slide_img, slide_is_synthetic = resolve_slide_sample()
 width, height = slide_img.size
 print(f"    Slide Resolution: {width}x{height}")
@@ -253,7 +251,7 @@ if not found_session:
     print("\n[3] SESSION COMPUTE REDUCTION")
     print("    No recorded session directory found in ./output. Run a lecture with `lecturelens start` to inspect session savings.")
 
-print(f"\n[4] MARKDOWN POST-PROCESSING & SANITIZATION BENCHMARK")
+print("\n[4] MARKDOWN POST-PROCESSING & SANITIZATION BENCHMARK")
 dirty_markdown = """01:51:40
 Drafting Section 1: Algorithmic Complexity analysis.
 Markdown headings? Yes.

@@ -783,8 +783,8 @@ class TestRemoteClientSendAndWait(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             spool_file = Path(td) / "spool.db"
             spool = CaptureSpool(spool_file, max_size=10)
-            spool.append("c1", '{"capture_id": "c1", "type": "audio"}')
-            spool.append("c2", '{"capture_id": "c2", "type": "screen"}')
+            await spool.append("c1", '{"capture_id": "c1", "type": "audio"}')
+            await spool.append("c2", '{"capture_id": "c2", "type": "screen"}')
             self.assertEqual(spool.count(), 2)
 
             mock_ws = mock.AsyncMock()
@@ -794,6 +794,27 @@ class TestRemoteClientSendAndWait(unittest.IsolatedAsyncioTestCase):
             await drain_spool(spool, mock_ws, stop_evt)
             self.assertEqual(spool.count(), 0)
             self.assertEqual(mock_ws.send.await_count, 2)
+
+    async def test_capture_spool_backpressure_does_not_drop_when_space_frees(self) -> None:
+        """The backpressure wait used to block a thread pool worker, so the
+        acknowledgements that free the space could not run."""
+        from lecturelens.client.remote_client import CaptureSpool
+        with tempfile.TemporaryDirectory() as td:
+            spool_file = Path(td) / "spool.db"
+            spool = CaptureSpool(spool_file, max_size=2, append_timeout_seconds=5.0)
+            await spool.append("c1", "one")
+            await spool.append("c2", "two")
+
+            async def free_space() -> None:
+                await asyncio.sleep(0.2)
+                spool.acknowledge("c1")
+
+            freer = asyncio.create_task(free_space())
+            await spool.append("c3", "three")
+            await freer
+
+            self.assertEqual(spool.dropped_count, 0)
+            self.assertEqual(spool.count(), 2)
 
     async def test_send_and_wait_times_out_on_unresponsive_server(self) -> None:
         from lecturelens.client.remote_client import send_and_wait

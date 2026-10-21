@@ -402,7 +402,12 @@ class TestScreenAgentHardening(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             agent, _ = self.make_agent(temp_dir, FlakyVisionRouter(0))
             capture = agent.session_clock.get_timestamp() - 42.0
-            with mock.patch.object(screen_agent, "run_in_process_pool", side_effect=self.empty_ocr):
+
+            async def slow_ocr(*args: Any, **kwargs: Any) -> str:
+                await asyncio.sleep(0.2)
+                return "late slide text"
+
+            with mock.patch.object(agent, "run_vision_fallback", side_effect=slow_ocr):
                 event = await agent.ingest_png_bytes(make_png(), capture_epoch=capture)
             self.assertEqual(event.timestamp_epoch, capture)
 
@@ -410,8 +415,7 @@ class TestScreenAgentHardening(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             router = FlakyVisionRouter(fail_first=2)
             agent, bus = self.make_agent(temp_dir, router)
-            with mock.patch.object(screen_agent, "run_in_process_pool", side_effect=self.empty_ocr):
-                first = await agent.ingest_png_bytes(make_png())
+            first = await agent.ingest_png_bytes(make_png())
             self.assertEqual(first.extracted_text, "")
             await asyncio.wait_for(asyncio.gather(*list(agent.retry_tasks)), timeout=5)
             # The slide is published exactly once. It used to be published
@@ -426,16 +430,14 @@ class TestScreenAgentHardening(unittest.IsolatedAsyncioTestCase):
     async def test_no_retry_scheduled_without_a_vision_router(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             agent, _ = self.make_agent(temp_dir, None)
-            with mock.patch.object(screen_agent, "run_in_process_pool", side_effect=self.empty_ocr):
-                await agent.ingest_png_bytes(make_png())
+            await agent.ingest_png_bytes(make_png())
             self.assertEqual(len(agent.retry_tasks), 0)
 
     async def test_stop_cancels_pending_retries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             agent, _ = self.make_agent(temp_dir, FlakyVisionRouter(fail_first=99))
             agent.settings.vision_retry_delays_seconds = [30.0]
-            with mock.patch.object(screen_agent, "run_in_process_pool", side_effect=self.empty_ocr):
-                await agent.ingest_png_bytes(make_png())
+            await agent.ingest_png_bytes(make_png())
             tasks = list(agent.retry_tasks)
             self.assertEqual(len(tasks), 1)
             agent.stop()

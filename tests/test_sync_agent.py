@@ -295,6 +295,106 @@ class TestSyncEndToEnd(SyncTestBase):
         self.assertEqual(first_pass_lines, second_pass_lines)
         self.assertEqual(len(second_pass_lines), 1)
 
+    async def test_partial_publish_failure_does_not_republish_the_first_entries(self) -> None:
+        """The per entry state was only updated after the whole loop, so the
+        entries that were published before the failure were published again
+        on the retry."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.output_dir = Path(temp_dir)
+            settings.sync_merge_window_seconds = 0.0
+            agent = SyncAgent(settings, self.bus, SessionClock(), "sync_partial_session")
+            agent.acknowledge = mock.AsyncMock()
+
+            for index in range(4):
+                agent.pending_buffer.append(BufferedEntry(
+                    entry=entry(100.0 + index, "transcript", f"partial {index}"),
+                    arrival_monotonic=time.monotonic() - 10.0,
+                    stream_name="s",
+                    group_name="g",
+                    message_id=f"1-{index}",
+                ))
+
+            published: list[str] = []
+            call_count = {"value": 0}
+
+            async def failing_publish(stream: str, item: object) -> str:
+                call_count["value"] += 1
+                if call_count["value"] > 2:
+                    raise RuntimeError("redis is down")
+                published.append(str(getattr(item, "content", "")))
+                return "1-0"
+
+            agent.redis_bus.publish_resilient = failing_publish
+            flushed = await agent.flush_ready_entries(force=True)
+            self.assertEqual(flushed, 0)
+            self.assertEqual(len(published), 2)
+
+            # The retry publishes only the entries that never made it.
+            published.clear()
+            call_count["value"] = 0
+            agent.redis_bus.publish_resilient = mock.AsyncMock(
+                side_effect=lambda stream, item: published.append(str(getattr(item, "content", ""))) or "1-0"
+            )
+            flushed = await agent.flush_ready_entries(force=True)
+            self.assertEqual(flushed, 4)
+            self.assertEqual(len(published), 2, "the already published entries must not be published again")
+            self.assertNotIn("partial 0", published)
+            self.assertNotIn("partial 1", published)
+
+    async def test_crash_after_the_file_write_republishes_to_redis(self) -> None:
+        """A crash between the file write and the Redis publish used to lose
+        the entry: the restart restored the fingerprint from timeline.jsonl and
+        treated the entry as done, so the persister never saw it."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.output_dir = Path(temp_dir)
+            settings.sync_merge_window_seconds = 0.0
+            session = "sync_crash_session"
+
+            agent = SyncAgent(settings, self.bus, SessionClock(), session)
+            agent.acknowledge = mock.AsyncMock()
+            ent = entry(100.0, "transcript", "crash between sinks")
+            agent.pending_buffer.append(BufferedEntry(
+                entry=ent,
+                arrival_monotonic=time.monotonic() - 10.0,
+                stream_name="s",
+                group_name="g",
+                message_id="1-0",
+            ))
+
+            # The file write succeeds, the publish never happens.
+            async def failing_publish(*args: object, **kwargs: object) -> str:
+                raise RuntimeError("redis is down")
+
+            agent.redis_bus.publish_resilient = failing_publish
+            flushed = await agent.flush_ready_entries(force=True)
+            self.assertEqual(flushed, 0)
+            self.assertTrue(agent.timeline_path.exists())
+            self.assertTrue(agent.flush_state_path.exists())
+
+            # A restart reloads the state from disk.
+            restarted = SyncAgent(settings, self.bus, SessionClock(), session)
+            self.assertTrue(restarted.flush_state_tracked)
+
+            published: list[Any] = []
+            restarted.acknowledge = mock.AsyncMock()
+            restarted.redis_bus.publish_resilient = mock.AsyncMock(
+                side_effect=lambda stream, item: published.append(item) or "1-0"
+            )
+
+            # The entry is delivered again, as the unacked message would be.
+            await restarted.add_entry(ent, stream_name="s", group_name="g", message_id="1-0")
+            self.assertEqual(len(restarted.pending_buffer), 1)
+
+            flushed = await restarted.flush_ready_entries(force=True)
+            self.assertEqual(flushed, 1)
+            self.assertEqual(len(published), 1, "the entry has to reach Redis after the restart")
+
+            # The file must not have been written a second time.
+            lines = restarted.timeline_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 1)
+
     async def test_sync_agent_deduplicates_redelivered_event_id(self) -> None:
         agent = SyncAgent(self.settings, self.bus, SessionClock(), "test_sync_dedup_session")
         agent.acknowledge = mock.AsyncMock()

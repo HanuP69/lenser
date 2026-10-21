@@ -1,10 +1,6 @@
 import asyncio
 import io
-import shutil
 import time
-import urllib.error
-import urllib.request
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -15,7 +11,7 @@ from PIL import Image
 from lecturelens.config.settings import Settings
 from lecturelens.core.agent_runtime import AgentControl, RuntimeContext, execute_agent_main, run_standard_agent
 from lecturelens.core.clock import SessionClock
-from lecturelens.core.concurrency import run_in_process_pool, run_in_thread_pool
+from lecturelens.core.concurrency import run_in_thread_pool
 from lecturelens.core.fileio import atomic_write_bytes, next_file_index
 from lecturelens.core.image_utils import (
     SlideChangeGate,
@@ -27,7 +23,7 @@ from lecturelens.core.image_utils import (
 from lecturelens.core.drift_filter import is_refusal_text
 from lecturelens.core.logging_setup import get_logger
 from lecturelens.core.redis_bus import RedisBus
-from lecturelens.core.vision_embedder import VisionEmbedder, get_shared_vision_embedder
+from lecturelens.core.vision_embedder import get_shared_vision_embedder
 from lecturelens.router.messages import build_image_message, response_to_text
 from lecturelens.schemas.events import SlideCaptured
 

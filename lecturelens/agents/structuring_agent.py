@@ -21,7 +21,7 @@ from lecturelens.core.agent_runtime import (
 )
 from lecturelens.core.clock import SessionClock
 from lecturelens.core.concurrency import run_in_thread_pool
-from lecturelens.core.fileio import atomic_write_text
+from lecturelens.core.fileio import append_text_durably, atomic_write_text
 from lecturelens.core.drift_filter import ContextDriftFilter
 from lecturelens.core.logging_setup import get_logger
 from lecturelens.core.markdown_formatter import format_clean_markdown
@@ -113,7 +113,6 @@ def extract_json_payload(raw_output: str, expect_list: bool = True) -> Any:
     repaired = re.sub(r",\s*([\]}])", r"\1", raw_output)
     decoder = json.JSONDecoder()
     pos = 0
-    target_cls = list if expect_list else (dict, list)
     best_candidate: Any = None
     while pos < len(repaired):
         m = re.search(r"(\[|\{)", repaired[pos:])
@@ -414,6 +413,7 @@ class StructuringAgent:
         self.context_path: Path = session_dir / "context.json"
         self.notes_marker_path: Path = session_dir / "notes_marker.json"
         self.batch_attempts_path: Path = session_dir / "batch_attempts.json"
+        self.quarantine_path: Path = session_dir / "timeline_quarantine.jsonl"
         self.control: AgentControl = AgentControl(session_dir, "structuring_agent", FINALIZE_FLAG_NAME)
 
         self.graph: Any = create_structuring_graph(llm_router)
@@ -623,10 +623,41 @@ class StructuringAgent:
             section_lines.append("")
         return "\n".join(section_lines) + "\n"
 
+    async def persist_quarantined_entries(self) -> None:
+        """Write the entries that the ad or drift filter excluded to disk.
+
+        They are kept out of the notes, but they are not deleted either, so a
+        false positive on the heuristics does not lose the content.
+        """
+        if self.drift_filter is None:
+            return
+        quarantined = list(self.drift_filter.quarantined_entries)
+        if len(quarantined) == 0:
+            return
+        self.drift_filter.quarantined_entries.clear()
+        lines = []
+        for entry in quarantined:
+            try:
+                lines.append(json.dumps(entry, ensure_ascii=False, default=str))
+            except (TypeError, ValueError):
+                continue
+        if len(lines) == 0:
+            return
+        try:
+            await run_in_thread_pool(
+                append_text_durably,
+                self.quarantine_path,
+                "\n".join(lines) + "\n"
+            )
+            self.control.increment_stat("quarantined_entries", len(lines))
+        except OSError as error:
+            logger.warning("could not write the quarantined entries: %s", error)
+
     async def process_single_batch(self, batch: SliceBatch, running_context: str) -> str:
         entries = batch.entries
         if self.drift_filter is not None:
             entries = await run_in_thread_pool(self.drift_filter.filter_batch_entries, batch.entries)
+            await self.persist_quarantined_entries()
 
         if len(entries) == 0:
             logger.info("all entries in batch ending at offset %d filtered as drift/ad; skipping synthesis", batch.end_offset)

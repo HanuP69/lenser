@@ -812,7 +812,6 @@ def review(
                 console.print(f"  - {c['concept_name']}: mastery {c['mastery_level']:.2f} (decayed: {decayed:.2f})")
             return
     if settings.postgres_url:
-        from lecturelens.storage.postgres import PostgresStorage
 
         course_val = course if isinstance(course, str) else None
         session_val = session if isinstance(session, str) else None
@@ -942,8 +941,6 @@ def persister(
         fail("LECTURELENS_POSTGRES_URL is not configured.")
     session_id = resolve_session(settings, session)
     from lecturelens.storage.persister import PostgresPersister
-    from lecturelens.storage.postgres import PostgresStorage
-
     async def run() -> None:
         redis_bus = create_redis_bus(settings, component_name="persister")
         storage = create_postgres_storage(settings)

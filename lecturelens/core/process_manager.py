@@ -10,8 +10,11 @@ from lecturelens.core.agent_runtime import set_flag
 logger = logging.getLogger(__name__)
 
 # A shutdown phase waits as long as the agent keeps producing output. This is
-# how long it may stall without any progress before the wait gives up.
-PROGRESS_STALL_SECONDS: float = 45.0
+# how long it may stall without any progress before the wait gives up. A
+# single local LLM call on CPU, or a rate limited cloud retry, can take
+# minutes without writing anything, so the limit is generous and the phase
+# deadline is the real backstop.
+PROGRESS_STALL_SECONDS: float = 180.0
 
 
 class AgentProcessManager:
@@ -239,16 +242,20 @@ class AgentProcessManager:
 
     @staticmethod
     def _phase_progress_probe(session_dir: Path) -> Callable[[], Any]:
-        """Report whether the session output is still growing.
+        """Report whether the phase is still doing something.
 
-        A phase that keeps producing output is making progress, so the
-        shutdown waits for it instead of killing it at a fixed deadline.
+        The output files only grow when a note is written, so a single slow
+        LLM call looks like a stall. The agent heartbeat is watched as well:
+        it is refreshed every couple of seconds, so a live agent is never
+        declared stalled. Only an agent that is both silent and idle is
+        considered stuck.
         """
         watched = [
             session_dir / "timeline.jsonl",
             session_dir / "notes.md",
             session_dir / "context.json",
         ]
+        heartbeat_dir = session_dir / "heartbeats"
 
         def probe() -> Any:
             total = 0
@@ -258,7 +265,16 @@ class AgentProcessManager:
                         total += path.stat().st_size
                 except OSError:
                     continue
-            return total
+            newest_heartbeat = 0.0
+            try:
+                for path in heartbeat_dir.glob("*.json"):
+                    try:
+                        newest_heartbeat = max(newest_heartbeat, path.stat().st_mtime)
+                    except OSError:
+                        continue
+            except OSError:
+                pass
+            return (total, newest_heartbeat)
 
         return probe
 

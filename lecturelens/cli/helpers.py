@@ -1,5 +1,4 @@
 import json
-import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -203,8 +202,15 @@ def count_file_lines(file_path: Path) -> int:
         return 0
 
 
+ALLOWED_COUNT_TABLE_NAMES: frozenset[str] = frozenset({"concepts", "applied_segments"})
+
+
 def count_sqlite_rows(db_path: Path, table_name: str) -> Optional[int]:
     if not db_path.exists():
+        return None
+    if table_name not in ALLOWED_COUNT_TABLE_NAMES:
+        # The table name cannot be parameterised, so it is restricted to a
+        # fixed set instead of being interpolated into the statement.
         return None
     try:
         import sqlite3

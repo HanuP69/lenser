@@ -4,7 +4,6 @@ import json
 import logging
 from pathlib import Path
 from typing import Any, Callable, Optional
-import uuid
 
 from lecturelens.core.redis_bus import RedisBus
 from lecturelens.schemas.events import SlideCaptured, TimelineEntry, TranscriptChunk

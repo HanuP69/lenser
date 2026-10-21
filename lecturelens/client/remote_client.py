@@ -7,7 +7,6 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-import numpy as np
 
 from lecturelens.agents.audio_agent import (
     SpeechSegmenter,
@@ -72,47 +71,73 @@ class CaptureSpool:
         finally:
             conn.close()
 
-    def append(self, capture_id: str, payload_text: str) -> None:
-        deadline = time.monotonic() + self.append_timeout_seconds
-        while True:
-            conn = sqlite3.connect(str(self.spool_path), timeout=5.0)
-            try:
-                cur = conn.cursor()
-                cur.execute("SELECT COUNT(*) FROM pending_captures;")
-                count = int(cur.fetchone()[0])
-                if count >= self.max_size:
-                    if time.monotonic() < deadline:
-                        # Backpressure: wait for the sender to acknowledge
-                        # something instead of dropping the capture.
-                        conn.close()
-                        time.sleep(0.05)
-                        continue
-                    # The spool stayed full. Dropping the oldest undelivered
-                    # capture lost lecture audio silently, so the failure is
-                    # now explicit and counted.
-                    self.dropped_count += 1
-                    logger.error(
-                        "capture spool %s is full (%d captures) after %.1fs; dropping the "
-                        "oldest pending capture (%d dropped so far)",
-                        self.spool_path, self.max_size, self.append_timeout_seconds,
-                        self.dropped_count
-                    )
-                    cur.execute(
-                        "SELECT capture_id FROM pending_captures ORDER BY created_at ASC LIMIT 1;"
-                    )
-                    old_rows = cur.fetchall()
-                    if old_rows:
-                        cur.execute(
-                            "DELETE FROM pending_captures WHERE capture_id = ?;", (old_rows[0][0],)
-                        )
+    def _try_append(self, capture_id: str, payload_text: str) -> bool:
+        """Insert a capture. Returns False when the spool is full.
+
+        The blocking wait for space happens in the async wrapper, so the
+        thread pool is never blocked. A blocked append used to delay the
+        acknowledgements that would have freed the space.
+        """
+        conn = sqlite3.connect(str(self.spool_path), timeout=5.0)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM pending_captures;")
+            count = int(cur.fetchone()[0])
+            if count >= self.max_size:
+                return False
+            cur.execute(
+                "INSERT OR REPLACE INTO pending_captures (capture_id, payload, created_at) VALUES (?, ?, ?);",
+                (capture_id, payload_text, time.time())
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+    def _evict_oldest(self) -> None:
+        conn = sqlite3.connect(str(self.spool_path), timeout=5.0)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT capture_id FROM pending_captures ORDER BY created_at ASC LIMIT 1;"
+            )
+            old_rows = cur.fetchall()
+            if old_rows:
                 cur.execute(
-                    "INSERT OR REPLACE INTO pending_captures (capture_id, payload, created_at) VALUES (?, ?, ?);",
-                    (capture_id, payload_text, time.time())
+                    "DELETE FROM pending_captures WHERE capture_id = ?;", (old_rows[0][0],)
                 )
                 conn.commit()
+        finally:
+            conn.close()
+
+    async def append(self, capture_id: str, payload_text: str) -> None:
+        """Add a capture to the spool, applying backpressure when it is full.
+
+        The wait happens on the event loop, not in a thread pool worker, so
+        the acknowledgements that free the space can still run.
+        """
+        deadline = time.monotonic() + self.append_timeout_seconds
+        while True:
+            inserted = await run_in_thread_pool(self._try_append, capture_id, payload_text)
+            if inserted:
                 return
-            finally:
-                conn.close()
+            if time.monotonic() >= deadline:
+                break
+            # Backpressure: wait for the sender to acknowledge something
+            # instead of dropping the capture.
+            await asyncio.sleep(0.05)
+
+        # The spool stayed full. Dropping the oldest undelivered capture
+        # would lose lecture audio, so the failure is explicit and counted.
+        self.dropped_count += 1
+        logger.error(
+            "capture spool %s is full (%d captures) after %.1fs; dropping the "
+            "oldest pending capture (%d dropped so far)",
+            self.spool_path, self.max_size, self.append_timeout_seconds,
+            self.dropped_count
+        )
+        await run_in_thread_pool(self._evict_oldest)
+        await run_in_thread_pool(self._try_append, capture_id, payload_text)
 
     def acknowledge(self, capture_id: str) -> None:
         conn = sqlite3.connect(str(self.spool_path), timeout=5.0)
@@ -294,7 +319,7 @@ async def stream_audio(
                 cap_id = uuid.uuid4().hex
                 msg_text = encode_message("audio", "wav_b64", wav_bytes, time.time(), capture_id=cap_id)
                 if spool is not None:
-                    await run_in_thread_pool(spool.append, cap_id, msg_text)
+                    await spool.append(cap_id, msg_text)
                 try:
                     await send_and_wait(websocket, msg_text, stop_event=stop_event)
                     if spool is not None:
@@ -335,7 +360,7 @@ async def stream_screen(
                 cap_id = uuid.uuid4().hex
                 msg_text = encode_message("screen", "png_b64", png_bytes, captured_at, capture_id=cap_id)
                 if spool is not None:
-                    await run_in_thread_pool(spool.append, cap_id, msg_text)
+                    await spool.append(cap_id, msg_text)
                 await send_and_wait(websocket, msg_text, stop_event=stop_event)
                 if spool is not None:
                     await run_in_thread_pool(spool.acknowledge, cap_id)

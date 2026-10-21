@@ -209,6 +209,31 @@ class TestContextDriftFilterBehavior(unittest.TestCase):
         self.assertEqual(accepted_after_first, self.filter.accepted_count)
         self.assertEqual(drift_after_first, self.filter.drift_count)
 
+    def test_ad_flagged_entries_are_quarantined_not_deleted(self) -> None:
+        """A false positive on the ad heuristics must not lose the content, so
+        the entry is quarantined instead of being dropped."""
+        entries = [
+            {
+                "event_id": "ad-1",
+                "content": "This video is sponsored by our friends",
+                "importance_flags": ["ad"],
+                "source_type": "transcript"
+            },
+            {
+                "event_id": "keep-1",
+                "content": "The definition of a binary search tree",
+                "importance_flags": ["definition"],
+                "source_type": "transcript"
+            }
+        ]
+        kept = self.filter.filter_batch_entries(entries)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["event_id"], "keep-1")
+        quarantined = self.filter.quarantined_entries
+        self.assertEqual(len(quarantined), 1)
+        self.assertEqual(quarantined[0]["event_id"], "ad-1")
+        self.assertIn("sponsored by", quarantined[0]["content"])
+
     def test_refusal_text_is_dropped_outright(self) -> None:
         """A refusal is a vision-model artefact. It used to be quarantined
         like a topic drift and could be released back into the notes when an

@@ -8,9 +8,8 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Optional, Sequence
 
-from lecturelens.config.settings import Settings
 from lecturelens.router.messages import HumanMessage, response_to_text
 from lecturelens.schemas.events import GeneralNoteSegment
 

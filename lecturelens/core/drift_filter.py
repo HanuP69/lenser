@@ -79,6 +79,10 @@ class ContextDriftFilter:
         self.running_anchor: Optional[np.ndarray] = None
         self.quarantine_buffer: list[tuple[str, np.ndarray]] = []
         self.pending_quarantine_entries: list[dict[str, Any]] = []
+        # The entries that were excluded from the notes because of the ad or
+        # drift flag. They are kept so a false positive does not lose the
+        # content.
+        self.quarantined_entries: list[dict[str, Any]] = []
         self.accepted_count: int = 0
         self.drift_count: int = 0
         self._batch_snapshots: dict[str, dict[str, Any]] = {}
@@ -285,6 +289,10 @@ class ContextDriftFilter:
             # produce false positives on legitimate speech, so an entry is only
             # dropped when no important marker contradicts the flag.
             if not is_important and ("drift" in flags or "ad" in flags):
+                # The entry is quarantined instead of being deleted, so a
+                # false positive on the ad heuristics does not lose the
+                # content. The caller can persist the quarantine.
+                self.quarantined_entries.append(dict(entry))
                 continue
 
             content = str(entry.get("content", ""))

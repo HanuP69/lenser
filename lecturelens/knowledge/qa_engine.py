@@ -47,7 +47,10 @@ class IndexedChunk:
 
 
 def make_chunk_id(source: str, text: str) -> str:
-    digest = hashlib.sha1(f"{source}|{text}".encode("utf-8")).hexdigest()
+    # The chunk id is a de-duplication key, not a security primitive.
+    digest = hashlib.sha1(
+        f"{source}|{text}".encode("utf-8"), usedforsecurity=False
+    ).hexdigest()
     return f"{source}_{digest}"
 
 

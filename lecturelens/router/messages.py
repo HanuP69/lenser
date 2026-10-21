@@ -1,6 +1,6 @@
 import base64
 import re
-from typing import Any, Optional
+from typing import Any
 
 from langchain_core.messages import HumanMessage
 
