@@ -398,6 +398,35 @@ class TestBatchHelpers(unittest.TestCase):
         self.assertEqual(first[0].start_offset, second[0].start_offset)
         self.assertNotEqual(first[0].end_offset, second[0].end_offset)
 
+    def test_the_time_mark_of_a_section_points_at_the_speech(self) -> None:
+        """A slide that was published late must not set the time mark.
+
+        The text of a slide is read by a model that takes a while, so the
+        slide reaches the timeline long after it was captured. It then
+        sits in front of a section that is about something else, and the
+        section got a time mark of the first twenty seconds of the
+        lecture while it was about the fifth minute.
+        """
+        from lecturelens.agents.structuring_agent import StructuringAgent
+
+        agent = StructuringAgent.__new__(StructuringAgent)
+        entries = [
+            {"source_type": "slide", "timestamp_epoch": 22.0, "content": "a slide"},
+            {"source_type": "transcript", "timestamp_epoch": 300.0, "content": "speech"},
+            {"source_type": "transcript", "timestamp_epoch": 320.0, "content": "more speech"},
+        ]
+        self.assertEqual(agent.section_start_timestamp(entries), 300.0)
+
+    def test_the_time_mark_falls_back_to_the_first_entry_without_speech(self) -> None:
+        from lecturelens.agents.structuring_agent import StructuringAgent
+
+        agent = StructuringAgent.__new__(StructuringAgent)
+        entries = [
+            {"source_type": "slide", "timestamp_epoch": 22.0, "content": "a slide"},
+            {"source_type": "slide", "timestamp_epoch": 40.0, "content": "another slide"},
+        ]
+        self.assertEqual(agent.section_start_timestamp(entries), 22.0)
+
 
 if __name__ == "__main__":
     unittest.main()

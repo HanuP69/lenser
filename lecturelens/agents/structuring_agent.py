@@ -576,6 +576,23 @@ class StructuringAgent:
                 break
         return excerpts
 
+    def section_start_timestamp(self, entries: list[dict[str, Any]]) -> float:
+        """When the section of the lecture starts.
+
+        The speech of the lecturer is what the time mark points at. A
+        slide that was published late can be much older than the rest of
+        the section, because the text of a slide is read by a model that
+        takes a while, and then the slide sits in front of a section that
+        is about something else entirely. That put a mark of 00:00:22 on
+        a section that was about the fifth minute of the lecture.
+        """
+        if len(entries) == 0:
+            return 0.0
+        for entry in entries:
+            if str(entry.get("source_type", "transcript")) == "transcript":
+                return float(entry.get("timestamp_epoch", 0.0))
+        return float(entries[0].get("timestamp_epoch", 0.0))
+
     def build_notes_section(
         self,
         batch: SliceBatch,
@@ -585,7 +602,7 @@ class StructuringAgent:
         if len(summary) == 0:
             return ""
         cleaned_summary = format_clean_markdown(summary).strip()
-        first_timestamp = float(batch.entries[0].get("timestamp_epoch", 0.0))
+        first_timestamp = self.section_start_timestamp(batch.entries)
         heading_time = self.session_clock.format_epoch_as_elapsed(first_timestamp)
         divider = "\n---\n\n" if (self.notes_path.exists() and self.notes_path.stat().st_size > 0) else ""
         section_lines: list[str] = [f"{divider}### {heading_time}", ""]
@@ -620,7 +637,7 @@ class StructuringAgent:
         Used when the language model keeps returning an empty summary. The
         lecture material is kept verbatim instead of being dropped.
         """
-        first_timestamp = float(batch.entries[0].get("timestamp_epoch", 0.0))
+        first_timestamp = self.section_start_timestamp(batch.entries)
         heading_time = self.session_clock.format_epoch_as_elapsed(first_timestamp)
         divider = "\n---\n\n" if (self.notes_path.exists() and self.notes_path.stat().st_size > 0) else ""
         section_lines: list[str] = [f"{divider}### {heading_time}", ""]
@@ -796,7 +813,7 @@ class StructuringAgent:
         key_points = result_state.get("key_points", []) or []
         concept_tags = result_state.get("concept_tags", []) or [d["term"] for d in definitions if "term" in d]
 
-        first_timestamp = float(entries[0].get("timestamp_epoch", 0.0))
+        first_timestamp = self.section_start_timestamp(entries)
         last_timestamp = float(entries[-1].get("timestamp_epoch", first_timestamp))
         start_time_str = self.session_clock.format_epoch_as_elapsed(first_timestamp)
         end_time_str = self.session_clock.format_epoch_as_elapsed(last_timestamp)
