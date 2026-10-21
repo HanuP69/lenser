@@ -114,7 +114,9 @@ END $$;
 """
 
 CREATE_VECTOR_EXTENSION_SQL = "CREATE EXTENSION IF NOT EXISTS vector;"
-ADD_VECTOR_COLUMN_SQL = "ALTER TABLE embeddings ADD COLUMN IF NOT EXISTS embedding vector(768);"
+# The vector column is created with the dimension that init_schema is given,
+# so there is no fixed width here. The old constant hardcoded vector(768)
+# and was never executed.
 
 # The sentinel used for concepts that were captured without a course. The
 # write and the read path have to agree on it.

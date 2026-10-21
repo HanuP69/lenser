@@ -3,11 +3,15 @@ import os
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from lecturelens.core.agent_runtime import set_flag
 
 logger = logging.getLogger(__name__)
+
+# A shutdown phase waits as long as the agent keeps producing output. This is
+# how long it may stall without any progress before the wait gives up.
+PROGRESS_STALL_SECONDS: float = 45.0
 
 
 class AgentProcessManager:
@@ -150,13 +154,27 @@ class AgentProcessManager:
                 restarted_agents.append(agent_name)
         return restarted_agents
 
-    def wait_for_exit(self, agent_names: list[str], timeout_seconds: Optional[float] = None) -> bool:
+    def wait_for_exit(
+        self,
+        agent_names: list[str],
+        timeout_seconds: Optional[float] = None,
+        progress_probe: Optional[Callable[[], bool]] = None,
+        progress_timeout_seconds: Optional[float] = None
+    ) -> bool:
+        """Wait for the agents to exit.
+
+        The wait continues while the agent still makes progress, so a large
+        backlog is flushed instead of being killed at a fixed deadline. The
+        overall timeout still applies as a hard limit.
+        """
         deadline = (
             time.monotonic() + timeout_seconds
             if (timeout_seconds is not None and timeout_seconds > 0)
             else None
         )
-        while deadline is None or time.monotonic() < deadline:
+        last_progress = time.monotonic()
+        last_state: Any = None
+        while True:
             all_exited = True
             for agent_name in agent_names:
                 process = self.processes.get(agent_name)
@@ -165,8 +183,84 @@ class AgentProcessManager:
                     break
             if all_exited:
                 return True
+            if progress_probe is not None:
+                state = progress_probe()
+                if state != last_state:
+                    last_state = state
+                    last_progress = time.monotonic()
+                elif (
+                    progress_timeout_seconds is not None
+                    and progress_timeout_seconds > 0
+                    and (time.monotonic() - last_progress) >= progress_timeout_seconds
+                ):
+                    # The agent stopped making progress, so waiting longer
+                    # will not help.
+                    return False
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
             time.sleep(0.2)
-        return False
+
+    def run_shutdown_sequence(
+        self,
+        session_dir: Path,
+        phases: list[tuple[list[str], str, Optional[float]]]
+    ) -> dict[str, bool]:
+        self.shutting_down = True
+        outcomes: dict[str, bool] = {}
+        for agent_names, flag_name, timeout_seconds in phases:
+            running_names: list[str] = []
+            for agent_name in agent_names:
+                if agent_name in self.processes:
+                    running_names.append(agent_name)
+            if len(running_names) == 0:
+                continue
+            set_flag(session_dir, flag_name)
+            exited_cleanly = self.wait_for_exit(
+                running_names,
+                timeout_seconds,
+                progress_probe=self._phase_progress_probe(session_dir),
+                progress_timeout_seconds=PROGRESS_STALL_SECONDS,
+            )
+            for agent_name in running_names:
+                process = self.processes[agent_name]
+                clean = process.poll() is not None
+                outcomes[agent_name] = clean
+                if not clean and (timeout_seconds is not None and timeout_seconds > 0):
+                    logger.warning("agent %s ignored stop flag, terminating", agent_name)
+                    self.terminate_agent(agent_name)
+            if not exited_cleanly and (timeout_seconds is not None and timeout_seconds > 0):
+                logger.warning(
+                    "phase %s did not finish within %.0fs; the remaining work of the "
+                    "agents was discarded", flag_name, timeout_seconds
+                )
+        for agent_name in list(self.processes.keys()):
+            self.close_log_handle(agent_name)
+        return outcomes
+
+    @staticmethod
+    def _phase_progress_probe(session_dir: Path) -> Callable[[], Any]:
+        """Report whether the session output is still growing.
+
+        A phase that keeps producing output is making progress, so the
+        shutdown waits for it instead of killing it at a fixed deadline.
+        """
+        watched = [
+            session_dir / "timeline.jsonl",
+            session_dir / "notes.md",
+            session_dir / "context.json",
+        ]
+
+        def probe() -> Any:
+            total = 0
+            for path in watched:
+                try:
+                    if path.exists():
+                        total += path.stat().st_size
+                except OSError:
+                    continue
+            return total
+
+        return probe
 
     def terminate_agent(self, agent_name: str, grace_seconds: float = 3.0) -> None:
         process = self.processes.get(agent_name)
@@ -195,35 +289,6 @@ class AgentProcessManager:
         self.shutting_down = True
         for agent_name in list(self.processes.keys()):
             self.stop_agent(agent_name)
-
-    def run_shutdown_sequence(
-        self,
-        session_dir: Path,
-        phases: list[tuple[list[str], str, Optional[float]]]
-    ) -> dict[str, bool]:
-        self.shutting_down = True
-        outcomes: dict[str, bool] = {}
-        for agent_names, flag_name, timeout_seconds in phases:
-            running_names: list[str] = []
-            for agent_name in agent_names:
-                if agent_name in self.processes:
-                    running_names.append(agent_name)
-            if len(running_names) == 0:
-                continue
-            set_flag(session_dir, flag_name)
-            exited_cleanly = self.wait_for_exit(running_names, timeout_seconds)
-            for agent_name in running_names:
-                process = self.processes[agent_name]
-                clean = process.poll() is not None
-                outcomes[agent_name] = clean
-                if not clean and (timeout_seconds is not None and timeout_seconds > 0):
-                    logger.warning("agent %s ignored stop flag, terminating", agent_name)
-                    self.terminate_agent(agent_name)
-            if not exited_cleanly and (timeout_seconds is not None and timeout_seconds > 0):
-                logger.warning("phase %s timed out", flag_name)
-        for agent_name in list(self.processes.keys()):
-            self.close_log_handle(agent_name)
-        return outcomes
 
 
 AgentMonitor = AgentProcessManager

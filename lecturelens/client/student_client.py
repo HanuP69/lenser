@@ -8,7 +8,7 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from lecturelens.config.settings import Settings
 from lecturelens.router.messages import HumanMessage, response_to_text
@@ -45,6 +45,25 @@ KEY_POINT_STOPWORDS = frozenset({
     "each", "some", "such", "also", "only", "over", "under", "about", "have",
     "will", "would", "could", "should", "because", "these", "those", "very",
 })
+
+
+def highest_contiguous_sequence(applied: Sequence[int]) -> int:
+    """The highest sequence number with no gap below it.
+
+    The ledger can be missing a sequence in the middle, for example when a
+    note write failed. The cursor must stop at the gap, otherwise the missing
+    segments are skipped and never written to the notes.
+    """
+    if not applied:
+        return 0
+    ordered = sorted(set(applied))
+    contiguous = ordered[0]
+    for value in ordered[1:]:
+        if value == contiguous + 1:
+            contiguous = value
+        elif value > contiguous + 1:
+            break
+    return contiguous
 
 
 class PersonalizationEngine:
@@ -360,6 +379,7 @@ class StudentClient:
                 pass
 
         ledger_max: Optional[int] = None
+        ledger_contiguous: Optional[int] = None
         if hasattr(self, "ledger_file") and self.ledger_file.exists():
             conn = None
             try:
@@ -371,6 +391,9 @@ class StudentClient:
                     ledger_max = int(row[0])
                 else:
                     ledger_max = 0
+                cur.execute("SELECT sequence_number FROM applied_segments ORDER BY sequence_number ASC;")
+                applied = [int(item[0]) for item in cur.fetchall()]
+                ledger_contiguous = highest_contiguous_sequence(applied)
             except Exception as err:
                 logger.error("reading student ledger failed, marking unverified: %s", err)
                 self.pending_reconciliation = True
@@ -383,8 +406,8 @@ class StudentClient:
                         pass
 
         if getattr(self, "pending_reconciliation", False):
-            if ledger_max is not None:
-                return min(persisted, ledger_max)
+            if ledger_contiguous is not None:
+                return min(persisted, ledger_contiguous)
             return 0
 
         if getattr(self, "_ledger_was_new", False) and (ledger_max is None or ledger_max == 0):
@@ -396,8 +419,12 @@ class StudentClient:
                 self.pending_reconciliation = True
                 return 0
 
-        if ledger_max is not None:
-            return max(persisted, ledger_max)
+        if ledger_contiguous is not None:
+            # The ledger is the record of what was actually written to the
+            # notes. Taking max(persisted, ledger_max) skipped every
+            # sequence that was received but not persisted, so those notes
+            # were never written.
+            return ledger_contiguous
         return persisted
 
     def save_persisted_sequence(self) -> None:

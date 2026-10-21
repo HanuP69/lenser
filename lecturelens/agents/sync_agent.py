@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from lecturelens.config.defaults import SYNC_CONSUMER_GROUP
+from lecturelens.config.defaults import SYNC_CONSUMER_GROUP, SYNC_CONSUMER_PREFIX
 from lecturelens.config.settings import Settings
 from lecturelens.core.agent_runtime import (
     AgentControl,
@@ -76,6 +76,9 @@ class SyncAgent:
         self.pending_buffer: list[BufferedEntry] = []
         self.pending_message_ids: set[tuple[str, str]] = set()
         self.written_fingerprints: set[str] = set()
+        # Tracks how far each entry made it into the two sinks, so a failure
+        # in one of them does not make the other one run twice.
+        self.flush_states: dict[str, str] = {}
         self.written_event_ids: set[str] = set()
         self.fingerprint_order: deque = deque()
         self.event_id_order: deque = deque()
@@ -235,7 +238,7 @@ class SyncAgent:
         await self.redis_bus.consume(
             stream_name=stream_name,
             group_name=SYNC_CONSUMER_GROUP,
-            consumer_name=f"consumer:kuudere:{source_type}",
+            consumer_name=f"{SYNC_CONSUMER_PREFIX}:{source_type}",
             handler=handle_message,
             batch_size=self.settings.redis_consumer_batch_size,
             block_ms=self.settings.redis_consumer_block_ms,
@@ -289,22 +292,25 @@ class SyncAgent:
                 return active
         return self.find_nearest_anchor(timestamp_epoch, window_seconds)
 
-    def find_cross_type_anchor(
-        self,
-        timestamp_epoch: float,
-        source_type: str,
+    @staticmethod
+    def find_nearest_entry_of_other_type(
+        entry: TimelineEntry,
+        ordered_entries: list[TimelineEntry],
         window_seconds: float
-    ) -> Optional[AnchorRecord]:
-        best_record: Optional[AnchorRecord] = None
+    ) -> Optional[TimelineEntry]:
+        """Find the closest entry that comes from a different source type."""
+        best_entry: Optional[TimelineEntry] = None
         best_distance = window_seconds + 1.0
-        for record in self.recent_anchors:
-            if record.source_type == source_type:
+        for candidate in ordered_entries:
+            if candidate is entry:
                 continue
-            distance = abs(record.timestamp_epoch - timestamp_epoch)
+            if candidate.source_type == entry.source_type:
+                continue
+            distance = abs(candidate.timestamp_epoch - entry.timestamp_epoch)
             if distance <= window_seconds and distance < best_distance:
                 best_distance = distance
-                best_record = record
-        return best_record
+                best_entry = candidate
+        return best_entry
 
     def prune_anchor_history(self, newest_timestamp: float, window_seconds: float) -> None:
         horizon = max(60.0, window_seconds * 6.0, self.settings.correlation_active_seconds)
@@ -316,21 +322,28 @@ class SyncAgent:
 
     def assign_correlation_ids(self, ordered_entries: list[TimelineEntry]) -> None:
         window_seconds = self.settings.correlation_window_seconds
-        known_ids: set[str] = set()
-        for record in self.recent_anchors:
-            known_ids.add(record.correlation_id)
+
+        # A slide is linked to the closest transcript of the same batch. The
+        # slide used to look for a cross type anchor in recent_anchors, but
+        # that list only ever holds slides and the lookup skips entries of
+        # the same type, so it could never return anything and every slide
+        # got a fresh uuid. The link only existed in one direction.
+        for entry in ordered_entries:
+            if entry.source_type not in ANCHOR_SOURCE_TYPES:
+                continue
+            if entry.correlation_id is not None:
+                continue
+            neighbour = self.find_nearest_entry_of_other_type(entry, ordered_entries, window_seconds)
+            if neighbour is not None:
+                if neighbour.correlation_id is None:
+                    neighbour.correlation_id = str(uuid.uuid4())
+                entry.correlation_id = neighbour.correlation_id
 
         for entry in ordered_entries:
             if entry.source_type not in ANCHOR_SOURCE_TYPES:
                 continue
             if entry.correlation_id is None:
-                neighbor = self.find_cross_type_anchor(
-                    entry.timestamp_epoch, entry.source_type, window_seconds
-                )
-                if neighbor is not None:
-                    entry.correlation_id = neighbor.correlation_id
-                else:
-                    entry.correlation_id = str(uuid.uuid4())
+                entry.correlation_id = str(uuid.uuid4())
             already_recorded = False
             for record in self.recent_anchors:
                 if (
@@ -391,30 +404,65 @@ class SyncAgent:
             for buffered in ready:
                 ordered_entries.append(buffered.entry)
             self.assign_correlation_ids(ordered_entries)
-            text_block = self.render_lines(ordered_entries)
+
+            # Each entry is tracked separately for the two sinks. The local
+            # file and the Redis stream used to be written in one step, so a
+            # failure in the second sink made the first one run again and
+            # duplicate the timeline.
+            fingerprints = [entry_fingerprint(buffered.entry) for buffered in ready]
+            needs_file: list[BufferedEntry] = []
+            needs_redis: list[BufferedEntry] = []
+            for buffered, fingerprint in zip(ready, fingerprints):
+                state = self.flush_states.get(fingerprint, "")
+                if state not in ("file", "both"):
+                    needs_file.append(buffered)
+                if state not in ("redis", "both"):
+                    needs_redis.append(buffered)
+
             timeline_stream = f"lecturelens:{self.session_id}:stream:timeline"
-            try:
-                for entry in ordered_entries:
-                    await self.redis_bus.publish_resilient(timeline_stream, entry)
-            except Exception as pub_error:
-                logger.error("publishing timeline entry failed, keeping buffer unacknowledged: %s", pub_error)
-                return 0
 
-            try:
-                await run_in_thread_pool(append_text_durably, self.timeline_path, text_block)
-            except OSError as error:
-                logger.error("timeline write failed, entries kept in buffer: %s", error)
-                return 0
+            # The durable local sink is written first, so a Redis failure
+            # cannot make the same entries be published twice.
+            if len(needs_file) > 0:
+                file_block = self.render_lines([buffered.entry for buffered in needs_file])
+                try:
+                    await run_in_thread_pool(append_text_durably, self.timeline_path, file_block)
+                except OSError as error:
+                    logger.error("timeline write failed, entries kept in buffer: %s", error)
+                    return 0
+                for buffered in needs_file:
+                    fingerprint = entry_fingerprint(buffered.entry)
+                    previous = self.flush_states.get(fingerprint, "")
+                    self.flush_states[fingerprint] = "both" if previous == "redis" else "file"
 
-            for buffered in ready:
-                self.remember_fingerprint(entry_fingerprint(buffered.entry))
+            if len(needs_redis) > 0:
+                try:
+                    for buffered in needs_redis:
+                        await self.redis_bus.publish_resilient(timeline_stream, buffered.entry)
+                except Exception as pub_error:
+                    logger.error("publishing timeline entry failed, keeping buffer unacknowledged: %s", pub_error)
+                    return 0
+                for buffered in needs_redis:
+                    fingerprint = entry_fingerprint(buffered.entry)
+                    previous = self.flush_states.get(fingerprint, "")
+                    self.flush_states[fingerprint] = "both" if previous == "file" else "redis"
+
+            flushed: list[BufferedEntry] = []
+            for buffered, fingerprint in zip(ready, fingerprints):
+                if self.flush_states.get(fingerprint) != "both":
+                    # Only one of the two sinks accepted the entry, so it
+                    # stays in the buffer and is retried for the missing sink.
+                    continue
+                flushed.append(buffered)
+                self.remember_fingerprint(fingerprint)
+                self.flush_states.pop(fingerprint, None)
                 if buffered.entry.event_id:
                     self.remember_event_id(buffered.entry.event_id)
                 if buffered.message_id is not None:
                     self.pending_message_ids.discard((buffered.stream_name or "", buffered.message_id))
                 await self.acknowledge(buffered.stream_name, buffered.group_name, buffered.message_id)
-            self.remove_flushed_entries(ready)
-            self.entries_written += len(ordered_entries)
+            self.remove_flushed_entries(flushed)
+            self.entries_written += len(flushed)
             self.control.set_stat("timeline_entries_written", self.entries_written)
             self.control.set_stat("buffered_entries", len(self.pending_buffer))
             return len(ordered_entries)

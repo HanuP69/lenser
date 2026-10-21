@@ -375,12 +375,18 @@ def run_shutdown(monitor: AgentMonitor, session_dir: Path, planned_agents: list[
             capture_names.append(name)
     phases: list[tuple[list[str], str, Optional[float]]] = [
         (capture_names, STOP_FLAG_NAME, 30.0),
-        (["sync_agent"], SYNC_STOP_FLAG_NAME, 30.0),
-        (["structuring_agent"], FINALIZE_FLAG_NAME, 120.0),
-        (["persister"], PERSISTER_STOP_FLAG_NAME, 10.0)
+        (["sync_agent"], SYNC_STOP_FLAG_NAME, 60.0),
+        (["structuring_agent"], FINALIZE_FLAG_NAME, 300.0),
+        (["persister"], PERSISTER_STOP_FLAG_NAME, 30.0)
     ]
     with console.status("[bold cyan]Stopping agents, flushing timeline, and generating final notes with LLM...[/bold cyan]", spinner="dots"):
-        monitor.run_shutdown_sequence(session_dir, phases)
+        outcomes = monitor.run_shutdown_sequence(session_dir, phases)
+    unfinished = [name for name, clean in outcomes.items() if not clean]
+    if unfinished:
+        console.print(
+            "[yellow]These agents did not finish in time and their remaining work was "
+            f"discarded: {', '.join(sorted(unfinished))}[/yellow]"
+        )
     clock_path = session_dir / "clock.json"
     if clock_path.exists():
         try:
@@ -619,10 +625,12 @@ def export(
 @app.command()
 def reprocess(
     session: str = typer.Option(..., "--session"),
-    llm_mode: str = typer.Option("local", "--llm-mode"),
+    llm_mode: Optional[str] = typer.Option(None, "--llm-mode"),
 ) -> None:
     settings = Settings()
-    settings.llm_mode = llm_mode
+    # The option default used to be exported unconditionally, so the value
+    # configured in .env was always overridden.
+    settings.llm_mode = llm_mode if llm_mode is not None else settings.llm_mode
     if not is_valid_session_id(session):
         fail(f"Invalid session name: {session}")
     session_dir = ensure_session_exists(settings, session)
@@ -686,11 +694,11 @@ def reprocess(
 def ask(
     question: str = typer.Argument(...),
     session: Optional[str] = typer.Option(None, "--session"),
-    llm_mode: str = typer.Option("local", "--llm-mode"),
+    llm_mode: Optional[str] = typer.Option(None, "--llm-mode"),
     student_id: Optional[str] = typer.Option(None, "--student-id", help="Student ID for personalized tutoring and misconception tracking"),
 ) -> None:
     settings = Settings()
-    settings.llm_mode = llm_mode
+    settings.llm_mode = llm_mode if llm_mode is not None else settings.llm_mode
     session_id = resolve_session(settings, session)
     session_dir = ensure_session_exists(settings, session_id)
 
@@ -959,16 +967,21 @@ def client(
     session: str = typer.Option(..., "--session"),
     server: Optional[str] = typer.Option(None, "--server", help="WebSocket URL of lecture gateway"),
     api_key: Optional[str] = typer.Option(None, "--api-key", envvar="LECTURELENS_GATEWAY_API_KEY"),
-    audio_source: str = typer.Option("mic", "--audio-source"),
+    audio_source: Optional[str] = typer.Option(None, "--audio-source"),
     no_screen: bool = typer.Option(False, "--no-screen"),
     audio_only: bool = typer.Option(False, "--audio-only"),
-    monitor_index: int = typer.Option(1, "--monitor"),
+    monitor_index: Optional[int] = typer.Option(None, "--monitor"),
 ) -> None:
+    settings = Settings()
+    # The option defaults used to be exported unconditionally, so the values
+    # configured in .env were always overridden.
+    resolved_audio_source = audio_source if audio_source is not None else settings.audio_source
+    resolved_monitor_index = monitor_index if monitor_index is not None else settings.monitor_index
     try:
-        validate_start_options(audio_source, "local", "local")
+        validate_start_options(resolved_audio_source, "local", "local")
     except ValueError as error:
         fail(str(error))
-    if audio_source == "system":
+    if resolved_audio_source == "system":
         from lecturelens.agents.audio_agent import find_loopback_microphone
         _, loopback_err = find_loopback_microphone()
         if loopback_err:
@@ -977,9 +990,8 @@ def client(
         fail(f"Invalid session name: {session}")
     from lecturelens.client.remote_client import run_remote_client
 
-    settings = Settings()
-    settings.audio_source = audio_source
-    settings.monitor_index = monitor_index
+    settings.audio_source = resolved_audio_source
+    settings.monitor_index = resolved_monitor_index
     client_host = "127.0.0.1" if settings.gateway_host in ("0.0.0.0", "::") else settings.gateway_host
     resolved_server = server or f"ws://{client_host}:{settings.gateway_port}"
     if not api_key:

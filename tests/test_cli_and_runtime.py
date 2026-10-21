@@ -279,6 +279,25 @@ class TestCliCommands(unittest.TestCase):
         with self.assertRaises(typer.Exit):
             cli_main.stop(session="lec1", wait=True, timeout_seconds=0.3)
 
+    def test_cli_options_fall_back_to_the_configured_settings(self) -> None:
+        """The option defaults were exported unconditionally, so the values
+        configured in .env were always overridden."""
+        import inspect
+
+        for command_name in ("client", "ask", "reprocess", "start"):
+            command = getattr(cli_main, command_name)
+            signature = inspect.signature(command)
+            for parameter_name, parameter in signature.parameters.items():
+                if parameter_name not in ("audio_source", "monitor_index", "llm_mode"):
+                    continue
+                default = parameter.default
+                option_default = getattr(default, "default", None)
+                self.assertIsNone(
+                    option_default,
+                    f"{command_name} --{parameter_name} must default to None so the "
+                    "configured settings are used"
+                )
+
     def test_stop_rejects_non_positive_timeout(self) -> None:
         """A non-positive timeout used to disable the deadline and hang forever."""
         with self.assertRaises(typer.Exit):

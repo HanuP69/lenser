@@ -237,6 +237,28 @@ class TestSyncEndToEnd(SyncTestBase):
         for suffix in ("transcript", "slide"):
             await self.bus.client.delete(f"lecturelens:{session}:stream:{suffix}")
 
+    async def test_a_slide_shares_the_correlation_id_of_a_nearby_transcript(self) -> None:
+        """A slide used to look for a cross type anchor in a list that only
+        ever holds slides, so it always got a fresh uuid and the link between
+        a slide and the speech next to it only existed in one direction."""
+        agent = SyncAgent(self.settings, self.bus, SessionClock(), "test_sync_correlation_session")
+        entries = [
+            entry(100.0, "transcript", "as you can see on this slide"),
+            entry(101.0, "slide", "Binary Search O(log n)")
+        ]
+        agent.assign_correlation_ids(entries)
+        self.assertIsNotNone(entries[0].correlation_id)
+        self.assertEqual(entries[0].correlation_id, entries[1].correlation_id)
+
+    async def test_a_distant_slide_gets_its_own_correlation_id(self) -> None:
+        agent = SyncAgent(self.settings, self.bus, SessionClock(), "test_sync_correlation_far_session")
+        entries = [
+            entry(100.0, "transcript", "as you can see on this slide"),
+            entry(400.0, "slide", "A completely different slide")
+        ]
+        agent.assign_correlation_ids(entries)
+        self.assertNotEqual(entries[0].correlation_id, entries[1].correlation_id)
+
     async def test_flush_ready_entries_retains_buffer_when_publish_fails(self) -> None:
         agent = SyncAgent(self.settings, self.bus, SessionClock(), "test_sync_fail_session")
         ent = entry(100.0, "transcript", "test fail")
@@ -256,7 +278,22 @@ class TestSyncEndToEnd(SyncTestBase):
         self.assertEqual(flushed, 0)
         self.assertEqual(len(agent.pending_buffer), 1)
         self.assertFalse(agent.acknowledge.called)
-        self.assertFalse(agent.timeline_path.exists())
+
+        # The durable local sink is written first, so the entry is already in
+        # timeline.jsonl. The retry must not write it a second time.
+        self.assertTrue(agent.timeline_path.exists())
+        first_pass_lines = agent.timeline_path.read_text(encoding="utf-8").splitlines()
+
+        agent.redis_bus.publish_resilient = mock.AsyncMock(return_value="1-0")
+        flushed = await agent.flush_ready_entries(force=True)
+        self.assertEqual(flushed, 1)
+        self.assertEqual(len(agent.pending_buffer), 0)
+
+        # The file still holds exactly one line: the retry published to
+        # Redis but did not append to the file again.
+        second_pass_lines = agent.timeline_path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(first_pass_lines, second_pass_lines)
+        self.assertEqual(len(second_pass_lines), 1)
 
     async def test_sync_agent_deduplicates_redelivered_event_id(self) -> None:
         agent = SyncAgent(self.settings, self.bus, SessionClock(), "test_sync_dedup_session")

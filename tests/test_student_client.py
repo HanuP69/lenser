@@ -497,7 +497,10 @@ class TestStudentClient(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(client.pending_reconciliation)
         self.assertEqual(client.load_persisted_sequence(), 0)
 
-    async def test_load_persisted_sequence_bounds_stale_state_file_by_ledger_max_when_pending(self) -> None:
+    async def test_load_persisted_sequence_stops_at_a_gap_in_the_ledger(self) -> None:
+        """The ledger has 1, 2 and 95 but nothing in between. The cursor used
+        to be max(persisted, ledger_max), so sequences 3 to 94 were treated
+        as applied and were never written to the notes."""
         profile = StudentProfile(student_id="student_stale_state", preferred_language="English")
         client = StudentClient("ws://localhost:8765", "lec_stale_state", profile, self.output_dir)
 
@@ -513,10 +516,30 @@ class TestStudentClient(unittest.IsolatedAsyncioTestCase):
         conn.close()
 
         client.pending_reconciliation = True
-        self.assertEqual(client.load_persisted_sequence(), 95)
+        # The cursor stops at the gap, so the missing segments are requested
+        # again instead of being skipped.
+        self.assertEqual(client.load_persisted_sequence(), 2)
 
         client.pending_reconciliation = False
-        self.assertEqual(client.load_persisted_sequence(), 100)
+        self.assertEqual(client.load_persisted_sequence(), 2)
+
+    async def test_load_persisted_sequence_uses_the_ledger_when_it_is_ahead(self) -> None:
+        profile = StudentProfile(student_id="student_ledger_ahead", preferred_language="English")
+        client = StudentClient("ws://localhost:8765", "lec_ledger_ahead", profile, self.output_dir)
+
+        client.state_file.write_text(json.dumps({"last_sequence_number": 3}), encoding="utf-8")
+
+        conn = sqlite3.connect(str(client.ledger_file))
+        for seq in [4, 5, 6]:
+            conn.execute(
+                "INSERT INTO applied_segments (sequence_number, session_id, heading, content, created_at) VALUES (?, ?, ?, ?, ?)",
+                (seq, "lec_ledger_ahead", f"Head {seq}", f"Content {seq}", 1700000000.0)
+            )
+        conn.commit()
+        conn.close()
+
+        # The ledger is the record of what was written, so it wins.
+        self.assertEqual(client.load_persisted_sequence(), 6)
 
     async def test_reconcile_notes_from_ledger_cleans_empty_ledger_with_zero_cursor(self) -> None:
         profile = StudentProfile(student_id="student_empty_state", preferred_language="English")
