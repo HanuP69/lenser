@@ -166,7 +166,7 @@ async def main() -> None:
     session_id = namespace.session or settings.session_name or "default_session"
     session_dir = settings.get_session_output_dir(session_id)
     redis_bus = create_redis_bus(settings, component_name="persister")
-    storage = PostgresStorage(settings.postgres_url, query_limit=getattr(settings, "postgres_query_limit", 1000))
+    storage = PostgresStorage(settings.postgres_url, query_limit=settings.postgres_query_limit)
     try:
         await storage.init_schema()
     except Exception as pg_err:

@@ -159,16 +159,16 @@ def create_redis_bus(
         resolved_outbox = settings.output_dir / f"redis_outbox_{comp}.db"
     return RedisBus(
         settings.redis_url,
-        stream_max_length=getattr(settings, "stream_max_length", 200000),
-        max_delivery_attempts=getattr(settings, "redis_max_delivery_attempts", 5),
-        reclaim_idle_ms=getattr(settings, "reclaim_idle_ms", 30000),
-        reclaim_interval_seconds=getattr(settings, "redis_reclaim_interval_seconds", 15.0),
-        retry_ttl_seconds=getattr(settings, "retry_key_ttl_seconds", getattr(settings, "redis_retry_ttl_seconds", 86400)),
-        outbox_max_size=getattr(settings, "redis_outbox_max_size", getattr(settings, "outbox_max_size", 1000)),
+        stream_max_length=settings.stream_max_length,
+        max_delivery_attempts=settings.redis_max_delivery_attempts,
+        reclaim_idle_ms=settings.reclaim_idle_ms,
+        reclaim_interval_seconds=settings.redis_reclaim_interval_seconds,
+        retry_ttl_seconds=settings.retry_key_ttl_seconds,
+        outbox_max_size=settings.redis_outbox_max_size,
         outbox_path=resolved_outbox,
-        backlog_drain_budget_seconds=getattr(settings, "redis_backlog_drain_budget_seconds", 60.0),
-        socket_connect_timeout=getattr(settings, "redis_socket_connect_timeout_seconds", 5.0),
-        socket_timeout=getattr(settings, "redis_socket_timeout_seconds", 30.0)
+        backlog_drain_budget_seconds=settings.redis_backlog_drain_budget_seconds,
+        socket_connect_timeout=settings.redis_socket_connect_timeout_seconds,
+        socket_timeout=settings.redis_socket_timeout_seconds
     )
 
 
@@ -176,7 +176,7 @@ def create_postgres_storage(settings: Settings) -> Any:
     from lecturelens.storage.postgres import PostgresStorage
     return PostgresStorage(
         settings.postgres_url,
-        query_limit=getattr(settings, "postgres_query_limit", 1000)
+        query_limit=settings.postgres_query_limit
     )
 
 
@@ -250,7 +250,7 @@ def configure_agent_pools(settings: Settings) -> None:
     again on its first transcription.
     """
     configure_pools(settings.thread_pool_max_workers, settings.process_pool_max_workers)
-    if not getattr(settings, "whisper_preload_in_every_worker", True):
+    if not settings.whisper_preload_in_every_worker:
         return
     try:
         from lecturelens.agents.audio_agent import preload_whisper_model

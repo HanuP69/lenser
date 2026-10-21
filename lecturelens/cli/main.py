@@ -30,7 +30,6 @@ from lecturelens.cli.helpers import (
     validate_export_format,
     validate_start_options
 )
-from lecturelens.config.defaults import SYNC_CONSUMER_GROUP
 from lecturelens.config.settings import Settings
 from lecturelens.core import session_meta
 from lecturelens.core.validation import sanitize_file_stem
@@ -148,38 +147,40 @@ def build_agent_environment(
         environment["LECTURELENS_COURSE_NAME"] = course
     if settings.postgres_url:
         environment["LECTURELENS_POSTGRES_URL"] = settings.postgres_url
-    if getattr(settings, "redis_url", None):
+    if settings.redis_url:
         environment["LECTURELENS_REDIS_URL"] = str(settings.redis_url)
-    if getattr(settings, "ollama_url", None):
+    if settings.ollama_url:
         environment["LECTURELENS_OLLAMA_URL"] = str(settings.ollama_url)
-    if getattr(settings, "enable_drift_filter", None) is not None:
-        environment["LECTURELENS_ENABLE_DRIFT_FILTER"] = str(settings.enable_drift_filter).lower()
-    if getattr(settings, "drift_similarity_threshold", None) is not None:
-        environment["LECTURELENS_DRIFT_SIMILARITY_THRESHOLD"] = str(settings.drift_similarity_threshold)
-        environment["LECTURELENS_DRIFT_THRESHOLD"] = str(settings.drift_similarity_threshold)
-    if getattr(settings, "local_model", None):
+    environment["LECTURELENS_ENABLE_DRIFT_FILTER"] = str(settings.enable_drift_filter).lower()
+    environment["LECTURELENS_DRIFT_SIMILARITY_THRESHOLD"] = str(settings.drift_similarity_threshold)
+    environment["LECTURELENS_DRIFT_THRESHOLD"] = str(settings.drift_similarity_threshold)
+    if settings.local_model:
         environment["LECTURELENS_LOCAL_MODEL"] = str(settings.local_model)
-    if getattr(settings, "ollama_model", None):
+    if settings.whisper_hallucination_phrases:
+        environment["LECTURELENS_WHISPER_HALLUCINATION_PHRASES"] = ",".join(
+            settings.whisper_hallucination_phrases
+        )
+    if settings.ollama_model:
         environment["LECTURELENS_OLLAMA_MODEL"] = str(settings.ollama_model)
-    if getattr(settings, "primary_provider", None):
+    if settings.primary_provider:
         environment["LECTURELENS_PRIMARY_PROVIDER"] = str(settings.primary_provider)
-    if getattr(settings, "unorouter_model", None):
+    if settings.unorouter_model:
         environment["LECTURELENS_UNOROUTER_MODEL"] = str(settings.unorouter_model)
-    if getattr(settings, "unorouter_api_key", None):
+    if settings.unorouter_api_key:
         environment["LECTURELENS_UNOROUTER_API_KEY"] = str(settings.unorouter_api_key)
-    if getattr(settings, "unorouter_api_keys", None):
+    if settings.unorouter_api_keys:
         environment["LECTURELENS_UNOROUTER_API_KEYS"] = str(settings.unorouter_api_keys)
-    if getattr(settings, "google_api_key", None):
+    if settings.google_api_key:
         environment["LECTURELENS_GOOGLE_API_KEY"] = str(settings.google_api_key)
-    if getattr(settings, "google_api_keys", None):
+    if settings.google_api_keys:
         environment["LECTURELENS_GOOGLE_API_KEYS"] = str(settings.google_api_keys)
-    if getattr(settings, "gemini_api_key", None):
+    if settings.gemini_api_key:
         environment["LECTURELENS_GEMINI_API_KEY"] = str(settings.gemini_api_key)
-    if getattr(settings, "gemini_api_keys", None):
+    if settings.gemini_api_keys:
         environment["LECTURELENS_GEMINI_API_KEYS"] = str(settings.gemini_api_keys)
-    if getattr(settings, "openrouter_api_key", None):
+    if settings.openrouter_api_key:
         environment["LECTURELENS_OPENROUTER_API_KEY"] = str(settings.openrouter_api_key)
-    if getattr(settings, "openrouter_api_keys", None):
+    if settings.openrouter_api_keys:
         environment["LECTURELENS_OPENROUTER_API_KEYS"] = str(settings.openrouter_api_keys)
     # The credentials may also come straight from the environment. The
     # Settings object only reads the LECTURELENS_ prefixed names, so the
@@ -223,7 +224,7 @@ def module_for_agent(agent_name: str) -> str:
 
 async def render_stream_backlogs(bus: RedisBus, session_id: str) -> dict[str, int]:
     backlogs: dict[str, int] = {}
-    consumer_group = getattr(Settings(), "sync_consumer_group", SYNC_CONSUMER_GROUP)
+    consumer_group = Settings().sync_consumer_group
     for source_type in ("transcript", "slide"):
         stream_name = f"lecturelens:{session_id}:stream:{source_type}"
         backlogs[source_type] = await bus.get_group_backlog(stream_name, consumer_group)

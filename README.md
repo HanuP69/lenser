@@ -12,7 +12,7 @@
 4. [Redis vs. Postgres: Durability & Replay](#redis-vs-postgres-durability--replay)
 5. [Thin Student Client & Personalization Engine](#thin-student-client--personalization-engine)
 6. [Student Knowledge Graph (`student_graph.db`)](#student-knowledge-graph-student_graphdb)
-7. [Automated Test Suite (412 Tests)](#automated-test-suite-412-tests)
+7. [Automated Test Suite (415 Tests)](#automated-test-suite-415-tests)
 8. [CLI Command Reference](#cli-command-reference)
 9. [Configuration & Environment Variables](#configuration--environment-variables)
 10. [Docker Compose & Getting Started](#docker-compose--getting-started)
@@ -223,15 +223,15 @@ Each student maintains an isolated, private SQLite database (`student_graph.db`)
 
 ---
 
-## Automated Test Suite (412 Tests)
+## Automated Test Suite (415 Tests)
 
-LectureLens maintains an automated test suite of **412 unit and integration tests** verifying concurrency, resilience, audio processing, screen capture, Postgres persistence, gateway fan-out, client personalization, and knowledge graphs:
+LectureLens maintains an automated test suite of **415 unit and integration tests** verifying concurrency, resilience, audio processing, screen capture, Postgres persistence, gateway fan-out, client personalization, and knowledge graphs:
 
 ```
-================= 410 passed, 2 skipped in 62.21s =================
+================= 412 passed, 3 skipped in 64.52s =================
 ```
 
-The two skipped tests are the failure injection tests. They need a live Redis
+The three skipped tests are the failure injection tests. They need a live Redis
 and are only run when it is configured:
 
 ```bash
@@ -250,7 +250,7 @@ LECTURELENS_INTEGRATION_REDIS=redis://127.0.0.1:6379 pytest tests/test_integrati
 | `test_redis_bus.py` | **23 tests** | Redis Streams resilient publishing, consumer group acknowledgements, delivery retry discarding with Redis persistence, backlog drain budget. |
 | `test_importance.py` | **21 tests** | Verbal cue classification across English, Hindi, and Hinglish ("definition", "exam_relevant", "dhyaan do"), plus protection of lecture content against the ad heuristics. |
 | `test_drift_filter.py` | **21 tests** | Context drift detection, sustained topic shifts, refusal handling, retry idempotency, corroborated ad/drift flags, quarantine. |
-| `test_audio_agent.py` | **20 tests** | RMS VAD energy gating, speech segmentation, audio mixing, faster-whisper chunking, dropped block timestamp compensation. |
+| `test_audio_agent.py` | **22 tests** | RMS VAD energy gating, speech segmentation, audio mixing, faster-whisper chunking, dropped block timestamp compensation, per language hallucination filtering. |
 | `test_postgres_persister.py` | **20 tests** | Idempotent timeline events, general note sequence numbers, concept tag extraction and merge with `COALESCE`, crash recovery, pgvector support, embedding reconciliation. |
 | `test_screen_agent.py` | **17 tests** | MSS screenshot grabbing, perceptual dHash hashing, Hamming distance slide cache, vision-LLM OCR fallback, mixed-clock gate, model checksum verification. |
 | `test_llm_router.py` | **17 tests** | Multimodal task routing, OpenAI-compatible provider, Google GenAI, Ollama, circuit breaker rate-limiting, retries, per-task breaker scoping. |
@@ -264,7 +264,7 @@ LECTURELENS_INTEGRATION_REDIS=redis://127.0.0.1:6379 pytest tests/test_integrati
 | `test_concurrency.py` | **4 tests** | Thread pool and process pool executor allocation, worker limits, safe shutdown. |
 | `test_pipeline_integration.py` | **3 tests** | Full integration test from multimodal stream ingestion through sync to general notes synthesis. |
 | `test_circuit_breaker.py` | **3 tests** | Redis fixed-window rate limiter, failure count tracking and TTL cooldown. |
-| `test_integration_failures.py` | **2 tests** | Opt-in failure injection: a crash between the durable file write and the Redis publish, and a crash between the state update and the release. |
+| `test_integration_failures.py` | **3 tests** | Opt-in failure injection: a crash between the durable file write and the Redis publish, a crash between the append and the state save, and a crash between the state update and the release. |
 
 To run the complete test suite:
 ```bash
@@ -373,9 +373,9 @@ lecturelens client --session "cs101_01" --server "ws://192.168.1.20:8765" --api-
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `LECTURELENS_REDIS_URL` | `redis://localhost:6379` | Redis connection URL. |
-| `LECTURELENS_POSTGRES_URL` | `postgresql://postgres:postgres@localhost:5433/lecturelens` | PostgreSQL connection URL. |
-| `LECTURELENS_OLLAMA_URL` | `http://localhost:11434` | Local Ollama base URL. |
+| `LECTURELENS_REDIS_URL` | `redis://127.0.0.1:6379` | Redis connection URL. |
+| `LECTURELENS_POSTGRES_URL` | `postgresql://postgres:postgres@127.0.0.1:5433/lecturelens` | PostgreSQL connection URL. |
+| `LECTURELENS_OLLAMA_URL` | `http://127.0.0.1:11434` | Local Ollama base URL. |
 | `LECTURELENS_LLM_MODE` | `local` | `local` (Ollama), `hybrid` (Cloud with local fallback), or `cloud`. |
 | `LECTURELENS_LOCAL_MODEL` | `gemma4:e4b` | Local model name. Overrides the `model` in `router.yaml`. |
 | `LECTURELENS_EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model name. |
@@ -391,6 +391,7 @@ lecturelens client --session "cs101_01" --server "ws://192.168.1.20:8765" --api-
 | `LECTURELENS_SYNC_CONSUMER_GROUP` | `group:kuudere` | Redis consumer group of the sync agent. **Changing it orphans the pending messages of every existing session**, because the old group is never read or acknowledged again. Drain the old group before switching. |
 | `LECTURELENS_CAPTURE_SPOOL_MAX_SIZE` | `500` | How many captures the remote client keeps on disk while it is offline. |
 | `LECTURELENS_CAPTURE_SPOOL_ON_FULL` | `drop_oldest` | `drop_oldest` keeps the capture running and loses the oldest pending capture. `raise` loses nothing: the new capture is dropped instead and only a log line reports it. |
+| `LECTURELENS_WHISPER_HALLUCINATION_PHRASES` | *(empty)* | Extra comma separated phrases that are treated as Whisper hallucinations, on top of the built in English, Hindi and Hinglish lists. |
 | `UNOROUTER_API_KEY` / `UNOROUTER_API_KEYS` | *(none)* | Cloud provider credentials. Both the plain and the `LECTURELENS_`-prefixed spellings are accepted, and comma-separated values enable key rotation. |
 | `OPENROUTER_API_KEY` / `OPENROUTER_API_KEYS` | *(none)* | As above. |
 | `GOOGLE_API_KEY` / `GOOGLE_API_KEYS` | *(none)* | As above. |

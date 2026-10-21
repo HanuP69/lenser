@@ -94,7 +94,7 @@ class SyncAgent:
         self.recent_anchors: list[AnchorRecord] = []
         self.buffer_lock: asyncio.Lock = asyncio.Lock()
         self.entries_written: int = 0
-        self.fingerprint_history_limit: int = getattr(settings, "sync_fingerprint_history_limit", getattr(settings, "fingerprint_history_limit", FINGERPRINT_HISTORY_LIMIT))
+        self.fingerprint_history_limit: int = settings.sync_fingerprint_history_limit
         # The consumer group and the consumer names are configurable, so two
         # deployments can share one Redis without splitting the group.
         self.consumer_group: str = getattr(
@@ -189,7 +189,12 @@ class SyncAgent:
             # Being in the file only proves the local write. The entry is
             # only fully flushed once it was published to Redis as well.
             self.file_fingerprints.add(fingerprint)
-            if not self.flush_state_tracked:
+            if self.flush_states.get(fingerprint) == "file_pending":
+                # The write ahead intent was persisted and the file does
+                # contain the entry, so the write happened and only the
+                # publish is missing.
+                self.flush_states[fingerprint] = "file"
+            elif not self.flush_state_tracked:
                 # There is no state file, so there is no way to tell whether
                 # the entry was published. The old behaviour is kept so an
                 # existing session is not republished wholesale.
@@ -198,6 +203,21 @@ class SyncAgent:
                 self.file_event_ids.add(restored.event_id)
                 if not self.flush_state_tracked:
                     self.remember_event_id(restored.event_id)
+
+        # A write ahead intent whose entry is not in the file means the write
+        # never happened, so the entry is written again.
+        stale_intents = [
+            fingerprint
+            for fingerprint, state in self.flush_states.items()
+            if state == "file_pending" and fingerprint not in self.file_fingerprints
+        ]
+        for fingerprint in stale_intents:
+            del self.flush_states[fingerprint]
+        if stale_intents:
+            logger.info(
+                "recovered %d timeline entries whose file write never happened", len(stale_intents)
+            )
+            self.save_flush_states()
 
     def remember_fingerprint(self, fingerprint: str) -> None:
         if fingerprint in self.written_fingerprints:
@@ -537,11 +557,22 @@ class SyncAgent:
             # cannot make the same entries be published twice.
             if len(needs_file) > 0:
                 file_block = self.render_lines([buffered.entry for buffered in needs_file])
+                # Write ahead. The intent is persisted before the file is
+                # appended, so a crash in between is detectable on the next
+                # start: the fingerprint is either in the file, which means
+                # the write happened and only the publish is missing, or it
+                # is not, which means the write never happened.
+                for buffered in needs_file:
+                    fingerprint = entry_fingerprint(buffered.entry)
+                    if self.flush_states.get(fingerprint) not in ("file", "both", "redis"):
+                        self.flush_states[fingerprint] = "file_pending"
+                self.save_flush_states()
                 try:
                     await run_in_thread_pool(append_text_durably, self.timeline_path, file_block)
                 except OSError as error:
                     logger.error("timeline write failed, entries kept in buffer: %s", error)
                     return 0
+                self.trigger_fault("crash_before_state_save")
                 for buffered in needs_file:
                     fingerprint = entry_fingerprint(buffered.entry)
                     previous = self.flush_states.get(fingerprint, "")

@@ -2,13 +2,13 @@ import asyncio
 from collections import deque
 import io
 import queue
-import re
 import threading
 import time
+import unicodedata
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import numpy as np
 
@@ -41,6 +41,34 @@ HALLUCINATION_PHRASES: tuple[str, ...] = (
     "subtitles by the amara.org community",
     "please subscribe",
 )
+
+# Whisper hallucinates the sign off of the language it is transcribing, so an
+# English only list does nothing for a Hindi or Hinglish lecture.
+HALLUCINATION_PHRASES_BY_LANGUAGE: dict[str, tuple[str, ...]] = {
+    "en": HALLUCINATION_PHRASES,
+    "hi": (
+        "धन्यवाद",
+        "धन्यवाद बहुत",
+        "धन्यवाद बहुत बहुत",
+        "अगले वीडियो",
+        "अगले भाग",
+        "सब्सक्राइब",
+        "सब्सक्राइब करें",
+        "चैनल",
+        "लाइक करें",
+        "बेल आइकन",
+    ),
+    "hinglish": (
+        "dhanyavaad",
+        "dhanyavad",
+        "shukriya",
+        "agle video",
+        "agle part",
+        "subscribe karein",
+        "like karein",
+        "bell icon dabayein",
+    ),
+}
 
 _whisper_model_cache: dict[str, Any] = {}
 
@@ -85,14 +113,42 @@ def convert_numpy_to_wav_bytes(audio_buffer: np.ndarray, sample_rate: int) -> by
 
 def normalize_phrase(text: str) -> str:
     lowered = text.lower().strip()
-    return re.sub(r"[^\w\s.]", "", lowered).strip(" .")
+    # Combining marks are not word characters, so a plain [^\w\s.] filter
+    # strips them. That changes Devanagari and every other Indic script, so
+    # the marks are kept and a Hindi phrase still matches its own form.
+    kept = "".join(
+        character
+        for character in lowered
+        if character.isalnum()
+        or character == "_"
+        or character.isspace()
+        or character == "."
+        or unicodedata.category(character).startswith("M")
+    )
+    return kept.strip(" .")
 
 
-def is_hallucinated_text(text: str) -> bool:
+def is_hallucinated_text(
+    text: str,
+    language: str = "en",
+    extra_phrases: Sequence[str] = ()
+) -> bool:
+    """Whether the transcript is a Whisper hallucination.
+
+    The phrases are matched for the language of the audio, so a Hindi or
+    Hinglish lecture is filtered as well. Extra phrases can be configured.
+    """
     normalized = normalize_phrase(text)
     if len(normalized) == 0:
         return True
-    if normalized in HALLUCINATION_PHRASES:
+    phrases = set(HALLUCINATION_PHRASES)
+    language_key = (language or "en").strip().lower()
+    phrases.update(HALLUCINATION_PHRASES_BY_LANGUAGE.get(language_key, ()))
+    for phrase in extra_phrases:
+        cleaned = normalize_phrase(str(phrase))
+        if len(cleaned) > 0:
+            phrases.add(cleaned)
+    if normalized in phrases:
         return True
     words = normalized.split()
     if len(words) >= 8:
@@ -531,7 +587,7 @@ class MixedBlockSource:
 def build_block_source(settings: Settings) -> Any:
     sample_rate = settings.mic_sample_rate
     block_seconds = settings.audio_block_seconds
-    audio_source = getattr(settings, "audio_source", "mic") or "mic"
+    audio_source = settings.audio_source or "mic"
     if audio_source == "system":
         return SystemBlockSource(sample_rate, block_seconds, strict=True)
     elif audio_source == "both":
@@ -743,10 +799,14 @@ class AudioAgent:
             self.settings.whisper_compute_type
         )
         transcript_text = str(result.get("text", "")).strip()
-        if is_hallucinated_text(transcript_text):
+        detected_language = str(result.get("language", "en"))
+        if is_hallucinated_text(
+            transcript_text,
+            language=detected_language,
+            extra_phrases=self.settings.whisper_hallucination_phrases
+        ):
             return None
 
-        detected_language = str(result.get("language", "en"))
         language_probability = float(result.get("language_probability", 0.0))
         if self.locked_language is None:
             # The language was detected again for every chunk, so a Hinglish

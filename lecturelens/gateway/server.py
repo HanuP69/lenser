@@ -157,7 +157,7 @@ class GatewayServer:
         self.api_key: str = ""
         if isinstance(configured_key, str) and len(configured_key.strip()) > 0:
             self.api_key = configured_key
-        elif getattr(settings, "gateway_require_api_key", True):
+        elif settings.gateway_require_api_key:
             # Without a key every local process could read the lecture notes
             # and inject audio, screen frames and events. Generate one so the
             # gateway is never open by default.
@@ -185,8 +185,8 @@ class GatewayServer:
     def _mark_capture_accepted(self, capture_id: str) -> None:
         self.accepted_capture_ids.add(capture_id)
         self._accepted_capture_queue.append((time.monotonic(), capture_id))
-        capacity = getattr(self.settings, "gateway_capture_id_capacity", 5000)
-        ttl = getattr(self.settings, "gateway_capture_id_ttl_seconds", 600.0)
+        capacity = self.settings.gateway_capture_id_capacity
+        ttl = self.settings.gateway_capture_id_ttl_seconds
         # The expiry was only enforced when the queue grew past the capacity,
         # so a capture id could stay accepted for the whole session. The
         # ttl is now enforced on every call.
@@ -340,7 +340,7 @@ class GatewayServer:
         Origin header therefore has to match the configured allowlist.
         """
         origin = extract_origin(websocket)
-        allowed = getattr(self.settings, "gateway_allowed_origins", []) or []
+        allowed = self.settings.gateway_allowed_origins
         if not is_origin_allowed(origin, allowed):
             raise PermissionError(f"origin not allowed: {origin}")
 
@@ -658,7 +658,7 @@ class GatewayServer:
 
     async def _replay_notes_from_redis(self, session_id: str, after_seq: int = 0) -> list[dict[str, Any]]:
         stream_name = f"lecturelens:{session_id}:stream:notes"
-        scan_limit = int(getattr(self.settings, "gateway_replay_scan_limit", 5000))
+        scan_limit = int(self.settings.gateway_replay_scan_limit)
         try:
             # The scan is bounded: the notes stream can hold up to
             # stream_max_length entries and reading all of them on every

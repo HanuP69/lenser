@@ -445,15 +445,15 @@ async def run_remote_client(
     session_dir = settings.get_session_output_dir(session_id)
     audio_spool = CaptureSpool(
         session_dir / "capture_spool_audio.db",
-        max_size=getattr(settings, "capture_spool_max_size", 500),
-        append_timeout_seconds=getattr(settings, "capture_spool_append_timeout_seconds", 5.0),
-        on_full=getattr(settings, "capture_spool_on_full", "drop_oldest")
+        max_size=settings.capture_spool_max_size,
+        append_timeout_seconds=settings.capture_spool_append_timeout_seconds,
+        on_full=settings.capture_spool_on_full
     )
     screen_spool = CaptureSpool(
         session_dir / "capture_spool_screen.db",
-        max_size=getattr(settings, "capture_spool_max_size", 500),
-        append_timeout_seconds=getattr(settings, "capture_spool_append_timeout_seconds", 5.0),
-        on_full=getattr(settings, "capture_spool_on_full", "drop_oldest")
+        max_size=settings.capture_spool_max_size,
+        append_timeout_seconds=settings.capture_spool_append_timeout_seconds,
+        on_full=settings.capture_spool_on_full
     )
 
     while not stop_event.is_set():

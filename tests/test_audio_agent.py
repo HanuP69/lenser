@@ -135,6 +135,24 @@ class TestAudioHelpers(unittest.TestCase):
         self.assertFalse(is_hallucinated_text("Thank you all for coming to the lecture today."))
         self.assertFalse(is_hallucinated_text("Binary search runs in log n time."))
 
+    def test_hallucination_filter_uses_the_language_of_the_audio(self) -> None:
+        """The phrase list was English only, so a Hindi or Hinglish lecture
+        was never filtered."""
+        self.assertTrue(is_hallucinated_text("धन्यवाद", language="hi"))
+        self.assertTrue(is_hallucinated_text("अगले वीडियो", language="hi"))
+        self.assertTrue(is_hallucinated_text("dhanyavaad", language="hinglish"))
+        self.assertTrue(is_hallucinated_text("agle video", language="hinglish"))
+        # The sign off of another language is not a hallucination.
+        self.assertFalse(is_hallucinated_text("धन्यवाद", language="en"))
+        # Real content is never filtered.
+        self.assertFalse(is_hallucinated_text("बाइनरी सर्च लॉग एन टाइम में चलता है", language="hi"))
+
+    def test_hallucination_filter_accepts_extra_phrases(self) -> None:
+        self.assertFalse(is_hallucinated_text("pause and resume"))
+        self.assertTrue(
+            is_hallucinated_text("pause and resume", extra_phrases=["pause and resume"])
+        )
+
     def test_wav_conversion_round_trip(self) -> None:
         samples = np.linspace(-0.5, 0.5, 1600, dtype=np.float32)
         wav_bytes = convert_numpy_to_wav_bytes(samples, SAMPLE_RATE)

@@ -393,15 +393,15 @@ class StructuringAgent:
 
         if drift_filter is not None:
             self.drift_filter: Optional[ContextDriftFilter] = drift_filter
-        elif getattr(settings, "enable_drift_filter", True):
-            resolved_ollama_url = getattr(settings, "ollama_url", None) or os.environ.get("LECTURELENS_OLLAMA_URL", "http://127.0.0.1:11434")
+        elif settings.enable_drift_filter:
+            resolved_ollama_url = settings.ollama_url or os.environ.get("LECTURELENS_OLLAMA_URL", "http://127.0.0.1:11434")
             self.drift_filter = ContextDriftFilter(
                 ollama_url=resolved_ollama_url,
-                embed_model=getattr(settings, "drift_embed_model", "nomic-embed-text"),
-                drift_threshold=getattr(settings, "drift_similarity_threshold", 0.50),
-                sustain_consecutive=getattr(settings, "drift_consecutive_shift", 3),
-                min_words=getattr(settings, "drift_min_content_words", 8),
-                session_topic=getattr(settings, "course_name", None)
+                embed_model=settings.drift_embed_model or settings.embedding_model,
+                drift_threshold=settings.drift_similarity_threshold,
+                sustain_consecutive=settings.drift_consecutive_shift,
+                min_words=settings.drift_min_content_words,
+                session_topic=settings.course_name
             )
         else:
             self.drift_filter = None
@@ -470,7 +470,7 @@ class StructuringAgent:
             }
 
     def save_state(self, running_context: str, timeline_byte_offset: int, overlap_entries: list[dict[str, Any]]) -> None:
-        max_context = getattr(self.settings, "context_max_characters", 4000)
+        max_context = self.settings.context_max_characters
         trimmed_context = running_context
         if max_context > 0 and len(trimmed_context) > max_context:
             trimmed_context = trimmed_context[-max_context:]
@@ -786,7 +786,7 @@ class StructuringAgent:
         self.current_overlap = next_overlap
 
         new_context = str(result_state.get("running_context", running_context))
-        max_context = getattr(self.settings, "context_max_characters", 4000)
+        max_context = self.settings.context_max_characters
         if max_context > 0 and len(new_context) > max_context:
             new_context = new_context[-max_context:]
         self.save_state(new_context, batch.end_offset, next_overlap)
@@ -794,7 +794,7 @@ class StructuringAgent:
 
     async def process_all_pending(self) -> int:
         processed_batches = 0
-        max_batches = getattr(self.settings, "structuring_max_batches_per_run", getattr(self.settings, "max_structuring_batches", 1000))
+        max_batches = self.settings.structuring_max_batches_per_run
         while processed_batches < max_batches:
             batches = self.read_pending_batches()
             if len(batches) == 0:

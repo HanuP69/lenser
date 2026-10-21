@@ -53,6 +53,8 @@ class Settings(BaseSettings):
     whisper_min_avg_logprob: float = Field(default=-1.0)
     whisper_max_no_speech_prob: float = Field(default=0.6)
     whisper_compute_type: Optional[str] = Field(default=None)
+    whisper_preload_in_every_worker: bool = Field(default=True)
+    whisper_hallucination_phrases: list[str] = Field(default_factory=list)
 
     screenshot_interval_seconds: float = Field(default=1.0)
     slide_diff_threshold: float = Field(default=0.004)

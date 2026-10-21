@@ -125,6 +125,42 @@ class TestSyncFailureInjection(unittest.IsolatedAsyncioTestCase):
         # The state file is gone once nothing is pending.
         self.assertFalse(self.flush_state_path.exists())
 
+    async def test_crash_before_the_state_save_still_publishes_the_entry(self) -> None:
+        """The write ahead intent is persisted before the file is appended.
+        A crash between the append and the state save leaves the intent and
+        the file out of sync, and the next start has to work out which
+        happened."""
+        count = 5
+        result = run_fault_runner(self.session_id, self.output_dir, count, "crash_before_state_save")
+        self.assertNotEqual(result.returncode, 0, "the helper was expected to crash")
+
+        # The file write happened, the publish did not.
+        lines = read_timeline_lines(self.timeline_path)
+        self.assertEqual(len(lines), count)
+        self.assertEqual(len(await read_stream_entries(self.bus, self.session_id)), 0)
+
+        # A restart reconciles the write ahead intent against the file and
+        # publishes the entries that never reached Redis.
+        restarted = SyncAgent(self.settings, self.bus, SessionClock(), self.session_id)
+        published: list[Any] = []
+        restarted.redis_bus.publish_resilient = _collect_publishes(published)
+        for index in range(count):
+            entry = restarted.transcript_to_entry(_chunk(self.session_id, index))
+            await restarted.add_entry(
+                entry,
+                stream_name=restarted.build_stream_name("transcript"),
+                group_name=restarted.consumer_group,
+                message_id=entry.event_id
+            )
+        flushed = await restarted.flush_ready_entries(force=True)
+        self.assertEqual(flushed, count)
+
+        # The file still has every entry exactly once and the stream has
+        # every entry exactly once.
+        self.assertEqual(len(read_timeline_lines(self.timeline_path)), count)
+        self.assertEqual(len(published), count)
+        self.assertFalse(self.flush_state_path.exists())
+
     async def test_crash_after_the_state_pop_does_not_duplicate_the_file(self) -> None:
         """The second window: the entries are finished but the state was not
         released yet. The file must not gain a duplicate."""
