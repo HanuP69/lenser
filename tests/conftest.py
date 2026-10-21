@@ -16,6 +16,11 @@ import pytest
 
 from lecturelens.config.settings import Settings
 
+# The variables that switch the tests on are not removed. The failure
+# injection tests need a redis to kill a worker in, and the build has
+# one, so removing the variable made them skip there as well.
+KEPT_ENVIRONMENT_VARIABLES = ("LECTURELENS_INTEGRATION_REDIS",)
+
 # The .env file of the project is not read while the tests run. This has
 # to happen while this file is imported, which is before the test modules
 # are collected, because a test module may build the settings when it is
@@ -30,8 +35,14 @@ def _clear_environment() -> None:
     before every test.
     """
     for name in list(os.environ):
-        if name.startswith("LECTURELENS_"):
-            os.environ.pop(name, None)
+        if not name.startswith("LECTURELENS_"):
+            continue
+        # The variables that switch the tests on are kept. The failure
+        # injection tests only run when the machine has a redis to kill
+        # a worker in, and the build has one.
+        if name in KEPT_ENVIRONMENT_VARIABLES:
+            continue
+        os.environ.pop(name, None)
 
 
 _clear_environment()

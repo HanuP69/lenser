@@ -87,8 +87,9 @@ class TestWindowCaptureGuards(unittest.TestCase):
                 list_windows()
 
     def test_a_closed_window_is_not_alive(self) -> None:
-        # A handle that was never handed out is not a window.
-        self.assertFalse(is_window_alive(0x7FFFFFFF) if window_capture.IS_WINDOWS else True)
+        # A handle that was never handed out is not a window. On a machine
+        # that is not windows there is no window at all.
+        self.assertFalse(is_window_alive(0x7FFFFFFF))
 
 
 class TestWindowPixels(unittest.TestCase):

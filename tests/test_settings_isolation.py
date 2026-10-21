@@ -14,7 +14,13 @@ class TestTheMachineDoesNotChangeTheTests(unittest.TestCase):
         self.assertFalse(Settings().whisper_lock_language)
 
     def test_the_key_of_the_developer_is_not_in_the_environment(self) -> None:
+        from tests.conftest import KEPT_ENVIRONMENT_VARIABLES
+
         for name in os.environ:
+            if name in KEPT_ENVIRONMENT_VARIABLES:
+                # The variables that switch the tests on are kept, they
+                # say nothing about the machine.
+                continue
             self.assertFalse(name.startswith("LECTURELENS_"), name)
 
     def test_the_settings_still_work(self) -> None:
@@ -29,10 +35,11 @@ class TestTheMachineDoesNotChangeTheTests(unittest.TestCase):
         was started from a different folder, and the notes of a session
         could not be found again.
         """
+        from lecturelens.config.settings import project_root
+
         settings = Settings()
         self.assertTrue(settings.output_dir.is_absolute())
-        self.assertIn("virt", str(settings.output_dir))
-        self.assertEqual(settings.output_dir.name, "output")
+        self.assertEqual(settings.output_dir, (project_root() / "output").resolve())
 
     def test_the_router_file_is_the_one_of_the_project(self) -> None:
         settings = Settings()
