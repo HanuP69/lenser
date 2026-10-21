@@ -1,4 +1,4 @@
-DEFAULT_LOCAL_MODEL: str = "gemma4:e4b"
+DEFAULT_LOCAL_MODEL: str = "gemma3:4b"
 DEFAULT_EMBEDDING_MODEL: str = "nomic-embed-text"
 # The Redis consumer group used by the sync agent, and the prefix of its
 # consumer names. The default keeps the historical name on purpose: renaming

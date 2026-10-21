@@ -1,14 +1,44 @@
 providers:
-  # The UnoRouter free tier allows one request per minute per model, and the
-  # budget is per model. Listing several models in one chain multiplies the
-  # effective rate: a 429 is a provider failure, so the chain falls through
-  # to the next model, which has its own budget.
+  # The UnoRouter free tier limits each model separately, so listing several
+  # models in one route multiplies the effective rate: a 429 is a provider
+  # failure, so the chain moves on to the next model, which has its own
+  # budget. The max_rpm of every entry is the limit that was measured for
+  # that model, not a guess.
   #
-  # The gemini free models do not forward the image to gemini, they answer
-  # that no image was attached, so they are only used for the text tasks.
+  # Only models that were verified to receive the image are in the
+  # screen_ocr route. A model that never gets the image either says so or
+  # invents slide text, and the invented text ends up in the notes.
 
-  # Vision models that were verified to receive the image.
-  unorouter_vl_qwen:
+  # Vision, verified to receive the image.
+  unorouter_vl_qwen38:
+    type: openai_compatible
+    cloud: true
+    base_url: "https://api.unorouter.com/v1"
+    model: "qwen3.8-27b:free"
+    api_key_env: "UNOROUTER_API_KEY"
+    timeout_seconds: 90
+    rate_limit:
+      max_rpm: 1
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 1
+      cooldown_seconds: 60
+
+  unorouter_vl_sealion:
+    type: openai_compatible
+    cloud: true
+    base_url: "https://api.unorouter.com/v1"
+    model: "qwen-sea-lion-v4.5-27b-it:free"
+    api_key_env: "UNOROUTER_API_KEY"
+    timeout_seconds: 90
+    rate_limit:
+      max_rpm: 1
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 1
+      cooldown_seconds: 60
+
+  unorouter_vl_qwen25:
     type: openai_compatible
     cloud: true
     base_url: "https://api.unorouter.com/v1"
@@ -22,35 +52,22 @@ providers:
       failure_threshold: 1
       cooldown_seconds: 60
 
-  unorouter_vl_llama:
-    type: openai_compatible
-    cloud: true
-    base_url: "https://api.unorouter.com/v1"
-    model: "llama-3.2-11b-vision:free"
-    api_key_env: "UNOROUTER_API_KEY"
-    timeout_seconds: 120
-    rate_limit:
-      max_rpm: 1
-      window_seconds: 60
-    circuit_breaker:
-      failure_threshold: 1
-      cooldown_seconds: 60
-
-  unorouter_vl_gemma:
+  # Text. gemma-4-26b allows five requests per minute, five times the
+  # others, and it answers in about five seconds.
+  unorouter_gemma:
     type: openai_compatible
     cloud: true
     base_url: "https://api.unorouter.com/v1"
     model: "gemma-4-26b:free"
     api_key_env: "UNOROUTER_API_KEY"
-    timeout_seconds: 120
+    timeout_seconds: 90
     rate_limit:
-      max_rpm: 1
+      max_rpm: 5
       window_seconds: 60
     circuit_breaker:
       failure_threshold: 1
       cooldown_seconds: 60
 
-  # Text models.
   unorouter_structuring:
     type: openai_compatible
     cloud: true
@@ -107,10 +124,11 @@ providers:
       failure_threshold: 1
       cooldown_seconds: 60
 
+  # The local Ollama model. It is skipped in cloud mode.
   gemma:
     type: ollama
     cloud: false
-    model: "gemma4:e4b"
+    model: "gemma3:4b"
     num_ctx: 8192
     temperature: 0.2
     timeout_seconds: 180
@@ -149,16 +167,15 @@ providers:
       cooldown_seconds: 60
 
 task_routing:
-  # The vision models come first. The gemini models do not receive the image
-  # through this endpoint, so they are not used for the slides.
   screen_ocr:
-    - unorouter_vl_qwen
-    - unorouter_vl_llama
-    - unorouter_vl_gemma
+    - unorouter_vl_qwen38
+    - unorouter_vl_sealion
+    - unorouter_vl_qwen25
     - gemma
     - openrouter
     - gemini
   structuring:
+    - unorouter_gemma
     - unorouter_structuring
     - unorouter
     - unorouter_glm
@@ -166,6 +183,7 @@ task_routing:
     - openrouter
     - gemini
   qa:
+    - unorouter_gemma
     - unorouter_qa
     - unorouter
     - unorouter_glm
