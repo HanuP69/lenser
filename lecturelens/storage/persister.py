@@ -49,7 +49,15 @@ class PostgresPersister:
             try:
                 entry = TimelineEntry.from_jsonl_dict(message_data)
             except Exception:
-                entry = TimelineEntry(**message_data)
+                try:
+                    entry = TimelineEntry(**message_data)
+                except Exception as error:
+                    # A malformed payload used to escape the handler, so the
+                    # message was retried five times and then dead-lettered,
+                    # while a malformed note was acknowledged immediately.
+                    logger.error("invalid timeline payload: %s", error)
+                    await self.redis_bus.acknowledge(stream_name, self.group_name, message_id)
+                    return
         await self.storage.insert_timeline_event(entry)
         await self.redis_bus.acknowledge(stream_name, self.group_name, message_id)
 
@@ -184,8 +192,17 @@ async def main() -> None:
             control.write_heartbeat("stopped")
         except Exception:
             pass
-        await storage.close()
-        await redis_bus.close()
+        # The two closings are independent: if the first one raises, the
+        # second never runs and the outbox is never flushed, so the buffered
+        # events stay unpublished.
+        try:
+            await storage.close()
+        except Exception as error:
+            logger.error("could not close the postgres storage: %s", error)
+        try:
+            await redis_bus.close()
+        except Exception as error:
+            logger.error("could not close the redis bus: %s", error)
 
 
 if __name__ == "__main__":

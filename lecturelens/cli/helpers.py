@@ -63,6 +63,10 @@ def classify_heartbeat(heartbeat: Optional[dict[str, Any]], now_epoch: float) ->
     state = str(heartbeat.get("state", "unknown"))
     if state == "stopped":
         return "STOPPED"
+    if state == "failed":
+        # session_has_live_agents treats "failed" as a terminal state, so a
+        # crashed agent used to be reported as IDLE here.
+        return "ERROR"
     age = now_epoch - float(heartbeat.get("time", 0.0))
     if age > HEARTBEAT_STALE_SECONDS:
         return "ERROR"

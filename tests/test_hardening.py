@@ -414,8 +414,11 @@ class TestScreenAgentHardening(unittest.IsolatedAsyncioTestCase):
                 first = await agent.ingest_png_bytes(make_png())
             self.assertEqual(first.extracted_text, "")
             await asyncio.wait_for(asyncio.gather(*list(agent.retry_tasks)), timeout=5)
-            self.assertEqual(len(bus.published), 2)
-            recovered = bus.published[1]
+            # The slide is published exactly once. It used to be published
+            # twice: once with the empty text and once with the recovered
+            # text, which produced two timeline rows for the same slide.
+            self.assertEqual(len(bus.published), 1)
+            recovered = bus.published[0]
             self.assertEqual(recovered.extracted_text, "Recovered slide text")
             self.assertEqual(recovered.slide_number, first.slide_number)
             self.assertEqual(recovered.timestamp_epoch, first.timestamp_epoch)

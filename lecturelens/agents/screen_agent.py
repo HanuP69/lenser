@@ -33,7 +33,9 @@ from lecturelens.schemas.events import SlideCaptured
 
 logger = get_logger("lecturelens.screen_agent")
 
-TESSERACT_CONFIG = "--oem 3 --psm 6 -c preserve_interword_spaces=1"
+# There is no local OCR engine in the pipeline: the slide text comes from a
+# vision model. The Tesseract configuration that used to live here was never
+# referenced by anything.
 MAX_REMEMBERED_SLIDES = 200
 REVISIT_THUMBNAIL_WIDTH = 192
 REVISIT_MAX_CHANGED_FRACTION = 0.01
@@ -175,6 +177,12 @@ class ScreenAgent:
                 del self.slide_texts[removed_number]
 
     async def run_ocr(self, png_bytes: bytes) -> str:
+        """Extract the text of a slide.
+
+        This runs a vision model, not a local OCR engine, so the name is
+        misleading. The local Tesseract configuration that used to sit next
+        to it was never referenced by anything.
+        """
         return await self.run_vision_fallback(png_bytes)
 
     async def run_vision_fallback(self, png_bytes: bytes, max_retries: int = 2) -> str:
@@ -213,8 +221,6 @@ class ScreenAgent:
         extracted_text = ""
         if revisited_number > 0 and revisited_number in self.slide_texts:
             extracted_text = self.slide_texts[revisited_number]
-        elif not self.control.stop_requested():
-            extracted_text = await self.run_ocr(png_bytes)
         if len(extracted_text.strip()) > 0:
             self.remember_slide(slide_number, difference_hash, small_thumbnail, extracted_text)
 
@@ -227,20 +233,50 @@ class ScreenAgent:
             extracted_text=extracted_text,
             revisited_slide_number=revisited_number
         )
-        published_id = await self.redis_bus.publish_resilient(self.stream_name, slide_event)
-        if published_id is not None:
-            self.control.increment_stat("slides_published")
-        else:
-            self.control.increment_stat("slides_buffered")
-        needs_text_retry = (
+
+        needs_text_extraction = (
             len(extracted_text.strip()) == 0
             and revisited_number == 0
             and self.llm_router is not None
             and not self.control.stop_requested()
         )
-        if needs_text_retry:
-            self.schedule_text_retry(slide_number, image_path, capture_timestamp, difference_hash, small_thumbnail)
+        if needs_text_extraction:
+            # The vision call runs in the background. It used to run inside
+            # the capture loop, so a slow model blocked the capture for up to
+            # four minutes and every slide change in the meantime was missed.
+            # The slide is published exactly once, by the background task,
+            # with the recovered text.
+            self.schedule_text_extraction(
+                slide_number, image_path, capture_timestamp, difference_hash,
+                small_thumbnail, png_bytes
+            )
+            self.control.increment_stat("slides_awaiting_text")
+            return slide_event
+
+        published_id = await self.redis_bus.publish_resilient(self.stream_name, slide_event)
+        if published_id is not None:
+            self.control.increment_stat("slides_published")
+        else:
+            self.control.increment_stat("slides_buffered")
         return slide_event
+
+    def schedule_text_extraction(
+        self,
+        slide_number: int,
+        image_path: str,
+        capture_timestamp: float,
+        difference_hash: int,
+        small_thumbnail: np.ndarray,
+        png_bytes: bytes
+    ) -> None:
+        task = asyncio.create_task(
+            self.extract_and_publish_slide_text(
+                slide_number, image_path, capture_timestamp, difference_hash,
+                small_thumbnail, png_bytes
+            )
+        )
+        self.retry_tasks.add(task)
+        task.add_done_callback(self.retry_tasks.discard)
 
     def schedule_text_retry(
         self,
@@ -256,39 +292,50 @@ class ScreenAgent:
         self.retry_tasks.add(task)
         task.add_done_callback(self.retry_tasks.discard)
 
-    async def retry_slide_text(
+    async def extract_and_publish_slide_text(
         self,
         slide_number: int,
         image_path: str,
         capture_timestamp: float,
         difference_hash: int,
-        small_thumbnail: np.ndarray
+        small_thumbnail: np.ndarray,
+        png_bytes: bytes
     ) -> None:
-        for delay_seconds in self.settings.vision_retry_delays_seconds:
-            await asyncio.sleep(delay_seconds)
+        """Recover the text of a slide in the background and publish it once."""
+        recovered_text = ""
+        delays = [0.0] + list(self.settings.vision_retry_delays_seconds)
+        for index, delay_seconds in enumerate(delays):
+            if delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
             if self.control.stop_requested():
                 return
-            try:
-                png_bytes = await run_in_thread_pool(Path(image_path).read_bytes)
-            except OSError:
-                return
-            recovered_text = await self.run_vision_fallback(png_bytes, max_retries=1)
-            if len(recovered_text.strip()) == 0:
-                continue
+            payload = png_bytes
+            if index > 0:
+                try:
+                    payload = await run_in_thread_pool(Path(image_path).read_bytes)
+                except OSError:
+                    return
+            recovered_text = await self.run_vision_fallback(payload, max_retries=1)
+            if len(recovered_text.strip()) > 0:
+                break
+
+        if len(recovered_text.strip()) > 0:
             self.remember_slide(slide_number, difference_hash, small_thumbnail, recovered_text)
-            update_event = SlideCaptured(
-                session_id=self.session_id,
-                timestamp_epoch=capture_timestamp,
-                slide_number=slide_number,
-                monitor_index=self.settings.monitor_index,
-                image_file_path=image_path,
-                extracted_text=recovered_text,
-                revisited_slide_number=0
-            )
-            await self.redis_bus.publish_resilient(self.stream_name, update_event)
             self.control.increment_stat("slide_text_recovered")
-            return
-        logger.warning("slide %d text could not be recovered after retries", slide_number)
+        else:
+            logger.warning("slide %d text could not be recovered after retries", slide_number)
+            self.control.increment_stat("slide_text_unrecovered")
+
+        update_event = SlideCaptured(
+            session_id=self.session_id,
+            timestamp_epoch=capture_timestamp,
+            slide_number=slide_number,
+            monitor_index=self.settings.monitor_index,
+            image_file_path=image_path,
+            extracted_text=recovered_text,
+            revisited_slide_number=0
+        )
+        await self.redis_bus.publish_resilient(self.stream_name, update_event)
 
     async def ingest_png_bytes(
         self,
@@ -373,7 +420,9 @@ async def main() -> None:
                 context.settings.llm_timeout_seconds
             )
         except Exception as error:
-            logger.warning("vision router unavailable, OCR only: %s", error)
+            # There is no local OCR fallback, so the slides will be captured
+            # without any text.
+            logger.warning("vision router unavailable, slides will have no text: %s", error)
         return ScreenAgent(
             settings=context.settings,
             redis_bus=context.redis_bus,

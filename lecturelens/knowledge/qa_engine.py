@@ -427,7 +427,10 @@ class QAEngine:
                     txt = str(row.get("chunk_text") or "")
                     if txt and txt not in seen_texts:
                         seen_texts.add(txt)
-                        retrieved.append((txt, str(row.get("source_id", "notes.md"))))
+                        # The Postgres path used the raw source_id, which is
+                        # a chunk hash such as "timeline_<sha1>", while the
+                        # Chroma path reported the human readable reference.
+                        retrieved.append((txt, self._humanize_source_id(row)))
             except Exception as err:
                 logger.debug("pgvector search fallback to chroma: %s", err)
 
@@ -449,6 +452,24 @@ class QAEngine:
                     if len(retrieved) >= self.top_k:
                         break
         return retrieved
+
+    @staticmethod
+    def _humanize_source_id(row: dict[str, Any]) -> str:
+        """Turn a stored source_id into a readable reference.
+
+        The chunk ids are built as "<source>_<hash>", so the source part
+        carries the file or the stream the chunk came from.
+        """
+        source_id = str(row.get("source_id") or "")
+        source_type = str(row.get("source_type") or "")
+        if not source_id:
+            return source_type or "unknown"
+        if "_" in source_id:
+            prefix = source_id.rsplit("_", 1)[0]
+            if prefix in ("timeline", "notes"):
+                return f"{prefix}.md"
+            return prefix
+        return source_id
 
     async def call_language_model(self, prompt: str) -> str:
         if self.llm_router is not None:

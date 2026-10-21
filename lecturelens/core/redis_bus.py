@@ -79,6 +79,8 @@ class RedisBus:
         self.outbox: list[tuple[str, Any]] = []
         self._outbox_row_ids: list[int] = []
         self._outbox_lock: asyncio.Lock = asyncio.Lock()
+        self._inflight_event_ids: set[str] = set()
+        self._inflight_wait_seconds: float = 5.0
         self.failure_counts: dict[str, int] = {}
         self._last_flush_attempt: float = 0.0
         self._flush_backoff_seconds: float = 1.0
@@ -438,6 +440,31 @@ class RedisBus:
         if not ev_id and hasattr(event, "session_id") and hasattr(event, "sequence_number"):
             ev_id = f"note_{getattr(event, 'session_id')}_{getattr(event, 'sequence_number')}"
 
+        if ev_id:
+            # Two coroutines can publish the same event at the same time. The
+            # second one has to wait for the first to finish, otherwise both
+            # can publish it, or one publishes it while the other buffers it,
+            # and the event ends up in the stream twice.
+            waited = 0.0
+            while True:
+                async with self._outbox_lock:
+                    if ev_id not in self._inflight_event_ids:
+                        self._inflight_event_ids.add(ev_id)
+                        break
+                if waited >= self._inflight_wait_seconds:
+                    break
+                await asyncio.sleep(0.01)
+                waited += 0.01
+        try:
+            return await self._publish_resilient_once(stream_name, event, ev_id)
+        finally:
+            if ev_id:
+                async with self._outbox_lock:
+                    self._inflight_event_ids.discard(ev_id)
+
+    async def _publish_resilient_once(
+        self, stream_name: str, event: BaseModel, ev_id: Optional[str]
+    ) -> Optional[str]:
         was_queued = False
         async with self._outbox_lock:
             if ev_id:

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+from lecturelens.config.defaults import SYNC_CONSUMER_GROUP
 from lecturelens.config.settings import Settings
 from lecturelens.core.agent_runtime import (
     AgentControl,
@@ -227,13 +228,13 @@ class SyncAgent:
             await self.add_entry(
                 entry,
                 stream_name=stream_name,
-                group_name="group:kuudere",
+                group_name=SYNC_CONSUMER_GROUP,
                 message_id=message_id
             )
 
         await self.redis_bus.consume(
             stream_name=stream_name,
-            group_name="group:kuudere",
+            group_name=SYNC_CONSUMER_GROUP,
             consumer_name=f"consumer:kuudere:{source_type}",
             handler=handle_message,
             batch_size=self.settings.redis_consumer_batch_size,

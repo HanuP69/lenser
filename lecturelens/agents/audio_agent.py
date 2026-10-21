@@ -200,6 +200,17 @@ class SpeechSegmenter:
         self.active_sample_count: int = 0
         self.has_speech: bool = False
         self.silence_run_samples: int = 0
+        self.dropped_samples: int = 0
+
+    def note_dropped_samples(self, dropped_samples: int) -> None:
+        """Record audio that the capture source dropped.
+
+        The sample clock is derived from the number of delivered blocks, so
+        dropped blocks shift every later timestamp. The dropped duration is
+        accounted for when the next block is pushed.
+        """
+        if dropped_samples > 0:
+            self.dropped_samples += int(dropped_samples)
 
     def update_noise_floor(self, rms: float) -> None:
         if not self.adaptive:
@@ -241,6 +252,15 @@ class SpeechSegmenter:
             return emitted
         if self.origin_seconds is None:
             self.origin_seconds = stream_elapsed_seconds - (block.size / float(self.sample_rate))
+        elif self.dropped_samples > 0:
+            # Blocks that were dropped by the capture source break the
+            # assumption that the sample clock is gap free, so the origin has
+            # to be moved forward by the dropped duration. Otherwise every
+            # later timestamp lags the real time by the total dropped
+            # duration and the error grows for the rest of the session.
+            dropped_seconds = self.dropped_samples / float(self.sample_rate)
+            self.origin_seconds += dropped_seconds
+            self.dropped_samples = 0
 
         block_start_sample = self.consumed_samples
         self.consumed_samples += block.size
@@ -311,6 +331,10 @@ class MicBlockSource:
             self.block_queue.put_nowait(indata[:, 0].copy())
         except queue.Full:
             self.dropped_blocks += 1
+
+    @property
+    def dropped_samples(self) -> int:
+        return self.dropped_blocks * self.block_frames
 
     def start(self) -> None:
         import sounddevice as sounddevice_module
@@ -428,6 +452,10 @@ class SystemBlockSource:
         except queue.Empty:
             return None
 
+    @property
+    def dropped_samples(self) -> int:
+        return self.dropped_blocks * self.block_frames
+
     def stop(self) -> None:
         self.is_running = False
         if self.thread is not None:
@@ -443,6 +471,7 @@ class MixedBlockSource:
     def __init__(self, sample_rate: int, block_seconds: float) -> None:
         self.mic_source = MicBlockSource(sample_rate, block_seconds)
         self.system_source = SystemBlockSource(sample_rate, block_seconds, strict=False)
+        self.dropped_blocks: int = 0
 
     def start(self) -> None:
         self.mic_source.start()
@@ -452,11 +481,13 @@ class MixedBlockSource:
         while self.system_source.block_queue.qsize() > 5:
             try:
                 self.system_source.block_queue.get_nowait()
+                self.dropped_blocks += 1
             except queue.Empty:
                 break
         while self.mic_source.block_queue.qsize() > 5:
             try:
                 self.mic_source.block_queue.get_nowait()
+                self.dropped_blocks += 1
             except queue.Empty:
                 break
 
@@ -477,6 +508,14 @@ class MixedBlockSource:
     def stop(self) -> None:
         self.mic_source.stop()
         self.system_source.stop()
+
+    @property
+    def dropped_samples(self) -> int:
+        return (
+            self.dropped_blocks * self.mic_source.block_frames
+            + self.mic_source.dropped_samples
+            + self.system_source.dropped_samples
+        )
 
     def restart(self) -> None:
         self.mic_source.restart()
@@ -545,11 +584,32 @@ class AudioAgent:
             await self.capture_loop(source)
         finally:
             self.is_running = False
-            await self.transcription_queue.put(None)
-            await transcription_task
+            try:
+                # The queue can be full and the transcription task can be
+                # gone, in which case a plain put() waits for space that
+                # never arrives and the agent hangs on shutdown.
+                await asyncio.wait_for(self.transcription_queue.put(None), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("transcription queue was full at shutdown; forcing the stop signal")
+                try:
+                    self.transcription_queue.put_nowait(None)
+                except Exception:
+                    pass
+            try:
+                await transcription_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as error:
+                logger.error("transcription task failed during shutdown: %s", error)
             preload_task.cancel()
             await asyncio.gather(preload_task, return_exceptions=True)
-            await run_in_thread_pool(source.stop)
+            try:
+                # The capture device has to be closed even when the
+                # transcription task failed, otherwise the microphone stream
+                # and the recording thread leak.
+                await run_in_thread_pool(source.stop)
+            except Exception as error:
+                logger.error("could not stop the audio capture device: %s", error)
 
     async def capture_loop(self, source: Any) -> None:
         segmenter = SpeechSegmenter(
@@ -562,8 +622,23 @@ class AudioAgent:
         stalled_seconds = 0.0
         was_paused = False
         read_timeout = 0.5
+        last_dropped_samples = 0
         while self.is_running and not self.control.stop_requested():
             block = await run_in_thread_pool(source.read_block, read_timeout)
+
+            dropped_samples = int(getattr(source, "dropped_samples", 0) or 0)
+            if dropped_samples > last_dropped_samples:
+                newly_dropped = dropped_samples - last_dropped_samples
+                last_dropped_samples = dropped_samples
+                segmenter.note_dropped_samples(newly_dropped)
+                # The counter used to be incremented but never read, so the
+                # operator never learned that audio was being lost.
+                self.control.set_stat("dropped_audio_samples", dropped_samples)
+                logger.warning(
+                    "audio capture dropped %d samples (%.1fs); the transcript "
+                    "timestamps are shifted to compensate",
+                    newly_dropped, newly_dropped / float(self.settings.mic_sample_rate)
+                )
 
             if self.control.is_paused():
                 if not was_paused:

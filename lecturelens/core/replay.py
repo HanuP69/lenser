@@ -69,7 +69,10 @@ class ReplayEngine:
             if self.speed > 0.0 and delta > 0.0:
                 delay = delta / self.speed
                 if delay > 0.001:
-                    await asyncio.sleep(min(delay, 5.0))
+                    # The delay used to be capped at five seconds, so a speed
+                    # of 1.0 was not real time for any gap longer than five
+                    # seconds: a ten minute gap was replayed in five seconds.
+                    await asyncio.sleep(delay)
             last_timestamp = current_timestamp
 
             session_id = target_session_id or entry.session_id

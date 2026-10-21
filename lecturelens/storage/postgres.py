@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS general_notes (
     key_points JSONB,
     concept_tags TEXT[],
     slide_references JSONB,
+    definitions JSONB,
     timestamp_epoch DOUBLE PRECISION,
     start_time TEXT,
     end_time TEXT,
@@ -115,6 +116,10 @@ END $$;
 CREATE_VECTOR_EXTENSION_SQL = "CREATE EXTENSION IF NOT EXISTS vector;"
 ADD_VECTOR_COLUMN_SQL = "ALTER TABLE embeddings ADD COLUMN IF NOT EXISTS embedding vector(768);"
 
+# The sentinel used for concepts that were captured without a course. The
+# write and the read path have to agree on it.
+DEFAULT_COURSE_KEY = "_default_course"
+
 
 class PostgresStorage:
     def __init__(self, connection_url: str, query_limit: int = 1000) -> None:
@@ -151,14 +156,27 @@ class PostgresStorage:
             async with conn.cursor() as cur:
                 await cur.execute(CREATE_TABLES_SQL)
                 await cur.execute(MIGRATE_CONCEPTS_SQL)
+                # The definitions extracted by the structuring agent had no
+                # column, so they were silently dropped on persist.
+                await cur.execute(
+                    "ALTER TABLE general_notes ADD COLUMN IF NOT EXISTS definitions JSONB;"
+                )
 
         try:
             async with self.transaction() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute("ALTER TABLE embeddings ADD COLUMN IF NOT EXISTS embedding_model TEXT DEFAULT '';")
+                    # The duplicate cleanup only makes sense before the
+                    # unique index exists. Running the self join on every
+                    # start (and on every embedding batch) was pure cost.
                     await cur.execute("""
                         DELETE FROM embeddings a USING embeddings b
-                        WHERE a.id < b.id AND a.session_id = b.session_id AND a.source_id = b.source_id;
+                        WHERE a.id < b.id AND a.session_id = b.session_id AND a.source_id = b.source_id
+                          AND NOT EXISTS (
+                              SELECT 1 FROM pg_indexes
+                              WHERE tablename = 'embeddings'
+                                AND indexname = 'idx_embeddings_session_source'
+                          );
                     """)
                     await cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_session_source ON embeddings (session_id, source_id);")
         except Exception as schema_err:
@@ -168,13 +186,20 @@ class PostgresStorage:
         try:
             async with self.transaction() as conn:
                 async with conn.cursor() as cur:
-                    await cur.execute("""
-                        SELECT atttypmod FROM pg_attribute
-                        WHERE attrelid = 'embeddings'::regclass AND attname = 'embedding';
-                    """)
-                    row = await cur.fetchone()
-                    if row and row.get("atttypmod") is not None and row["atttypmod"] > 0:
-                        current_dim = row["atttypmod"]
+                    current_dim: Optional[int] = None
+                    try:
+                        await cur.execute("""
+                            SELECT atttypmod FROM pg_attribute
+                            WHERE attrelid = 'embeddings'::regclass AND attname = 'embedding';
+                        """)
+                        row = await cur.fetchone()
+                        if row and row.get("atttypmod") is not None and row["atttypmod"] > 0:
+                            current_dim = int(row["atttypmod"])
+                    except Exception as inspect_error:
+                        # The column cannot be inspected, so assume it still
+                        # has to be created.
+                        logger.debug("could not inspect the embeddings vector column: %s", inspect_error)
+                    if current_dim is not None:
                         if current_dim != vector_dimensions:
                             logger.warning(
                                 "vector dimension changed from %d to %d; altering column",
@@ -185,7 +210,13 @@ class PostgresStorage:
                         sql = f"ALTER TABLE embeddings ADD COLUMN IF NOT EXISTS embedding vector({vector_dimensions});"
                         await cur.execute(sql)
         except Exception as vector_col_error:
-            logger.debug("vector column skipped: %s", vector_col_error)
+            # A failed dimension migration leaves the column at the old
+            # width, so every later insert fails with a dimension mismatch.
+            # This was logged at debug level and went unnoticed.
+            logger.error("could not align the embeddings vector column: %s", vector_col_error)
+            raise RuntimeError(
+                f"could not align the embeddings vector column: {vector_col_error}"
+            ) from vector_col_error
 
     async def delete_embeddings_not_in(self, session_id: str, valid_source_ids: list[str]) -> int:
         """Remove embeddings for a session that are not in the valid set.
@@ -263,6 +294,7 @@ class PostgresStorage:
             key_points_val = json.dumps(note.key_points)
             concept_tags = note.concept_tags
             slide_refs_val = json.dumps(note.slide_references)
+            definitions_val = json.dumps(note.definitions)
             timestamp_epoch = note.timestamp_epoch
             start_time = note.start_time
             end_time = note.end_time
@@ -275,6 +307,7 @@ class PostgresStorage:
             key_points_val = json.dumps(note.get("key_points") or [])
             concept_tags = list(note.get("concept_tags") or [])
             slide_refs_val = json.dumps(note.get("slide_references") or [])
+            definitions_val = json.dumps(note.get("definitions") or [])
             timestamp_epoch = float(note.get("timestamp_epoch", 0.0))
             start_time = str(note.get("start_time") or "")
             end_time = str(note.get("end_time") or "")
@@ -282,15 +315,17 @@ class PostgresStorage:
         query = """
         INSERT INTO general_notes (
             session_id, lecture_id, sequence_number, heading, content,
-            key_points, concept_tags, slide_references, timestamp_epoch,
-            start_time, end_time
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            key_points, concept_tags, slide_references, definitions,
+            timestamp_epoch, start_time, end_time
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (session_id, sequence_number) DO UPDATE SET
+            lecture_id = EXCLUDED.lecture_id,
             heading = EXCLUDED.heading,
             content = EXCLUDED.content,
             key_points = EXCLUDED.key_points,
             concept_tags = EXCLUDED.concept_tags,
             slide_references = EXCLUDED.slide_references,
+            definitions = EXCLUDED.definitions,
             timestamp_epoch = EXCLUDED.timestamp_epoch,
             start_time = EXCLUDED.start_time,
             end_time = EXCLUDED.end_time;
@@ -301,8 +336,8 @@ class PostgresStorage:
                     query,
                     (
                         session_id, lecture_id, sequence_number, heading, content,
-                        key_points_val, concept_tags, slide_refs_val, timestamp_epoch,
-                        start_time, end_time
+                        key_points_val, concept_tags, slide_refs_val, definitions_val,
+                        timestamp_epoch, start_time, end_time
                     )
                 )
                 return (cur.rowcount or 0) > 0
@@ -316,7 +351,7 @@ class PostgresStorage:
         session_id: str,
         timestamp_epoch: float
     ) -> bool:
-        course_key = course_id if course_id else "_default_course"
+        course_key = course_id if course_id else DEFAULT_COURSE_KEY
         query = """
         INSERT INTO concepts (
             course_id, concept_name, definition, related_concepts, session_id, timestamp_epoch
@@ -493,7 +528,15 @@ class PostgresStorage:
                     await cur.execute(query, params)
                     return await cur.fetchall()
                 except Exception as err:
-                    await conn.rollback()
+                    # Only a missing pgvector extension is expected here. Any
+                    # other failure (a dimension mismatch, a missing column, a
+                    # permission error) used to be swallowed into an empty
+                    # result, which is indistinguishable from "no similar
+                    # chunks exist" and produced quietly wrong answers.
+                    message = str(err).lower()
+                    if "vector" not in message or "extension" not in message:
+                        logger.error("postgres vector search failed: %s", err)
+                        raise
                     logger.warning("vector search unavailable in postgres: %s", err)
                     return []
 
@@ -505,10 +548,14 @@ class PostgresStorage:
         WHERE course_id = %s
         ORDER BY timestamp_epoch ASC;
         """
+        # insert_concept stores a session without a course under the
+        # "_default_course" sentinel. The read path has to use the same
+        # mapping, otherwise those concepts are unreachable.
+        course_key = course_id if course_id else DEFAULT_COURSE_KEY
         async with self._lock:
             conn = await self.get_connection()
             async with conn.cursor() as cur:
-                await cur.execute(query, (course_id,))
+                await cur.execute(query, (course_key,))
                 rows = await cur.fetchall()
 
         grouped: dict[str, dict[str, Any]] = {}

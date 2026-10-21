@@ -147,16 +147,27 @@ def make_agent(temp_dir: str, router: Any = None) -> tuple[ScreenAgent, FakeBus]
 
 
 class TestScreenAgent(unittest.IsolatedAsyncioTestCase):
+    async def drain_background(self, agent: ScreenAgent) -> None:
+        """Wait for the background slide text extraction tasks."""
+        while agent.retry_tasks:
+            await asyncio.wait_for(
+                asyncio.gather(*list(agent.retry_tasks), return_exceptions=True), timeout=10.0
+            )
+
     async def test_ingest_saves_before_ocr_and_numbers_slides(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             router = MockVisionRouter("Binary Search")
             agent, bus = make_agent(temp_dir, router)
             event = await agent.ingest_png_bytes(make_slide_png(["Binary Search"]))
             self.assertEqual(event.slide_number, 1)
-            self.assertEqual(event.extracted_text, "Binary Search")
+            # The vision call runs in the background so the capture loop is
+            # not blocked by a slow model.
+            self.assertEqual(event.extracted_text, "")
+            await self.drain_background(agent)
             self.assertEqual(router.calls, 1)
             self.assertEqual(len(list(agent.slides_dir.glob("slide_*.png"))), 1)
             self.assertEqual(len(bus.published), 1)
+            self.assertEqual(bus.published[0].extracted_text, "Binary Search")
 
     async def test_revisited_slide_reuses_text_and_is_marked(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -176,12 +187,14 @@ class TestScreenAgent(unittest.IsolatedAsyncioTestCase):
             other_png = make_slide_png(["Quick sort", "pivot", "partition", "recurse"])
 
             first = await agent.ingest_png_bytes(first_png)
+            await self.drain_background(agent)
             await agent.ingest_png_bytes(other_png)
+            await self.drain_background(agent)
             again = await agent.ingest_png_bytes(first_png)
 
             self.assertEqual(first.revisited_slide_number, 0)
             self.assertEqual(again.revisited_slide_number, 1)
-            self.assertEqual(again.extracted_text, first.extracted_text)
+            self.assertEqual(again.extracted_text, "Slide content call 1")
             self.assertEqual(router.calls, 2)
 
     async def test_numbering_continues_after_restart(self) -> None:
@@ -203,9 +216,15 @@ class TestScreenAgent(unittest.IsolatedAsyncioTestCase):
 
             router = FailingRouter()
             agent, bus = make_agent(temp_dir, router)
+            agent.settings.vision_retry_delays_seconds = [0.05]
             event = await agent.ingest_png_bytes(make_slide_png(["test failure"]))
             self.assertEqual(event.extracted_text, "")
-            self.assertEqual(router.calls, 2)
+            await self.drain_background(agent)
+            self.assertGreaterEqual(router.calls, 2)
+            # The slide is still published, so the timeline keeps a record of
+            # it instead of losing it.
+            self.assertEqual(len(bus.published), 1)
+            self.assertEqual(bus.published[0].extracted_text, "")
 
 
 class TestScreenHelpers(unittest.TestCase):

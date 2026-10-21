@@ -30,6 +30,7 @@ from lecturelens.cli.helpers import (
     validate_export_format,
     validate_start_options
 )
+from lecturelens.config.defaults import SYNC_CONSUMER_GROUP
 from lecturelens.config.settings import Settings
 from lecturelens.core import session_meta
 from lecturelens.core.validation import sanitize_file_stem
@@ -224,7 +225,7 @@ async def render_stream_backlogs(bus: RedisBus, session_id: str) -> dict[str, in
     backlogs: dict[str, int] = {}
     for source_type in ("transcript", "slide"):
         stream_name = f"lecturelens:{session_id}:stream:{source_type}"
-        backlogs[source_type] = await bus.get_group_backlog(stream_name, "group:kuudere")
+        backlogs[source_type] = await bus.get_group_backlog(stream_name, SYNC_CONSUMER_GROUP)
     return backlogs
 
 

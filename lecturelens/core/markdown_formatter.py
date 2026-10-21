@@ -12,7 +12,10 @@ MOJIBAKE_REPLACEMENTS: dict[str, str] = {
     "â€¦": "...",
     "Ã©": "e",
     "Ã¨": "e",
-    "Ã ": "a",
+    # The mis-decoded a-grave is a capital A-tilde followed by a non breaking
+    # space, not a regular space, so the entry with a regular space could
+    # never match and every "à" survived into the notes.
+    "Ã\xa0": "a",
     "Ã§": "c",
 }
 

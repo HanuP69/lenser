@@ -1,4 +1,5 @@
 import asyncio
+import multiprocessing
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from typing import Any, Callable, Optional
@@ -34,7 +35,15 @@ def get_process_pool(max_workers: Optional[int] = None) -> ProcessPoolExecutor:
     global _process_pool
     if _process_pool is None:
         worker_count = max_workers if max_workers is not None else _configured_process_workers
-        _process_pool = ProcessPoolExecutor(max_workers=worker_count)
+        # The default start method on Linux is "fork", which copies a process
+        # that has running threads. The agents run an event loop and a thread
+        # pool, so forking can deadlock on a lock that another thread held at
+        # fork time. "spawn" is safe.
+        try:
+            context = multiprocessing.get_context("spawn")
+        except ValueError:
+            context = multiprocessing.get_context()
+        _process_pool = ProcessPoolExecutor(max_workers=worker_count, mp_context=context)
     return _process_pool
 
 
