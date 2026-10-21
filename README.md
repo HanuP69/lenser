@@ -12,7 +12,7 @@
 4. [Redis vs. Postgres: Durability & Replay](#redis-vs-postgres-durability--replay)
 5. [Thin Student Client & Personalization Engine](#thin-student-client--personalization-engine)
 6. [Student Knowledge Graph (`student_graph.db`)](#student-knowledge-graph-student_graphdb)
-7. [Automated Test Suite (415 Tests)](#automated-test-suite-415-tests)
+7. [Automated Test Suite (418 Tests)](#automated-test-suite-418-tests)
 8. [CLI Command Reference](#cli-command-reference)
 9. [Configuration & Environment Variables](#configuration--environment-variables)
 10. [Docker Compose & Getting Started](#docker-compose--getting-started)
@@ -223,16 +223,18 @@ Each student maintains an isolated, private SQLite database (`student_graph.db`)
 
 ---
 
-## Automated Test Suite (415 Tests)
+## Automated Test Suite (418 Tests)
 
-LectureLens maintains an automated test suite of **415 unit and integration tests** verifying concurrency, resilience, audio processing, screen capture, Postgres persistence, gateway fan-out, client personalization, and knowledge graphs:
+LectureLens maintains an automated test suite of **418 unit and integration tests** verifying concurrency, resilience, audio processing, screen capture, Postgres persistence, gateway fan-out, client personalization, and knowledge graphs:
 
 ```
-================= 412 passed, 3 skipped in 64.52s =================
+================= 414 passed, 4 skipped in 59.36s =================
 ```
 
-The three skipped tests are the failure injection tests. They need a live Redis
-and are only run when it is configured:
+The four skipped tests are the failure injection tests. They need a live Redis
+and are only run when it is configured. The variable holds the **Redis URL**, it
+is not a flag, so `LECTURELENS_INTEGRATION_REDIS=1` would try to connect to a
+host called "1":
 
 ```bash
 LECTURELENS_INTEGRATION_REDIS=redis://127.0.0.1:6379 pytest tests/test_integration_failures.py
@@ -254,7 +256,7 @@ LECTURELENS_INTEGRATION_REDIS=redis://127.0.0.1:6379 pytest tests/test_integrati
 | `test_postgres_persister.py` | **20 tests** | Idempotent timeline events, general note sequence numbers, concept tag extraction and merge with `COALESCE`, crash recovery, pgvector support, embedding reconciliation. |
 | `test_screen_agent.py` | **17 tests** | MSS screenshot grabbing, perceptual dHash hashing, Hamming distance slide cache, vision-LLM OCR fallback, mixed-clock gate, model checksum verification. |
 | `test_llm_router.py` | **17 tests** | Multimodal task routing, OpenAI-compatible provider, Google GenAI, Ollama, circuit breaker rate-limiting, retries, per-task breaker scoping. |
-| `test_clock_and_files.py` | **14 tests** | SessionClock persistence, elapsed duration calculation, accumulated_seconds tracking, atomic file writes. |
+| `test_clock_and_files.py` | **16 tests** | SessionClock persistence, elapsed duration calculation, accumulated_seconds tracking, atomic file writes, durable append after a torn line. |
 | `test_markdown_formatter.py` | **14 tests** | Code block indentation preservation, equation heading protection, unicode math preservation, display math block normalization. |
 | `test_structuring_agent.py` | **14 tests** | LangGraph pipeline, rolling window, 20s context overlap, byte-offset tracking, robust JSON extraction, crash rollback, empty-summary retry and raw fallback. |
 | `test_qa_engine.py` | **10 tests** | Vector indexing, pgvector integration with Chroma fallback, semantic search, RAG-grounded question answering with source citations. |
@@ -264,7 +266,7 @@ LECTURELENS_INTEGRATION_REDIS=redis://127.0.0.1:6379 pytest tests/test_integrati
 | `test_concurrency.py` | **4 tests** | Thread pool and process pool executor allocation, worker limits, safe shutdown. |
 | `test_pipeline_integration.py` | **3 tests** | Full integration test from multimodal stream ingestion through sync to general notes synthesis. |
 | `test_circuit_breaker.py` | **3 tests** | Redis fixed-window rate limiter, failure count tracking and TTL cooldown. |
-| `test_integration_failures.py` | **3 tests** | Opt-in failure injection: a crash between the durable file write and the Redis publish, a crash between the append and the state save, and a crash between the state update and the release. |
+| `test_integration_failures.py` | **4 tests** | Opt-in failure injection: a crash before the file write, between the file write and the Redis publish, between the append and the state save, and between the state update and the release. |
 
 To run the complete test suite:
 ```bash

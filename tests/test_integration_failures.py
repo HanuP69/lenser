@@ -161,6 +161,39 @@ class TestSyncFailureInjection(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(published), count)
         self.assertFalse(self.flush_state_path.exists())
 
+    async def test_crash_before_the_file_write_rewrites_the_entry(self) -> None:
+        """The write ahead intent is persisted but the file write never
+        happened. The next start has to drop the stale intent and write the
+        entry again."""
+        count = 4
+        result = run_fault_runner(self.session_id, self.output_dir, count, "crash_before_file_write")
+        self.assertNotEqual(result.returncode, 0, "the helper was expected to crash")
+
+        # The intent was saved but nothing was written.
+        self.assertTrue(self.flush_state_path.exists())
+        self.assertEqual(len(read_timeline_lines(self.timeline_path)), 0)
+        self.assertEqual(len(await read_stream_entries(self.bus, self.session_id)), 0)
+
+        # A restart drops the stale intent and writes the entries again.
+        restarted = SyncAgent(self.settings, self.bus, SessionClock(), self.session_id)
+        published: list[Any] = []
+        restarted.redis_bus.publish_resilient = _collect_publishes(published)
+        for index in range(count):
+            entry = restarted.transcript_to_entry(_chunk(self.session_id, index))
+            await restarted.add_entry(
+                entry,
+                stream_name=restarted.build_stream_name("transcript"),
+                group_name=restarted.consumer_group,
+                message_id=entry.event_id
+            )
+        flushed = await restarted.flush_ready_entries(force=True)
+        self.assertEqual(flushed, count)
+
+        # The file has every entry exactly once and so does the stream.
+        self.assertEqual(len(read_timeline_lines(self.timeline_path)), count)
+        self.assertEqual(len(published), count)
+        self.assertFalse(self.flush_state_path.exists())
+
     async def test_crash_after_the_state_pop_does_not_duplicate_the_file(self) -> None:
         """The second window: the entries are finished but the state was not
         released yet. The file must not gain a duplicate."""

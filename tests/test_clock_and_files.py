@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from lecturelens.core.clock import SessionClock
-from lecturelens.core.fileio import atomic_write_text, next_file_index
+from lecturelens.core.fileio import append_text_durably, atomic_write_text, next_file_index
 from lecturelens.core.session_meta import begin_run, finish_run, get_previous_duration_seconds
 from lecturelens.core.validation import is_valid_session_id, sanitize_file_stem
 
@@ -74,6 +74,30 @@ class TestFileHelpers(unittest.TestCase):
             atomic_write_text(path, "two")
             self.assertEqual(path.read_text(encoding="utf-8"), "two")
             self.assertEqual(len(list(Path(temp_dir).iterdir())), 1)
+
+    def test_durable_append_closes_a_torn_last_line(self) -> None:
+        """A crash can leave a partial last line. Appending directly would
+        merge the new entry into the fragment, and the merged line would be
+        skipped as invalid JSON, so the entry would be lost. The fragment
+        itself is unrecoverable, but the new entry has to survive."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "timeline.jsonl"
+            path.write_text('{"a": 1}\n{"b": 2', encoding="utf-8")
+            append_text_durably(path, '{"c": 3}\n')
+            lines = path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 3)
+            self.assertEqual(json.loads(lines[0]), {"a": 1})
+            # The torn fragment stays on its own line and is skipped as
+            # corrupt, instead of swallowing the entry that follows it.
+            self.assertEqual(lines[1], '{"b": 2')
+            self.assertEqual(json.loads(lines[2]), {"c": 3})
+
+    def test_durable_append_does_not_add_a_newline_to_a_clean_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "timeline.jsonl"
+            append_text_durably(path, '{"a": 1}\n')
+            append_text_durably(path, '{"b": 2}\n')
+            self.assertEqual(path.read_text(encoding="utf-8"), '{"a": 1}\n{"b": 2}\n')
 
 
 class TestValidationAndMeta(unittest.TestCase):

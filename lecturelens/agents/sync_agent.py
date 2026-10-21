@@ -567,6 +567,7 @@ class SyncAgent:
                     if self.flush_states.get(fingerprint) not in ("file", "both", "redis"):
                         self.flush_states[fingerprint] = "file_pending"
                 self.save_flush_states()
+                self.trigger_fault("crash_before_file_write")
                 try:
                     await run_in_thread_pool(append_text_durably, self.timeline_path, file_block)
                 except OSError as error:

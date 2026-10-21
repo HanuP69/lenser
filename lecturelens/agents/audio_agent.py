@@ -30,7 +30,7 @@ from lecturelens.schemas.events import TranscriptChunk
 
 logger = get_logger("lecturelens.audio_agent")
 
-HALLUCINATION_PHRASES: tuple[str, ...] = (
+ENGLISH_HALLUCINATION_PHRASES: tuple[str, ...] = (
     "thank you",
     "thanks for watching",
     "thank you for watching",
@@ -44,31 +44,45 @@ HALLUCINATION_PHRASES: tuple[str, ...] = (
 
 # Whisper hallucinates the sign off of the language it is transcribing, so an
 # English only list does nothing for a Hindi or Hinglish lecture.
+HINDI_HALLUCINATION_PHRASES: tuple[str, ...] = (
+    "\u0927\u0928\u094d\u092f\u0935\u093e\u0926",
+    "\u0927\u0928\u094d\u092f\u0935\u093e\u0926 \u092c\u0939\u0941\u0924",
+    "\u0927\u0928\u094d\u092f\u0935\u093e\u0926 \u092c\u0939\u0941\u0924 \u092c\u0939\u0941\u0924",
+    "\u0905\u0917\u0932\u0947 \u0935\u0940\u0921\u093f\u092f\u094b",
+    "\u0905\u0917\u0932\u0947 \u092d\u093e\u0917",
+    "\u0938\u092c\u094d\u0938\u0915\u094d\u0930\u093e\u0907\u092c",
+    "\u0938\u092c\u094d\u0938\u0915\u094d\u0930\u093e\u0907\u092c \u0915\u0930\u0947\u0902",
+    "\u091a\u0948\u0928\u0932",
+    "\u0932\u093e\u0907\u0915 \u0915\u0930\u0947\u0902",
+    "\u092c\u0947\u0932 \u0906\u0907\u0915\u0928",
+)
+
+HINGLISH_HALLUCINATION_PHRASES: tuple[str, ...] = (
+    "dhanyavaad",
+    "dhanyavad",
+    "shukriya",
+    "agle video",
+    "agle part",
+    "subscribe karein",
+    "like karein",
+    "bell icon dabayein",
+)
+
 HALLUCINATION_PHRASES_BY_LANGUAGE: dict[str, tuple[str, ...]] = {
-    "en": HALLUCINATION_PHRASES,
-    "hi": (
-        "धन्यवाद",
-        "धन्यवाद बहुत",
-        "धन्यवाद बहुत बहुत",
-        "अगले वीडियो",
-        "अगले भाग",
-        "सब्सक्राइब",
-        "सब्सक्राइब करें",
-        "चैनल",
-        "लाइक करें",
-        "बेल आइकन",
-    ),
-    "hinglish": (
-        "dhanyavaad",
-        "dhanyavad",
-        "shukriya",
-        "agle video",
-        "agle part",
-        "subscribe karein",
-        "like karein",
-        "bell icon dabayein",
-    ),
+    "en": ENGLISH_HALLUCINATION_PHRASES,
+    "hi": HINDI_HALLUCINATION_PHRASES,
+    "hinglish": HINGLISH_HALLUCINATION_PHRASES,
 }
+
+# Whisper never reports "hinglish" as a language, and a Hinglish lecture is
+# detected as "hi" or "en", so a list that is only selected by the detected
+# language would never be used. All of the lists are applied instead; the
+# phrases are specific enough for that.
+HALLUCINATION_PHRASES: tuple[str, ...] = tuple(
+    phrase
+    for language_phrases in HALLUCINATION_PHRASES_BY_LANGUAGE.values()
+    for phrase in language_phrases
+)
 
 _whisper_model_cache: dict[str, Any] = {}
 
