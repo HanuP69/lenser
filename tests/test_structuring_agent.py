@@ -180,6 +180,68 @@ class TestStructuringBasics(StructuringTestBase):
         self.assertEqual(restarted._batch_attempts, agent._batch_attempts)
         self.assertEqual(sum(restarted._batch_attempts.values()), 1)
 
+    async def test_quarantined_entries_are_written_once_per_batch(self) -> None:
+        """The quarantine was written before the synthesis, so a retried batch
+        appended the same entries again."""
+        agent = self.make_agent()
+        agent.max_batch_retries = 1
+        self.write_lines([
+            timeline_line(300.0, "transcript", "This video is sponsored by our friends", ["ad"]),
+            timeline_line(301.0, "transcript", "The definition of a binary search tree", ["definition"]),
+        ])
+
+        async def failing_invoke(state: Any) -> dict:
+            raise RuntimeError("llm is down")
+
+        agent.graph.ainvoke = failing_invoke  # type: ignore[assignment]
+
+        class FakeDrift:
+            def __init__(self) -> None:
+                self.quarantined_entries: list[dict[str, Any]] = []
+
+            def filter_batch_entries(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                quarantined = [e for e in entries if "ad" in (e.get("importance_flags") or [])]
+                self.quarantined_entries = list(quarantined)
+                return [e for e in entries if "ad" not in (e.get("importance_flags") or [])]
+
+            def to_dict(self) -> dict[str, Any]:
+                return {"quarantined_entries": list(self.quarantined_entries)}
+
+            def load_dict(self, data: dict[str, Any]) -> None:
+                return None
+
+            def reset(self) -> None:
+                self.quarantined_entries.clear()
+
+        agent.drift_filter = FakeDrift()  # type: ignore[assignment]
+
+        # The first attempt fails, so nothing is written yet.
+        with self.assertRaises(StructuringBatchError):
+            await agent.process_batch()
+        self.assertFalse(agent.quarantine_path.exists())
+
+        # The second attempt falls back to the raw content and the batch
+        # finishes, so the quarantine is written exactly once.
+        await agent.process_batch()
+        self.assertTrue(agent.quarantine_path.exists())
+        lines = [
+            json.loads(line)
+            for line in agent.quarantine_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("sponsored by", lines[0]["content"])
+
+    async def test_reset_outputs_clears_the_quarantine_file(self) -> None:
+        """The quarantine belongs to the run, so a reprocess must not append
+        to the file of the previous run."""
+        agent = self.make_agent()
+        agent.quarantine_path.write_text('{"event_id": "old"}\n', encoding="utf-8")
+        self.assertTrue(agent.quarantine_path.exists())
+
+        agent.reset_outputs()
+        self.assertFalse(agent.quarantine_path.exists())
+
     async def test_correlated_events_reach_the_llm_as_one_unit(self) -> None:
         await self.make_agent().process_batch()
         prompt = self.router.summary_prompts()[0]

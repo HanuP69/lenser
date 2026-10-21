@@ -117,6 +117,9 @@ class ContextDriftFilter:
             "running_anchor": None if self.running_anchor is None else self.running_anchor.copy(),
             "quarantine_buffer": list(self.quarantine_buffer),
             "pending_quarantine_entries": list(self.pending_quarantine_entries),
+            # The quarantined entries are part of the state, so a retried batch
+            # does not quarantine the same entries a second time.
+            "quarantined_entries": list(self.quarantined_entries),
             "accepted_count": self.accepted_count,
             "drift_count": self.drift_count,
         }
@@ -126,6 +129,7 @@ class ContextDriftFilter:
         self.running_anchor = None if anchor is None else np.asarray(anchor, dtype=np.float32)
         self.quarantine_buffer = list(snapshot.get("quarantine_buffer", []))
         self.pending_quarantine_entries = list(snapshot.get("pending_quarantine_entries", []))
+        self.quarantined_entries = list(snapshot.get("quarantined_entries", []))
         self.accepted_count = int(snapshot.get("accepted_count", 0))
         self.drift_count = int(snapshot.get("drift_count", 0))
 

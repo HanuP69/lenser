@@ -283,6 +283,45 @@ class TestPostgresLiveIntegration(unittest.IsolatedAsyncioTestCase):
         serialized = json.dumps({"type": "note_segment", "payload": notes[0]})
         self.assertIn("Live Postgres Note Content", serialized)
 
+    async def test_double_delivery_stores_the_event_once(self) -> None:
+        """A message that is redelivered after a failed acknowledgement must
+        not store the event twice."""
+        session_id = f"test_live_dup_{uuid.uuid4().hex[:8]}"
+        entry = TimelineEntry(
+            session_id=session_id,
+            event_id=f"dup_evt_{uuid.uuid4().hex[:6]}",
+            timestamp_epoch=1700000000.0,
+            elapsed_seconds=5.0,
+            source_type="transcript",
+            content="Delivered twice",
+            importance_flags=[]
+        )
+        self.assertTrue(await self.storage.insert_timeline_event(entry))
+        self.assertFalse(await self.storage.insert_timeline_event(entry))
+
+        events = await self.storage.get_timeline_events(session_id)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["content"], "Delivered twice")
+
+    async def test_double_delivery_of_a_note_keeps_one_row(self) -> None:
+        session_id = f"test_live_dup_note_{uuid.uuid4().hex[:8]}"
+        note = GeneralNoteSegment(
+            session_id=session_id,
+            sequence_number=1,
+            timestamp_epoch=1700000000.0,
+            start_time="00:00:10",
+            end_time="00:00:30",
+            heading="Section 1",
+            content="Note delivered twice",
+            key_points=[],
+            concept_tags=[]
+        )
+        self.assertTrue(await self.storage.insert_general_note(note))
+        self.assertTrue(await self.storage.insert_general_note(note))
+
+        notes = await self.storage.get_general_notes_since(session_id, after_sequence_number=0)
+        self.assertEqual(len(notes), 1)
+
     async def test_concept_merge_in_live_postgres(self) -> None:
         session_id = f"test_live_concept_sess_{uuid.uuid4().hex[:8]}"
         course_id = f"test_course_live_{uuid.uuid4().hex[:8]}"

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -623,11 +624,30 @@ class StructuringAgent:
             section_lines.append("")
         return "\n".join(section_lines) + "\n"
 
+    @staticmethod
+    def _quarantine_key(entry: dict[str, Any]) -> str:
+        """A stable key for a quarantined entry.
+
+        The event id is used when there is one. The timeline records do not
+        always carry one, so the content is used as the fallback.
+        """
+        event_id = str(entry.get("event_id") or "")
+        if len(event_id) > 0:
+            return event_id
+        raw = (
+            f"{entry.get('source_type', '')}|{entry.get('timestamp_epoch', '')}|"
+            f"{entry.get('content', '')}"
+        )
+        return hashlib.sha1(raw.encode("utf-8", errors="replace"), usedforsecurity=False).hexdigest()
+
     async def persist_quarantined_entries(self) -> None:
         """Write the entries that the ad or drift filter excluded to disk.
 
         They are kept out of the notes, but they are not deleted either, so a
-        false positive on the heuristics does not lose the content.
+        false positive on the heuristics does not lose the content. The write
+        happens once the batch is finished, so a batch that is retried does
+        not append the same entries again, and the entries are keyed so a
+        repeated write is skipped.
         """
         if self.drift_filter is None:
             return
@@ -635,12 +655,17 @@ class StructuringAgent:
         if len(quarantined) == 0:
             return
         self.drift_filter.quarantined_entries.clear()
+        known_keys = self._read_quarantine_keys()
         lines = []
         for entry in quarantined:
+            key = self._quarantine_key(entry)
+            if key in known_keys:
+                continue
             try:
                 lines.append(json.dumps(entry, ensure_ascii=False, default=str))
             except (TypeError, ValueError):
                 continue
+            known_keys.add(key)
         if len(lines) == 0:
             return
         try:
@@ -653,13 +678,36 @@ class StructuringAgent:
         except OSError as error:
             logger.warning("could not write the quarantined entries: %s", error)
 
+    def _read_quarantine_keys(self) -> set[str]:
+        """The keys that are already in the quarantine file."""
+        if not self.quarantine_path.exists():
+            return set()
+        keys: set[str] = set()
+        try:
+            with open(self.quarantine_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if len(line) == 0:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(payload, dict):
+                        keys.add(self._quarantine_key(payload))
+        except OSError:
+            return keys
+        return keys
+
     async def process_single_batch(self, batch: SliceBatch, running_context: str) -> str:
         entries = batch.entries
         if self.drift_filter is not None:
             entries = await run_in_thread_pool(self.drift_filter.filter_batch_entries, batch.entries)
-            await self.persist_quarantined_entries()
 
         if len(entries) == 0:
+            # Everything was filtered out, so the batch is finished and the
+            # quarantine can be written.
+            await self.persist_quarantined_entries()
             logger.info("all entries in batch ending at offset %d filtered as drift/ad; skipping synthesis", batch.end_offset)
             self.save_notes_marker(batch.end_offset)
             self.save_state(running_context, batch.end_offset, self.current_overlap)
@@ -717,6 +765,11 @@ class StructuringAgent:
                 "falling back to the raw timeline content",
                 batch.end_offset, attempts
             )
+            # The raw content is a fallback, not a synthesis. It is worth
+            # pointing out, because the notes for that part of the lecture
+            # are unedited transcript until the batch is reprocessed.
+            self.control.increment_stat("raw_fallback_batches")
+            self.control.set_stat("raw_fallback_offset", batch.end_offset)
             section_text = self.build_raw_section(active_batch)
             result_state = dict(result_state)
             result_state["summary"] = section_text
@@ -745,6 +798,10 @@ class StructuringAgent:
 
         self.sequence_number += 1
         self._batch_attempts.pop(batch.end_offset, None)
+        # The batch is finished, so the quarantined entries are written now.
+        # Writing them before the synthesis would append them again on every
+        # retry of a failed batch.
+        await self.persist_quarantined_entries()
 
         slide_references: list[int] = []
         for entry in entries:
@@ -813,7 +870,15 @@ class StructuringAgent:
         return await self.process_all_pending()
 
     def reset_outputs(self) -> None:
-        for path in (self.notes_path, self.context_path, self.notes_marker_path, self.batch_attempts_path):
+        for path in (
+            self.notes_path,
+            self.context_path,
+            self.notes_marker_path,
+            self.batch_attempts_path,
+            # The quarantine belongs to the run. Leaving it behind made a
+            # reprocess append the same entries to the old file again.
+            self.quarantine_path,
+        ):
             if path.exists():
                 path.unlink()
         self.current_overlap = []
