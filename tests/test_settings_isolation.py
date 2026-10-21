@@ -22,6 +22,23 @@ class TestTheMachineDoesNotChangeTheTests(unittest.TestCase):
         self.assertEqual(settings.screenshot_interval_seconds, 1.0)
         self.assertEqual(settings.monitor_index, 1)
 
+    def test_the_output_is_the_output_of_the_project(self) -> None:
+        """A relative path is resolved against the project.
+
+        The same command wrote its notes somewhere else every time it
+        was started from a different folder, and the notes of a session
+        could not be found again.
+        """
+        settings = Settings()
+        self.assertTrue(settings.output_dir.is_absolute())
+        self.assertIn("virt", str(settings.output_dir))
+        self.assertEqual(settings.output_dir.name, "output")
+
+    def test_the_router_file_is_the_one_of_the_project(self) -> None:
+        settings = Settings()
+        self.assertTrue(settings.router_config_path.is_absolute())
+        self.assertTrue(settings.router_config_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

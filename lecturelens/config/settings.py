@@ -13,6 +13,25 @@ from pydantic_settings import BaseSettings
 from lecturelens.core.validation import sanitize_file_stem
 
 
+def project_root() -> Path:
+    """The folder of the project, where the .env file is."""
+    return Path(__file__).resolve().parent.parent.parent
+
+
+def resolve_output_dir(output_dir: Path) -> Path:
+    """Where the sessions are written.
+
+    A relative path is resolved against the folder of the project, not
+    against the folder the command was started in. Otherwise the same
+    command wrote its notes somewhere else every time it was started
+    from a different folder, and the notes of a session could not be
+    found again.
+    """
+    if output_dir.is_absolute():
+        return output_dir
+    return (project_root() / output_dir).resolve()
+
+
 class Settings(BaseSettings):
     model_config = {
         "env_prefix": "LECTURELENS_",
@@ -202,6 +221,11 @@ class Settings(BaseSettings):
             # could silently use a different embedding space than the rest
             # of the pipeline.
             self.drift_embed_model = self.embedding_model
+        self.output_dir = resolve_output_dir(self.output_dir)
+        if not self.router_config_path.is_absolute():
+            # The router file belongs to the project, so it is found
+            # wherever the command was started.
+            self.router_config_path = (project_root() / self.router_config_path).resolve()
         return self
 
     def get_session_output_dir(self, session_id: str) -> Path:
