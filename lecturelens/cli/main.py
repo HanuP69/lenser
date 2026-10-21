@@ -50,6 +50,7 @@ from lecturelens.cli.helpers import (
     format_low_disk_warning,
     get_free_disk_bytes,
     last_transcript_snippet,
+    safe_for_console,
     validate_export_format,
     validate_start_options
 )
@@ -84,6 +85,11 @@ console = Console()
 logger = get_logger("lecturelens.cli")
 
 CAPTURE_AGENT_NAMES: tuple[str, ...] = ("audio_agent", "screen_agent")
+
+# How long the stop waits for the finished flag after the agents of the
+# session stopped. The agents are stopped first and the flag is set
+# afterwards, so the stop has to wait for it.
+AGENTS_GONE_GRACE_SECONDS = 120.0
 
 
 def fail(message: str) -> None:
@@ -767,19 +773,27 @@ def stop(
     if not wait:
         return
     deadline = time.monotonic() + timeout_seconds
+    # The agents are stopped by the process that owns the session, and the
+    # flag is set after that. So the agents being gone is the normal way
+    # a session ends, and the stop waits a little for the flag instead of
+    # giving up at once.
+    agents_gone_since: Optional[float] = None
     while time.monotonic() < deadline:
         if flag_exists(session_dir, SESSION_FINISHED_FLAG_NAME):
             console.print("[green]Session stopped.[/green]")
             display_session_output_summary(session_dir, console)
             return
         if agents_are_gone(session_dir):
-            # Nothing is running any more, so the session cannot finish on
-            # its own. Waiting for the whole timeout would be pointless.
-            console.print(
-                "[yellow]The agents of the session are not running any more, "
-                "so the session cannot be finished.[/yellow]"
-            )
-            break
+            if agents_gone_since is None:
+                agents_gone_since = time.monotonic()
+            elif time.monotonic() - agents_gone_since >= AGENTS_GONE_GRACE_SECONDS:
+                console.print(
+                    "[yellow]The agents of the session are not running any more, "
+                    "so the session cannot be finished.[/yellow]"
+                )
+                break
+        else:
+            agents_gone_since = None
         time.sleep(1.0)
     # The session is not killed by the timeout. The agents keep running and
     # the notes are written when the final structuring pass is done, which
@@ -1016,11 +1030,11 @@ def ask(
         answer, references = asyncio.run(run())
     except Exception as error:
         fail(f"Could not answer: {error}")
-    console.print(answer)
+    console.print(safe_for_console(answer))
     if len(references) > 0:
         console.print("\n[bold]Sources[/bold]")
         for reference in references:
-            console.print(f"- {reference}")
+            console.print(safe_for_console(f"- {reference}"))
 
 
 @app.command()
@@ -1041,7 +1055,7 @@ def review(
             console.print(f"Concepts tracked: {summary['concepts_tracked']}, Misconceptions: {summary['total_misconceptions']}")
             for c in summary["concepts"][:10]:
                 decayed = c.get("decayed_mastery", c["mastery_level"])
-                console.print(f"  - {c['concept_name']}: mastery {c['mastery_level']:.2f} (decayed: {decayed:.2f})")
+                console.print(safe_for_console(f"  - {c['concept_name']}: mastery {c['mastery_level']:.2f} (decayed: {decayed:.2f})"))
             return
     if settings.postgres_url:
 
@@ -1064,7 +1078,7 @@ def review(
             if concepts:
                 console.print(f"[bold]Concepts ({len(concepts)})[/bold]")
                 for c in concepts:
-                    console.print(f"  - {c['concept_name']}: {c.get('definition') or 'No definition'} (Related: {', '.join(c.get('related_concepts') or [])})")
+                    console.print(safe_for_console(f"  - {c['concept_name']}: {c.get('definition') or 'No definition'} (Related: {', '.join(c.get('related_concepts') or [])})"))
                 return
         except Exception as err:
             console.print(f"[yellow]Could not query Postgres concepts: {err}[/yellow]")
