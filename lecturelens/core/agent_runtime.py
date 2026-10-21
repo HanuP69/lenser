@@ -160,7 +160,9 @@ def create_redis_bus(
     return RedisBus(
         settings.redis_url,
         stream_max_length=getattr(settings, "stream_max_length", 200000),
+        max_delivery_attempts=getattr(settings, "redis_max_delivery_attempts", 5),
         reclaim_idle_ms=getattr(settings, "reclaim_idle_ms", 30000),
+        reclaim_interval_seconds=getattr(settings, "redis_reclaim_interval_seconds", 15.0),
         retry_ttl_seconds=getattr(settings, "retry_key_ttl_seconds", getattr(settings, "redis_retry_ttl_seconds", 86400)),
         outbox_max_size=getattr(settings, "redis_outbox_max_size", getattr(settings, "outbox_max_size", 1000)),
         outbox_path=resolved_outbox,
@@ -236,6 +238,33 @@ def build_runtime_context(
         session_id=session_id,
         session_clock=session_clock,
         redis_bus=redis_bus
+    )
+
+
+def configure_agent_pools(settings: Settings) -> None:
+    """Configure the pools for an agent process.
+
+    The audio agent preloads the Whisper model in every process pool worker,
+    because the model was previously only loaded in whichever worker the
+    preload task happened to run in. The other worker then had to load it
+    again on its first transcription.
+    """
+    configure_pools(settings.thread_pool_max_workers, settings.process_pool_max_workers)
+    if not getattr(settings, "whisper_preload_in_every_worker", True):
+        return
+    try:
+        from lecturelens.agents.audio_agent import preload_whisper_model
+    except Exception:
+        return
+    configure_pools(
+        settings.thread_pool_max_workers,
+        settings.process_pool_max_workers,
+        process_initializer=preload_whisper_model,
+        process_initargs=(
+            settings.whisper_model_size,
+            settings.whisper_device,
+            settings.whisper_compute_type,
+        ),
     )
 
 

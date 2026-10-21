@@ -120,7 +120,14 @@ else:
 
 img_arr1 = np.array(slide_img.convert("RGB"))
 img_arr2 = np.copy(img_arr1)
-img_arr2[100:150, 100:150] = 0
+# The synthetic change has to be large enough to cross the slide change gate
+# threshold. The small 50x50 square was below it, so the "changed"
+# benchmarks actually measured the unchanged path and the numbers were
+# meaningless.
+_changed_fraction = 0.12
+_region_height = max(1, int(img_arr1.shape[0] * (_changed_fraction ** 0.5)))
+_region_width = max(1, int(img_arr1.shape[1] * (_changed_fraction ** 0.5)))
+img_arr2[:_region_height, :_region_width] = 0
 
 naive_times = []
 for _ in range(50):
@@ -132,6 +139,19 @@ avg_naive_ms = (sum(naive_times) / len(naive_times)) * 1000.0
 thumb_base = build_gray_thumbnail(slide_img, 640)
 alt_slide_img = Image.fromarray(img_arr2)
 thumb_changed = build_gray_thumbnail(alt_slide_img, 640)
+
+# Verify that the synthetic change is actually detected by the gate, so the
+# "changed" measurements below are real.
+_gate_probe = SlideChangeGate(change_threshold=0.004, pixel_delta=25, min_interval_seconds=0.0)
+_gate_probe.evaluate(thumb_base, 0.0)
+_detected = False
+for _probe_index in range(1, 6):
+    if _gate_probe.evaluate(thumb_changed, float(_probe_index)):
+        _detected = True
+        break
+if not _detected:
+    print("    WARNING: the synthetic change is below the gate threshold; "
+          "the 'changed' measurements below do not exercise the change path.")
 
 gate_settled = SlideChangeGate(change_threshold=0.004, pixel_delta=25, min_interval_seconds=0.0)
 gate_settled.evaluate(thumb_base, 0.0)

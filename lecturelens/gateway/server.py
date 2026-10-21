@@ -188,14 +188,16 @@ class GatewayServer:
         self._accepted_capture_queue.append((time.monotonic(), capture_id))
         capacity = getattr(self.settings, "gateway_capture_id_capacity", 5000)
         ttl = getattr(self.settings, "gateway_capture_id_ttl_seconds", 600.0)
-        if len(self._accepted_capture_queue) > capacity:
-            cutoff = time.monotonic() - ttl
-            while self._accepted_capture_queue and self._accepted_capture_queue[0][0] < cutoff:
-                _, old_id = self._accepted_capture_queue.pop(0)
-                self.accepted_capture_ids.discard(old_id)
-            if len(self._accepted_capture_queue) > capacity:
-                _, old_id = self._accepted_capture_queue.pop(0)
-                self.accepted_capture_ids.discard(old_id)
+        # The expiry was only enforced when the queue grew past the capacity,
+        # so a capture id could stay accepted for the whole session. The
+        # ttl is now enforced on every call.
+        cutoff = time.monotonic() - ttl
+        while self._accepted_capture_queue and self._accepted_capture_queue[0][0] < cutoff:
+            _, old_id = self._accepted_capture_queue.pop(0)
+            self.accepted_capture_ids.discard(old_id)
+        while len(self._accepted_capture_queue) > capacity:
+            _, old_id = self._accepted_capture_queue.pop(0)
+            self.accepted_capture_ids.discard(old_id)
 
     async def broadcast_note_segment(self, session_id: str, note_data: dict[str, Any]) -> None:
         if session_id in self.catching_up:

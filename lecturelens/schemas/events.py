@@ -282,6 +282,9 @@ class TimelineEntry(BaseModel):
     @classmethod
     def from_jsonl_dict(cls, data: dict, record_index: Optional[int] = None) -> "TimelineEntry":
         if not data.get("event_id"):
+            # The legacy id is derived from the content and the position in
+            # the file. Two identical records are still two distinct events,
+            # but the ids stay stable when the same file is replayed again.
             rec_id = data.get("record_id")
             if rec_id is None:
                 rec_id = data.get("line_number")
@@ -293,6 +296,8 @@ class TimelineEntry(BaseModel):
             content_hash = hashlib.sha256(
                 f"{data.get('session_id')}:{data.get('timestamp_epoch')}:{data.get('source_type')}:{data.get('content')}{elapsed_part}{rec_part}:{meta_str}".encode()
             ).hexdigest()[:32]
+            # The caller's dict is not modified.
+            data = dict(data)
             data["event_id"] = f"legacy_{content_hash}"
         return cls(**data)
 

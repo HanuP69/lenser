@@ -120,7 +120,7 @@ class TestStructuringBasics(StructuringTestBase):
         stream_name, segment = self.bus.published[0]
         self.assertIn("stream:notes", stream_name)
         self.assertEqual(segment.sequence_number, 1)
-        self.assertIn("binary search", segment.concept_tags)
+        self.assertIn("Binary Search", segment.concept_tags)
         self.assertEqual(segment.slide_references, [1])
 
     async def test_empty_summary_is_retried_then_falls_back_to_raw_content(self) -> None:

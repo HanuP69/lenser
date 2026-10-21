@@ -39,6 +39,24 @@ class SessionClock:
             return self.elapsed_offset_seconds
         return elapsed
 
+    def format_elapsed(self, elapsed_seconds: float) -> str:
+        """Format an elapsed duration as HH:MM:SS."""
+        total = int(max(0.0, elapsed_seconds))
+        hours = total // 3600
+        minutes = (total % 3600) // 60
+        seconds = total % 60
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    def format_epoch_as_elapsed(self, epoch_seconds: float) -> str:
+        """Format an absolute timestamp as the elapsed lecture time.
+
+        The notes used the wall clock time of the moment, so a lecture that
+        started at 14:30 produced headings like "14:42:03". The elapsed
+        lecture time is what a reader needs, and it is what the question
+        answering citations already use.
+        """
+        return self.format_elapsed(self.elapsed_for_epoch(epoch_seconds))
+
     def to_dict(self) -> dict:
         data = {}
         data["reference_wall_time"] = self.reference_wall_time

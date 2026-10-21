@@ -13,7 +13,13 @@ from typing import Any, Optional
 import numpy as np
 
 from lecturelens.config.settings import Settings
-from lecturelens.core.agent_runtime import AgentControl, RuntimeContext, execute_agent_main, run_standard_agent
+from lecturelens.core.agent_runtime import (
+    AgentControl,
+    RuntimeContext,
+    configure_agent_pools,
+    execute_agent_main,
+    run_standard_agent
+)
 from lecturelens.core.clock import SessionClock
 from lecturelens.core.concurrency import run_in_process_pool, run_in_thread_pool
 from lecturelens.core.fileio import atomic_write_bytes, next_file_index
@@ -742,13 +748,15 @@ class AudioAgent:
 
         detected_language = str(result.get("language", "en"))
         language_probability = float(result.get("language_probability", 0.0))
-        if (
-            self.locked_language is None
-            and self.settings.whisper_lock_language
-            and language_probability >= 0.8
-        ):
-            self.locked_language = detected_language
-            logger.info("language locked to %s", detected_language)
+        if self.locked_language is None:
+            # The language was detected again for every chunk, so a Hinglish
+            # lecture could flip between languages mid sentence. A confident
+            # detection is remembered and reused. whisper_lock_language
+            # additionally sticks a low confidence detection.
+            threshold = 0.0 if self.settings.whisper_lock_language else 0.8
+            if language_probability >= threshold:
+                self.locked_language = detected_language
+                logger.info("language locked to %s", detected_language)
 
         importance_flags = detect_importance_flags(transcript_text)
         chunk_event = TranscriptChunk(
@@ -801,6 +809,9 @@ class AudioAgent:
 
 async def main() -> None:
     def build_agent(context: RuntimeContext) -> AudioAgent:
+        # Every process pool worker preloads the Whisper model, so the model
+        # is not loaded twice or reloaded on the first transcription.
+        configure_agent_pools(context.settings)
         return AudioAgent(
             settings=context.settings,
             redis_bus=context.redis_bus,

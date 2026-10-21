@@ -74,7 +74,7 @@ class QAEngine:
         self.embedding_model: str = embedding_model
         self.fallback_model: str = fallback_model
         self.session_dir: Path = Path(session_dir)
-        resolved_url = ollama_url or os.environ.get("LECTURELENS_OLLAMA_URL", "http://localhost:11434")
+        resolved_url = ollama_url or os.environ.get("LECTURELENS_OLLAMA_URL", "http://127.0.0.1:11434")
         self.ollama_url: str = resolved_url.rstrip("/")
         self.llm_router: Any = llm_router
         self.top_k: int = top_k

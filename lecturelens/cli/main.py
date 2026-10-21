@@ -836,7 +836,11 @@ def review(
 def student(
     server: Optional[str] = typer.Option(None, "--server", help="WebSocket URL of lecture gateway"),
     session: str = typer.Option(..., "--session", help="Session ID to subscribe to"),
-    student_id: str = typer.Option("student_1", "--student-id", help="Unique student ID"),
+    student_id: str = typer.Option(
+        os.environ.get("USERNAME") or os.environ.get("USER") or "student",
+        "--student-id",
+        help="Unique student ID"
+    ),
     language: str = typer.Option("English", "--language", help="Target language/style (e.g. English, Hindi, Hinglish)"),
     detail: str = typer.Option("comprehensive", "--detail", help="Detail level (comprehensive, concise, beginner)"),
     api_key: Optional[str] = typer.Option(None, "--api-key", envvar="LECTURELENS_GATEWAY_API_KEY"),

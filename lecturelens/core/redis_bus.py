@@ -81,6 +81,7 @@ class RedisBus:
         self._outbox_lock: asyncio.Lock = asyncio.Lock()
         self._inflight_event_ids: set[str] = set()
         self._inflight_wait_seconds: float = 5.0
+        self._reclaim_cursors: dict[str, str] = {}
         self.failure_counts: dict[str, int] = {}
         self._last_flush_attempt: float = 0.0
         self._flush_backoff_seconds: float = 1.0
@@ -95,6 +96,27 @@ class RedisBus:
         if not self.outbox_path:
             return
         self.outbox_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._init_db_inner()
+        except Exception as error:
+            # A permanently malformed outbox file blocked the agent from
+            # starting: the same error was raised on every start. The file is
+            # quarantined so the agent can run, and the path is logged so the
+            # buffered events can be recovered from it.
+            broken_path = self.outbox_path.with_suffix(".broken")
+            try:
+                if self.outbox_path.exists():
+                    self.outbox_path.replace(broken_path)
+            except OSError:
+                pass
+            logger.error(
+                "the outbox %s could not be initialised (%s). It was moved to %s and a "
+                "new one was created. Any events that were buffered in it are in that file.",
+                self.outbox_path, error, broken_path
+            )
+            self._init_db_inner()
+
+    def _init_db_inner(self) -> None:
         legacy_path = self.outbox_path.with_suffix(".legacy_migration")
         legacy_source = None
         if legacy_path.exists():
@@ -571,17 +593,24 @@ class RedisBus:
         batch_size: int,
         idle_ms: Optional[int] = None
     ) -> list[tuple[str, dict[str, str]]]:
+        # The reclaim cursor is remembered, so the scan does not restart from
+        # the beginning of the pending list on every call.
+        cursor_key = f"{stream_name}|{group_name}"
+        start_id = self._reclaim_cursors.get(cursor_key, "0-0")
         result = await self.client.xautoclaim(
             stream_name,
             group_name,
             consumer_name,
             min_idle_time=idle_ms if idle_ms is not None else self.reclaim_idle_ms,
-            start_id="0-0",
+            start_id=start_id,
             count=batch_size
         )
         claimed: list[tuple[str, dict[str, str]]] = []
         if result is None or len(result) < 2:
             return claimed
+        next_cursor = result[0]
+        if isinstance(next_cursor, str) and len(next_cursor) > 0:
+            self._reclaim_cursors[cursor_key] = next_cursor
         for message_id, message_data in result[1]:
             if message_data is None:
                 continue

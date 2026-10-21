@@ -93,6 +93,8 @@ class Settings(BaseSettings):
 
     redis_consumer_batch_size: int = Field(default=10)
     redis_consumer_block_ms: int = Field(default=2000)
+    redis_max_delivery_attempts: int = Field(default=5)
+    redis_reclaim_interval_seconds: float = Field(default=15.0)
     redis_backlog_drain_budget_seconds: float = Field(default=60.0)
     redis_socket_connect_timeout_seconds: float = Field(default=5.0)
     redis_socket_timeout_seconds: float = Field(default=30.0)
@@ -146,12 +148,17 @@ class Settings(BaseSettings):
     drift_similarity_threshold: float = Field(default=0.50)
     drift_consecutive_shift: int = Field(default=3)
     drift_min_content_words: int = Field(default=8)
-    drift_embed_model: str = Field(default="nomic-embed-text")
+    drift_embed_model: Optional[str] = Field(default=None)
 
     @model_validator(mode="after")
     def sync_drift_threshold(self) -> "Settings":
         if self.drift_threshold is not None:
             self.drift_similarity_threshold = self.drift_threshold
+        if not self.drift_embed_model:
+            # The drift filter used a separately configured model, so it
+            # could silently use a different embedding space than the rest
+            # of the pipeline.
+            self.drift_embed_model = self.embedding_model
         return self
 
     def get_session_output_dir(self, session_id: str) -> Path:

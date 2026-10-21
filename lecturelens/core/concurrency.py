@@ -12,15 +12,29 @@ _thread_pool: Optional[ThreadPoolExecutor] = None
 _process_pool: Optional[ProcessPoolExecutor] = None
 _configured_thread_workers: int = 4
 _configured_process_workers: int = 2
+_process_pool_initializer: Optional[Callable[..., Any]] = None
+_process_pool_initargs: tuple = ()
 
 
-def configure_pools(thread_workers: int, process_workers: int) -> None:
+def configure_pools(
+    thread_workers: int,
+    process_workers: int,
+    process_initializer: Optional[Callable[..., Any]] = None,
+    process_initargs: tuple = ()
+) -> None:
     global _configured_thread_workers
     global _configured_process_workers
+    global _process_pool_initializer
+    global _process_pool_initargs
     if thread_workers > 0:
         _configured_thread_workers = thread_workers
     if process_workers > 0:
         _configured_process_workers = process_workers
+    if process_initializer is not None:
+        _process_pool_initializer = process_initializer
+        _process_pool_initargs = tuple(process_initargs)
+        # The initializer only applies to a newly created pool.
+        reset_process_pool()
 
 
 def get_thread_pool(max_workers: Optional[int] = None) -> ThreadPoolExecutor:
@@ -43,7 +57,19 @@ def get_process_pool(max_workers: Optional[int] = None) -> ProcessPoolExecutor:
             context = multiprocessing.get_context("spawn")
         except ValueError:
             context = multiprocessing.get_context()
-        _process_pool = ProcessPoolExecutor(max_workers=worker_count, mp_context=context)
+        # The initializer runs in every worker, so a model that is expensive to
+        # load is only loaded once per worker. Without it the model was
+        # preloaded in a single worker and the other one had to load it again
+        # on its first use.
+        if _process_pool_initializer is not None:
+            _process_pool = ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=context,
+                initializer=_process_pool_initializer,
+                initargs=_process_pool_initargs,
+            )
+        else:
+            _process_pool = ProcessPoolExecutor(max_workers=worker_count, mp_context=context)
     return _process_pool
 
 

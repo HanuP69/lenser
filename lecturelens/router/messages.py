@@ -51,7 +51,7 @@ def parse_confidence_footer(text: str, default_confidence: float = 0.5) -> tuple
         return text.strip(), default_confidence
     if confidence > 1.0:
         confidence = confidence / 100.0 if confidence <= 100.0 else 1.0
-    if confidence < 0.0:
-        confidence = 0.0
+    # The pattern cannot match a leading minus sign, so a negative confidence
+    # is never parsed. The clamp below was unreachable.
     cleaned_text = text[:match.start()].strip()
     return cleaned_text, confidence

@@ -19,6 +19,7 @@ from lecturelens.core.agent_runtime import (
     execute_agent_main,
     run_standard_agent
 )
+from lecturelens.core.clock import SessionClock
 from lecturelens.core.concurrency import run_in_thread_pool
 from lecturelens.core.fileio import atomic_write_text
 from lecturelens.core.drift_filter import ContextDriftFilter
@@ -287,8 +288,12 @@ LECTURE SUMMARY:
         if isinstance(parsed, list):
             for item in parsed:
                 if isinstance(item, dict) and "term" in item and "definition" in item:
+                    # The term used to be lowercased, which wrecked acronyms
+                    # and proper nouns such as "TCP" or "Binary Search Tree".
+                    # The term is matched case insensitively where it is
+                    # looked up, so the original spelling is kept here.
                     definitions.append({
-                        "term": str(item["term"]).strip().lower(),
+                        "term": str(item["term"]).strip(),
                         "definition": str(item["definition"]).strip()
                     })
         return {"definitions": definitions}
@@ -415,6 +420,9 @@ class StructuringAgent:
         self.max_batch_retries: int = MAX_BATCH_RETRIES
         self.max_consecutive_failures: int = MAX_CONSECUTIVE_PASS_FAILURES
         self._batch_attempts: dict[int, int] = {}
+        # The notes are timestamped with the elapsed lecture time, not with
+        # the wall clock time of the moment.
+        self.session_clock: SessionClock = SessionClock.load_or_create(self.session_dir / "clock.json")
         initial_state_data = self.load_state()
         self.current_overlap: list[dict[str, Any]] = list(initial_state_data.get("overlap_entries", []))
         self.sequence_number: int = int(initial_state_data.get("sequence_number", 0))
@@ -539,7 +547,7 @@ class StructuringAgent:
             return ""
         cleaned_summary = format_clean_markdown(summary).strip()
         first_timestamp = float(batch.entries[0].get("timestamp_epoch", 0.0))
-        heading_time = time.strftime("%H:%M:%S", time.localtime(first_timestamp))
+        heading_time = self.session_clock.format_epoch_as_elapsed(first_timestamp)
         divider = "\n---\n\n" if (self.notes_path.exists() and self.notes_path.stat().st_size > 0) else ""
         section_lines: list[str] = [f"{divider}### {heading_time}", ""]
 
@@ -574,7 +582,7 @@ class StructuringAgent:
         lecture material is kept verbatim instead of being dropped.
         """
         first_timestamp = float(batch.entries[0].get("timestamp_epoch", 0.0))
-        heading_time = time.strftime("%H:%M:%S", time.localtime(first_timestamp))
+        heading_time = self.session_clock.format_epoch_as_elapsed(first_timestamp)
         divider = "\n---\n\n" if (self.notes_path.exists() and self.notes_path.stat().st_size > 0) else ""
         section_lines: list[str] = [f"{divider}### {heading_time}", ""]
         for entry in batch.entries:
@@ -658,8 +666,8 @@ class StructuringAgent:
 
         first_timestamp = float(entries[0].get("timestamp_epoch", 0.0))
         last_timestamp = float(entries[-1].get("timestamp_epoch", first_timestamp))
-        start_time_str = time.strftime("%H:%M:%S", time.localtime(first_timestamp))
-        end_time_str = time.strftime("%H:%M:%S", time.localtime(last_timestamp))
+        start_time_str = self.session_clock.format_epoch_as_elapsed(first_timestamp)
+        end_time_str = self.session_clock.format_epoch_as_elapsed(last_timestamp)
 
         if self.notes_path.exists() and self.load_notes_marker() >= batch.end_offset:
             logger.info(
