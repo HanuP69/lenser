@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
+from lecturelens.core.repeat_guard import Guards
 from lecturelens.router.messages import HumanMessage, response_to_text
 from lecturelens.schemas.events import GeneralNoteSegment
 
@@ -234,6 +235,8 @@ class StudentClient:
         # students sharing an output directory overwrote each other's notes.
         self.notes_file = output_dir / f"{session_id}_{profile.student_id}_personalized_notes.md"
         self.legacy_notes_file = output_dir / f"{session_id}_personalized_notes.md"
+        # The faults that are expected but should not be silent.
+        self._guards = Guards(logger)
         if not self.notes_file.exists() and self.legacy_notes_file.exists():
             # Migrate the pre-0.4 per-session notes file so an upgrade does
             # not lose the notes that were already written.
@@ -276,8 +279,11 @@ class StudentClient:
                     try:
                         with open(self.state_file, "r", encoding="utf-8") as handle:
                             legacy_seq = int(json.load(handle).get("last_sequence_number", 0))
-                    except Exception:
-                        pass
+                    except Exception as error:
+                        # Without the number the notes are sent from the
+                        # beginning again, and the student sees every note
+                        # twice.
+                        self._guards.saw("the number of the last note of the old state", error)
                     if legacy_seq > 0:
                         has_usable_notes = (
                             self.notes_file.exists()

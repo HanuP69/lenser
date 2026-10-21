@@ -7,6 +7,7 @@ from typing import Any, Optional, Sequence
 import numpy as np
 
 from lecturelens.core.logging_setup import get_logger
+from lecturelens.core.repeat_guard import Guards
 
 logger = get_logger("lecturelens.drift_filter")
 
@@ -105,6 +106,8 @@ class ContextDriftFilter:
         self.accepted_count: int = 0
         self.drift_count: int = 0
         self._batch_snapshots: dict[str, dict[str, Any]] = {}
+        # The faults that are expected but should not be silent.
+        self._guards = Guards(logger)
 
         if session_topic is not None and len(session_topic.strip()) > 0:
             clean_topic = session_topic.strip()
@@ -171,6 +174,10 @@ class ContextDriftFilter:
             "pending_quarantine_entries": self.pending_quarantine_entries
         }
 
+    def guards(self) -> Guards:
+        """The guards of the faults, for the heartbeat of the agent."""
+        return self._guards
+
     def load_dict(self, data: dict[str, Any]) -> None:
         if not isinstance(data, dict):
             return
@@ -231,7 +238,9 @@ class ContextDriftFilter:
                     )
                 self._embedding_endpoint_unavailable = True
             else:
-                logger.warning("ollama embedding call failed or timed out: %s", error)
+                # The fault is said once and then counted, so that a
+                # model that is not running does not fill the log.
+                self._guards.saw("the embedding of the drift filter", error)
         return None
 
     def check_entry_with_shift(

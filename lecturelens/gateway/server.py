@@ -28,6 +28,7 @@ from lecturelens.core.agent_runtime import (
 from lecturelens.core.clock import SessionClock
 from lecturelens.core.concurrency import configure_pools, shutdown_pools
 from lecturelens.core.logging_setup import get_logger
+from lecturelens.core.repeat_guard import Guards
 from lecturelens.core.redis_bus import RedisBus
 from lecturelens.core.validation import is_valid_session_id
 from lecturelens.schemas.events import GeneralNoteSegment, SlideCaptured, TranscriptChunk
@@ -181,6 +182,8 @@ class GatewayServer:
         self.accepted_capture_ids: set[str] = set()
         self.in_flight_captures: dict[str, asyncio.Event] = {}
         self._accepted_capture_queue: list[tuple[float, str]] = []
+        # The faults that are expected but should not be silent.
+        self._guards = Guards(logger)
 
     def _mark_capture_accepted(self, capture_id: str) -> None:
         self.accepted_capture_ids.add(capture_id)
@@ -434,8 +437,13 @@ class GatewayServer:
                 try:
                     if await self.storage.session_exists(session_id):
                         return True
-                except Exception:
-                    pass
+                except Exception as error:
+                    # The storage cannot answer, so the session cannot be
+                    # ruled out either. The other branch below does the
+                    # same, and a storage that is down used to shut every
+                    # student out of their session.
+                    self._guards.saw("the check of a session in the storage", error)
+                    return True
             elif hasattr(self.storage, "get_general_notes_since"):
                 # The fallback has to verify the session instead of
                 # authorising every session id: returning True unconditionally
@@ -443,9 +451,10 @@ class GatewayServer:
                 try:
                     notes = await self.storage.get_general_notes_since(session_id, 0)
                     return len(notes) > 0
-                except Exception:
+                except Exception as error:
                     # The storage cannot answer, so the session cannot be
                     # ruled out either.
+                    self._guards.saw("the check of a session in the storage", error)
                     return True
         return False
 

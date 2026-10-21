@@ -12,6 +12,7 @@ import redis.asyncio as redis
 from pydantic import BaseModel
 
 from lecturelens.core.logging_setup import get_logger
+from lecturelens.core.repeat_guard import Guards
 
 logger = get_logger("lecturelens.redis_bus")
 
@@ -88,6 +89,8 @@ class RedisBus:
         self._db_conn: Optional[sqlite3.Connection] = None
         self._retry_task: Optional[asyncio.Task] = None
         self._closing: bool = False
+        # The faults that are expected but should not be silent.
+        self._guards = Guards(logger)
         if self.outbox_path:
             self._init_db()
             self._load_outbox()
@@ -318,8 +321,11 @@ class RedisBus:
                 row = cur.fetchone()
                 if row:
                     existing_row_id = row[0]
-            except Exception:
-                pass
+            except Exception as error:
+                # The entry is looked for so that it is not sent twice. When
+                # the look fails the entry is treated as new and it is sent
+                # again, so it is worth saying.
+                self._guards.saw("the duplicate check of the outbox", error)
 
         is_duplicate = (existing_idx is not None) or (existing_row_id is not None)
 
@@ -642,8 +648,13 @@ class RedisBus:
                     redis_count = await self.client.incr(redis_retry_key)
                     await self.client.expire(redis_retry_key, self.retry_ttl_seconds)
                     failure_total = max(failure_total, redis_count)
-                except Exception:
-                    pass
+                except Exception as count_error:
+                    # The count of the tries is kept in redis so that it
+                    # survives a restart. When it cannot be written the
+                    # count in memory is used, or the handler would keep
+                    # failing for ever without ever reaching the dead
+                    # letter stream.
+                    self._guards.saw("the count of the tries of a message", count_error)
                 self.failure_counts[failure_key] = failure_total
                 logger.error(
                     "handler failed for %s on %s (attempt %d): %s",

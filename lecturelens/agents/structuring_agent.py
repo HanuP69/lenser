@@ -1228,6 +1228,10 @@ class StructuringAgent:
         while self.is_running:
             now = time.monotonic()
             if (now - last_heartbeat_time) >= heartbeat_interval:
+                # How often each fault happened is in the heartbeat, so a
+                # fault that is said once is not forgotten.
+                for name, count in self.drift_filter.guards().counts().items():
+                    self.control.set_stat(f"fault_{name}", count)
                 if self.consecutive_failures >= self.max_consecutive_failures:
                     # Keep reporting the failure instead of flipping straight
                     # back to "live" on the next heartbeat.
