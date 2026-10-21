@@ -295,9 +295,27 @@ def check_dependency_versions() -> list[str]:
         ):
             problems.append(
                 f"{requirement.name} {installed} is installed, but the project needs "
-                f"{requirement.specifier}. Run: pip install -e \".[full]\""
+                f"{requirement.specifier}. Run: {install_hint()}"
             )
     return problems
+
+
+def install_hint() -> str:
+    """The command that installs what is missing.
+
+    A folder that was made with uv has no pip in it, and then the
+    command that people know does nothing at all, or worse, it installs
+    into the python of the machine and the folder stays as it was.
+    """
+    import importlib.util
+    import sys
+
+    if importlib.util.find_spec("pip") is not None:
+        return 'pip install -e ".[full]"'
+    if sys.prefix != sys.base_prefix:
+        # A folder of its own without pip in it. It was made with uv.
+        return 'uv pip install -e ".[full]"'
+    return 'pip install -e ".[full]"'
 
 
 def check_agent_dependencies(agent_names: list[str]) -> list[str]:
@@ -341,7 +359,7 @@ def check_agent_dependencies(agent_names: list[str]) -> list[str]:
                 reason = f" The installed versions do not fit each other: {version_problems[0]}"
             problems.append(
                 f"{agent_name} needs the module {missing}, which does not work on this "
-                f"machine.{reason} Run: pip install -e \".[full]\""
+                f"machine.{reason} Run: {install_hint()}"
             )
         else:
             last_line = ""

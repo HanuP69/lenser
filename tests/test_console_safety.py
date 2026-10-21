@@ -151,6 +151,35 @@ class TestAgentFailureReason(unittest.TestCase):
             self.assertIsNone(agent_failure_reason(log))
 
 
+class TestInstallHint(unittest.TestCase):
+    def test_the_hint_says_how_to_install(self) -> None:
+        """A folder made with uv has no pip in it.
+
+        The command that people know then does nothing at all, or worse,
+        it installs into the python of the machine and the folder stays
+        as it was.
+        """
+        from lecturelens.cli.helpers import install_hint
+
+        hint = install_hint()
+        self.assertIn("install", hint)
+        self.assertIn(".[full]", hint)
+
+    def test_a_folder_without_pip_says_uv(self) -> None:
+        import sys
+        from unittest import mock
+
+        from lecturelens.cli import helpers
+
+        with mock.patch.object(sys, "prefix", "C:\\somewhere\\.venv"):
+            with mock.patch.object(sys, "base_prefix", "C:\\Python"):
+                with mock.patch(
+                    "importlib.util.find_spec", return_value=None
+                ):
+                    hint = helpers.install_hint()
+        self.assertIn("uv pip install", hint)
+
+
 class TestAgentDependencies(unittest.TestCase):
     def test_the_agents_that_are_there_are_found(self) -> None:
         from lecturelens.cli.helpers import check_agent_dependencies
