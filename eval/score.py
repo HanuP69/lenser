@@ -164,17 +164,162 @@ def match_pages(
     return matches
 
 
+def match_pages_monotonic(
+    readings: list[dict[str, Any]],
+    pages: list[dict[str, Any]],
+    threshold: float = 55.0,
+    advance_cost: float = 40.0
+) -> list[Optional[int]]:
+    """Which page of the notes fits every picture, when the pages only go forward.
+
+    The slides of a lecture go forward and never back. Looking at every
+    picture on its own gives a wrong answer, because the slides of one
+    lecture share much of their text and the wrong one often has more
+    words in common.
+
+    The pages are lined up with the pictures the way a row of slides is
+    lined up with a video of that lecture. Moving to the next page costs
+    something, so the page only moves on when the pictures clearly
+    belong to the next one.
+    """
+    from rapidfuzz import fuzz
+
+    page_texts = [page["text"].lower() for page in pages]
+    if not page_texts:
+        return [None] * len(readings)
+
+    matches: list[Optional[int]] = [None] * len(readings)
+    usable: list[int] = []
+    similarities: list[list[float]] = []
+    for index, reading in enumerate(readings):
+        text = reading.get("text", "").lower()
+        if not text.strip():
+            continue
+        usable.append(index)
+        similarities.append(
+            [fuzz.token_set_ratio(text, page_text) for page_text in page_texts]
+        )
+
+    if not usable:
+        return matches
+
+    page_count = len(page_texts)
+    # The best total for the pictures so far, when the last one is on the
+    # page j.
+    previous: list[float] = [float("-inf")] * page_count
+    previous[0] = 0.0
+    came_from: list[list[int]] = []
+
+    for row in similarities:
+        current = [float("-inf")] * page_count
+        row_from = [-1] * page_count
+        # The best total that ends on a page before this one.
+        best_before = float("-inf")
+        best_before_page = -1
+        for page in range(page_count):
+            stay = previous[page]
+            advance = best_before - advance_cost
+            if advance >= stay:
+                current[page] = advance + row[page]
+                row_from[page] = best_before_page
+            else:
+                current[page] = stay + row[page]
+                row_from[page] = page
+            if previous[page] > best_before:
+                best_before = previous[page]
+                best_before_page = page
+        previous = current
+        came_from.append(row_from)
+
+    # The path is put together again from the end.
+    end_page = max(range(page_count), key=lambda page: previous[page])
+    path: list[int] = []
+    page = end_page
+    for row in range(len(similarities) - 1, -1, -1):
+        path.append(page)
+        page = came_from[row][page]
+        if page < 0:
+            break
+    path.reverse()
+
+    for position, frame_index in enumerate(usable):
+        if position >= len(path):
+            break
+        page = path[position]
+        if similarities[position][page] >= threshold:
+            matches[frame_index] = page
+    return matches
+
+
+def slide_change_times(
+    readings: list[dict[str, Any]],
+    pages: list[dict[str, Any]]
+) -> list[float]:
+    """The moments where the slide on the screen changed.
+
+    The pages of the notes are lined up with the pictures, and the page
+    only goes forward. The moment of the change is not the moment the
+    lining up noticed it, it is the moment the new page started to fit
+    better than the old one.
+    """
+    from rapidfuzz import fuzz
+
+    page_texts = [page["text"].lower() for page in pages]
+    if not page_texts:
+        return []
+
+    matches = match_pages_monotonic(readings, pages)
+    times: list[float] = []
+    previous: Optional[int] = None
+    for index, match in enumerate(matches):
+        if match is None or match == previous:
+            continue
+        if previous is not None:
+            times.append(_moment_the_page_took_over(
+                readings, page_texts, previous, match, index
+            ))
+        previous = match
+    return times
+
+
+def _moment_the_page_took_over(
+    readings: list[dict[str, Any]],
+    page_texts: list[str],
+    old_page: int,
+    new_page: int,
+    from_index: int
+) -> float:
+    """The first picture where the new page fits better than the old one."""
+    from rapidfuzz import fuzz
+
+    for index in range(from_index, len(readings)):
+        text = readings[index].get("text", "").lower()
+        if not text.strip():
+            continue
+        new_score = fuzz.token_set_ratio(text, page_texts[new_page])
+        old_score = fuzz.token_set_ratio(text, page_texts[old_page])
+        if new_score >= old_score:
+            return float(readings[index]["t"])
+    return float(readings[from_index]["t"])
+
+
 def change_times(
     readings: list[dict[str, Any]],
     matches: list[Optional[int]]
 ) -> list[float]:
-    """The moments where the screen really changed."""
+    """The moments where the screen really changed.
+
+    Only a change from one slide to another counts. A moment where the
+    screen showed something that is not a slide, such as a terminal, is
+    not a change of the slide, and the screen was not a lecture there
+    either.
+    """
     changes: list[float] = []
     previous: Optional[int] = None
     for reading, match in zip(readings, matches):
-        if match is None or match == previous:
+        if match is None:
             continue
-        if previous is not None:
+        if previous is not None and match != previous:
             changes.append(float(reading["t"]))
         previous = match
     return changes
