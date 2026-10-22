@@ -4,8 +4,10 @@ import binascii
 import hmac
 import inspect
 import json
+import re
 import secrets
 import time
+import urllib.parse
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence
@@ -626,6 +628,101 @@ class GatewayServer:
                 runtime.connection_count -= 1
                 runtime.last_active = time.monotonic()
 
+    def handle_http_request(self, connection: Any, request: Any) -> Optional[Any]:
+        try:
+            from websockets.http11 import Response
+            from websockets.datastructures import Headers
+        except ImportError:
+            return None
+
+        path_with_query = getattr(request, "path", "") or ""
+        parsed_url = urllib.parse.urlparse(path_with_query)
+        path = parsed_url.path
+
+        if not path.startswith("/api/assets/"):
+            return None
+
+        if self.api_key:
+            auth_header = ""
+            req_headers = getattr(request, "headers", None)
+            if req_headers is not None:
+                auth_header = req_headers.get("Authorization", "") or req_headers.get("x-api-key", "")
+            query_params = urllib.parse.parse_qs(parsed_url.query)
+            token = ""
+            if auth_header.startswith("Bearer "):
+                token = auth_header[7:].strip()
+            elif auth_header:
+                token = auth_header.strip()
+            elif "key" in query_params:
+                token = query_params["key"][0].strip()
+            elif "token" in query_params:
+                token = query_params["token"][0].strip()
+
+            if not token or not secrets.compare_digest(token, self.api_key):
+                return Response(
+                    401,
+                    "Unauthorized",
+                    Headers([("Content-Type", "text/plain")]),
+                    b"unauthorized"
+                )
+
+        parts = path.strip("/").split("/")
+        if len(parts) < 4:
+            return Response(
+                400,
+                "Bad Request",
+                Headers([("Content-Type", "text/plain")]),
+                b"invalid asset path"
+            )
+
+        session_id = parts[2]
+        asset_id = parts[3]
+        if not re.match(r"^[a-zA-Z0-9_\-\.]+$", session_id) or not re.match(r"^[a-zA-Z0-9_\-\.]+$", asset_id):
+            return Response(
+                400,
+                "Bad Request",
+                Headers([("Content-Type", "text/plain")]),
+                b"invalid path parameters"
+            )
+
+        session_dir = self.settings.get_session_output_dir(session_id)
+        assets_dir = (session_dir / "assets").resolve()
+        target_path = (assets_dir / asset_id).resolve()
+
+        if not str(target_path).startswith(str(assets_dir)) or not target_path.is_file():
+            if not asset_id.endswith(".png"):
+                alt_path = (assets_dir / f"{asset_id}.png").resolve()
+                if str(alt_path).startswith(str(assets_dir)) and alt_path.is_file():
+                    target_path = alt_path
+
+        if not target_path.is_file():
+            return Response(
+                404,
+                "Not Found",
+                Headers([("Content-Type", "text/plain")]),
+                b"asset not found"
+            )
+
+        try:
+            body = target_path.read_bytes()
+            content_type = "image/png"
+            if target_path.suffix.lower() in (".jpg", ".jpeg"):
+                content_type = "image/jpeg"
+            return Response(
+                200,
+                "OK",
+                Headers([("Content-Type", content_type), ("Content-Length", str(len(body)))]),
+                body
+            )
+        except Exception as read_err:
+            logger.warning("failed to serve asset %s: %s", target_path, read_err)
+            return Response(
+                500,
+                "Internal Server Error",
+                Headers([("Content-Type", "text/plain")]),
+                b"error reading asset"
+            )
+
     async def start(self, host: Optional[str] = None, port: Optional[int] = None) -> None:
         try:
             from websockets.asyncio.server import serve
@@ -638,7 +735,8 @@ class GatewayServer:
             self.handle_connection,
             bind_host,
             bind_port,
-            max_size=self.settings.gateway_max_message_bytes
+            max_size=self.settings.gateway_max_message_bytes,
+            process_request=self.handle_http_request
         )
         logger.info("gateway listening on %s:%d", bind_host, bind_port)
 

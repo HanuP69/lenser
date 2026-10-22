@@ -191,7 +191,12 @@ class TestSyncEndToEnd(SyncTestBase):
         )
 
         async def stopper() -> None:
-            await asyncio.sleep(1.0)
+            for _ in range(50):
+                if agent.timeline_path.exists():
+                    text = agent.timeline_path.read_text(encoding="utf-8")
+                    if len([l for l in text.splitlines() if l.strip()]) >= 2:
+                        break
+                await asyncio.sleep(0.1)
             set_flag(agent.control.session_dir, SYNC_STOP_FLAG_NAME)
 
         await asyncio.wait_for(asyncio.gather(agent.run(), stopper()), timeout=30)

@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
+from lecturelens.core.fileio import atomic_write_bytes
 from lecturelens.core.repeat_guard import Guards
 from lecturelens.router.messages import HumanMessage, response_to_text
 from lecturelens.schemas.events import GeneralNoteSegment
@@ -182,6 +183,12 @@ class PersonalizationEngine:
                 )
                 return False
 
+        original_assets = re.findall(r"!\[.*?\]\((.*?)\)", segment.content)
+        for asset in original_assets:
+            if asset not in rewritten_text:
+                logger.warning("rewritten note omitted asset link %s, rejected", asset)
+                return False
+
         return True
 
     async def rewrite_segment(self, segment: GeneralNoteSegment) -> str:
@@ -195,10 +202,30 @@ class PersonalizationEngine:
         ):
             return segment.content
 
-        prompt = self.build_prompt(segment)
+        asset_placeholders: dict[str, str] = {}
+        counter = 0
+
+        def protect_asset(match: re.Match) -> str:
+            nonlocal counter
+            token = f"__LL_ASSET_LINK_{counter}__"
+            counter += 1
+            asset_placeholders[token] = match.group(0)
+            return token
+
+        asset_pattern = re.compile(r"!\[.*?\]\(.*?\)|asset://[a-zA-Z0-9_\-\.]+")
+        masked_content = asset_pattern.sub(protect_asset, segment.content)
+        masked_segment = segment.model_copy(update={"content": masked_content})
+
+        prompt = self.build_prompt(masked_segment)
         try:
             response = await self.llm_router.ainvoke([HumanMessage(content=prompt)])
             personalized = response_to_text(response).strip()
+            for token, original_link in asset_placeholders.items():
+                if token in personalized:
+                    personalized = personalized.replace(token, original_link)
+                else:
+                    personalized += f"\n\n{original_link}"
+
             if self.validate_rewrite(segment, personalized):
                 return personalized
             logger.warning("personalization validation failed, falling back to original content")
@@ -349,6 +376,37 @@ class StudentClient:
                 except Exception:
                     pass
 
+    def cache_referenced_assets(self, content: str) -> None:
+        asset_links = re.findall(r"!\[.*?\]\((.*?)\)", content)
+        if not asset_links:
+            return
+        assets_dir = self.output_dir / "assets"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+
+        base_http_url = self.server_url
+        if base_http_url.startswith("ws://"):
+            base_http_url = "http://" + base_http_url[5:]
+        elif base_http_url.startswith("wss://"):
+            base_http_url = "https://" + base_http_url[6:]
+        base_http_url = base_http_url.rstrip("/")
+
+        for link in asset_links:
+            filename = Path(link).name
+            target_file = assets_dir / filename
+            if target_file.exists():
+                continue
+            download_url = f"{base_http_url}/api/assets/{self.session_id}/{filename}"
+            if self.api_key:
+                download_url += f"?key={self.api_key}"
+            try:
+                import urllib.request
+                req = urllib.request.Request(download_url, headers={"User-Agent": "LectureLens-StudentClient"})
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    data = response.read()
+                    atomic_write_bytes(target_file, data)
+            except Exception as dl_err:
+                logger.debug("could not cache asset %s: %s", filename, dl_err)
+
     def _init_ledger(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         conn = None
@@ -469,6 +527,7 @@ class StudentClient:
         self.received_segments.append(segment)
         self.last_sequence_number = max(self.last_sequence_number, segment.sequence_number)
         self.save_persisted_sequence()
+        self.cache_referenced_assets(personalized_content)
 
         if self.student_graph is not None:
             for tag in segment.concept_tags:

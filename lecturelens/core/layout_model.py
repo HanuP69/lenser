@@ -58,7 +58,7 @@ KIND_OTHER = "other"
 KIND_BY_LABEL = {
     "image": KIND_FIGURE,
     "chart": KIND_FIGURE,
-    "seal": KIND_FIGURE,
+    "seal": KIND_CHROME,
     "algorithm": KIND_CODE,
     "display_formula": KIND_FORMULA,
     "inline_formula": KIND_FORMULA,
@@ -229,7 +229,12 @@ class LayoutModel:
         tensor = np.transpose(array, (2, 0, 1))[None, ...]
         return tensor.astype(np.float32)
 
-    def detect(self, image: np.ndarray, threshold: float = 0.4) -> list[Region]:
+    def detect(
+        self,
+        image: np.ndarray,
+        threshold: float = 0.4,
+        figure_threshold: float = 0.65
+    ) -> list[Region]:
         """The parts of a picture."""
         if self.session is None:
             return []
@@ -250,6 +255,9 @@ class LayoutModel:
                 continue
             label_index = int(labels[index])
             label = self.labels[label_index] if label_index < len(self.labels) else "other"
+            kind = KIND_BY_LABEL.get(label, KIND_OTHER)
+            if kind == KIND_FIGURE and confidence[index] < figure_threshold:
+                continue
             cx, cy, box_width, box_height = [float(value) for value in boxes[0][index]]
             left = int((cx - box_width / 2) * width)
             top = int((cy - box_height / 2) * height)
@@ -261,7 +269,7 @@ class LayoutModel:
             bottom = max(top + 1, min(height, bottom))
             regions.append(
                 Region(
-                    kind=KIND_BY_LABEL.get(label, KIND_OTHER),
+                    kind=kind,
                     box=(left, top, right, bottom),
                     score=round(float(confidence[index]), 4),
                     label=label

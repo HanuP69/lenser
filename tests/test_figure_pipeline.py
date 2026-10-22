@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+import numpy as np
 from PIL import Image, ImageDraw
 
 from lecturelens.core.layout_model import (
@@ -279,6 +280,372 @@ class TestTheLabelOfAPicture(unittest.TestCase):
                 agent.caption_of_the_figure(regions, lines),
                 "Feature points selected"
             )
+
+
+class TestFigurePipelineEnhancements(unittest.IsolatedAsyncioTestCase):
+    def make_screen_agent(self, folder: str, router: Any = None) -> Any:
+        from lecturelens.agents.screen_agent import ScreenAgent
+        from lecturelens.config.settings import Settings
+        from lecturelens.core.clock import SessionClock
+
+        class FakeBus:
+            def __init__(self) -> None:
+                self.published: list[Any] = []
+
+            async def publish_resilient(self, stream_name: str, event: Any) -> str:
+                self.published.append(event)
+                return "1-1"
+
+            async def publish(self, stream_name: str, event: Any) -> str:
+                self.published.append(event)
+                return "1-1"
+
+        settings = Settings()
+        settings.output_dir = Path(folder)
+        settings.screen_layout_model = True
+        settings.screen_local_ocr = False
+        return ScreenAgent(settings, FakeBus(), SessionClock(), "fig_enhance_test", router)
+
+    async def test_layout_on_full_frame_vs_crop(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            agent = self.make_screen_agent(folder)
+            full_frame = make_png((800, 600))
+            crop_frame = make_png((200, 100))
+
+            full_regions = [
+                Region(kind=KIND_FIGURE, box=(100, 100, 400, 400), score=0.85, label="image")
+            ]
+            crop_regions = [
+                Region(kind=KIND_TEXT, box=(10, 10, 50, 50), score=0.9, label="text")
+            ]
+
+            async def mock_find_parts(png_bytes: bytes) -> list[Any]:
+                if len(png_bytes) == len(full_frame):
+                    return full_regions
+                return crop_regions
+
+            agent.find_the_parts = mock_find_parts
+            event = await agent.accept_png(
+                full_frame,
+                np.zeros((64, 64), dtype=np.uint8),
+                crop_png=crop_frame
+            )
+            self.assertTrue(event.figure_file_path)
+            self.assertTrue(Path(event.figure_file_path).exists())
+
+    def test_repeating_chrome_webcam_suppression(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            agent = self.make_screen_agent(folder)
+            frame_png = make_png((800, 600))
+            webcam_region = [
+                Region(kind=KIND_FIGURE, box=(600, 10, 780, 160), score=0.95, label="image")
+            ]
+
+            p1 = agent.save_the_figure(frame_png, webcam_region, 1)
+            self.assertTrue(p1)
+            p2 = agent.save_the_figure(frame_png, webcam_region, 2)
+            self.assertTrue(p2)
+            p3 = agent.save_the_figure(frame_png, webcam_region, 3)
+            self.assertEqual(p3, "")
+
+    def test_dedup_across_progressive_builds(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            agent = self.make_screen_agent(folder)
+            frame1 = make_png((800, 600))
+            frame2 = make_png((800, 600))
+            fig_regions = [
+                Region(kind=KIND_FIGURE, box=(100, 100, 400, 400), score=0.85, label="image")
+            ]
+
+            path1 = agent.save_the_figure(frame1, fig_regions, 1)
+            self.assertTrue(path1)
+            stat_before = agent.control.stats.get("slide_figure_deduped", 0)
+            path2 = agent.save_the_figure(frame2, fig_regions, 2)
+            self.assertTrue(path2)
+            stat_after = agent.control.stats.get("slide_figure_deduped", 0)
+            self.assertGreater(stat_after, stat_before)
+
+    def test_token_placement_and_invalid_token_dropping(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            from lecturelens.agents.structuring_agent import StructuringAgent, SliceBatch
+            from lecturelens.config.settings import Settings
+
+            class DummyRouter:
+                async def ainvoke(self, messages: Any) -> Any:
+                    return ""
+
+            settings = Settings()
+            settings.output_dir = Path(folder)
+            agent = StructuringAgent(settings=settings, session_id="test_tok", llm_router=DummyRouter())
+
+            fig_path = str(agent.session_dir / "assets" / "fig_100.png")
+            entries = [
+                {
+                    "source_type": "slide",
+                    "timestamp_epoch": 10.0,
+                    "metadata": {
+                        "figure_file_path": fig_path,
+                        "figure_id": "fig_100",
+                        "figure_caption": "Neural Network Architecture"
+                    }
+                }
+            ]
+            batch = SliceBatch(entries=entries, end_offset=100, start_offset=0)
+            summary_with_tokens = (
+                "Here is an overview of the network:\n"
+                "[FIGURE fig_100]\n"
+                "And here is an invalid token that should be dropped:\n"
+                "[FIGURE hallucinated_id]"
+            )
+            result_state = {"summary": summary_with_tokens}
+            rendered = agent.build_notes_section(batch, result_state)
+
+            self.assertIn("![Neural Network Architecture](assets/fig_100.png)", rendered)
+            self.assertNotIn("[FIGURE fig_100]", rendered)
+            self.assertNotIn("hallucinated_id", rendered)
+
+    def test_prompt_injection_in_figure_caption_sanitized(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            from lecturelens.agents.structuring_agent import StructuringAgent, SliceBatch
+            from lecturelens.config.settings import Settings
+
+            class DummyRouter:
+                async def ainvoke(self, messages: Any) -> Any:
+                    return ""
+
+            settings = Settings()
+            settings.output_dir = Path(folder)
+            agent = StructuringAgent(settings=settings, session_id="test_inj", llm_router=DummyRouter())
+
+            fig_path = str(agent.session_dir / "assets" / "fig_200.png")
+            entries = [
+                {
+                    "source_type": "slide",
+                    "timestamp_epoch": 10.0,
+                    "metadata": {
+                        "figure_file_path": fig_path,
+                        "figure_id": "fig_200",
+                        "figure_caption": "Evil Caption](http://attacker.com)\n\n# Injected Heading"
+                    }
+                }
+            ]
+            batch = SliceBatch(entries=entries, end_offset=100, start_offset=0)
+            rendered = agent.build_notes_section(batch, {"summary": "Explaining the diagram:\n[FIGURE fig_200]"})
+
+            self.assertNotIn("Injected Heading", rendered.splitlines()[0])
+            self.assertIn("fig_200.png", rendered)
+            self.assertNotIn("Evil Caption](http://attacker.com)", rendered)
+
+    def test_unreferenced_figure_appended_as_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            from lecturelens.agents.structuring_agent import StructuringAgent, SliceBatch
+            from lecturelens.config.settings import Settings
+
+            class DummyRouter:
+                async def ainvoke(self, messages: Any) -> Any:
+                    return ""
+
+            settings = Settings()
+            settings.output_dir = Path(folder)
+            agent = StructuringAgent(settings=settings, session_id="test_fallback", llm_router=DummyRouter())
+
+            fig_path = str(agent.session_dir / "assets" / "fig_300.png")
+            entries = [
+                {
+                    "source_type": "slide",
+                    "timestamp_epoch": 10.0,
+                    "metadata": {
+                        "figure_file_path": fig_path,
+                        "figure_id": "fig_300",
+                        "figure_caption": "Unreferenced Diagram"
+                    }
+                }
+            ]
+            batch = SliceBatch(entries=entries, end_offset=100, start_offset=0)
+            rendered = agent.build_notes_section(batch, {"summary": "Note content without tokens."})
+            self.assertIn("![Unreferenced Diagram](assets/fig_300.png)", rendered)
+
+    def test_gateway_asset_serving_and_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            from lecturelens.config.settings import Settings
+            from lecturelens.gateway.server import GatewayServer
+
+            settings = Settings()
+            settings.output_dir = Path(folder)
+            settings.gateway_api_key = "secret_key_123"
+
+            class DummyBus:
+                pass
+
+            gateway = GatewayServer(settings, DummyBus())
+            session_id = "test_asset_sess"
+            sess_assets = Path(folder) / session_id / "assets"
+            sess_assets.mkdir(parents=True, exist_ok=True)
+            (sess_assets / "diagram.png").write_bytes(b"PNG_BYTES_HERE")
+
+            class DummyReq:
+                def __init__(self, path: str, headers: dict[str, str]) -> None:
+                    self.path = path
+                    self.headers = headers
+
+            req_unauth = DummyReq(f"/api/assets/{session_id}/diagram.png", {})
+            resp_unauth = gateway.handle_http_request(None, req_unauth)
+            self.assertIsNotNone(resp_unauth)
+            self.assertEqual(resp_unauth.status_code, 401)
+
+            req_ok = DummyReq(f"/api/assets/{session_id}/diagram.png", {"Authorization": "Bearer secret_key_123"})
+            resp_ok = gateway.handle_http_request(None, req_ok)
+            self.assertIsNotNone(resp_ok)
+            self.assertEqual(resp_ok.status_code, 200)
+            self.assertEqual(resp_ok.body, b"PNG_BYTES_HERE")
+
+            req_query_ok = DummyReq(f"/api/assets/{session_id}/diagram.png?key=secret_key_123", {})
+            resp_query_ok = gateway.handle_http_request(None, req_query_ok)
+            self.assertIsNotNone(resp_query_ok)
+            self.assertEqual(resp_query_ok.status_code, 200)
+
+            req_missing = DummyReq(f"/api/assets/{session_id}/missing.png", {"Authorization": "Bearer secret_key_123"})
+            resp_missing = gateway.handle_http_request(None, req_missing)
+            self.assertIsNotNone(resp_missing)
+            self.assertEqual(resp_missing.status_code, 404)
+
+            req_traversal = DummyReq(f"/api/assets/{session_id}/..%2F..%2Fevil.png", {"Authorization": "Bearer secret_key_123"})
+            resp_traversal = gateway.handle_http_request(None, req_traversal)
+            self.assertIsNotNone(resp_traversal)
+            self.assertIn(resp_traversal.status_code, (400, 404))
+
+    async def test_student_client_hinglish_asset_link_protection(self) -> None:
+        from lecturelens.client.student_client import PersonalizationEngine, StudentProfile
+        from lecturelens.schemas.events import GeneralNoteSegment
+
+        class HinglishRouter:
+            async def ainvoke(self, messages: Any) -> Any:
+                prompt_text = str(messages[0].content)
+                token = "__LL_ASSET_LINK_0__"
+                self.assertIn(token, prompt_text)
+                class Msg:
+                    content = f"Yeh lecture notes hain:\n{token}\nSamajh aaya sabko."
+                return Msg()
+
+        profile = StudentProfile(student_id="s1", preferred_language="Hinglish", detail_level="concise")
+        engine = PersonalizationEngine(profile, HinglishRouter())
+
+        segment = GeneralNoteSegment(
+            session_id="s1",
+            sequence_number=1,
+            timestamp_epoch=100.0,
+            start_time="00:01:40",
+            end_time="00:02:40",
+            heading="Section 1 (00:01:40)",
+            content="Summary content:\n![Neuron Architecture](assets/figure_0001.png)\nDetails here.",
+            concept_tags=["neural_network"]
+        )
+
+        rewritten = await engine.rewrite_segment(segment)
+        self.assertIn("![Neuron Architecture](assets/figure_0001.png)", rewritten)
+        self.assertNotIn("__LL_ASSET_LINK_0__", rewritten)
+
+    async def test_crash_replay_republishing_without_resynthesis(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            from lecturelens.agents.structuring_agent import StructuringAgent, SliceBatch
+            from lecturelens.config.settings import Settings
+
+            class CountingRouter:
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                async def ainvoke(self, messages: Any) -> Any:
+                    self.calls += 1
+                    class Resp:
+                        content = "Synthesized content."
+                    return Resp()
+
+            class MockBus:
+                def __init__(self) -> None:
+                    self.published: list[Any] = []
+
+                async def publish_resilient(self, stream: str, msg: Any) -> str:
+                    self.published.append(msg)
+                    return "1-1"
+
+            settings = Settings()
+            settings.output_dir = Path(folder)
+            router = CountingRouter()
+            bus = MockBus()
+            agent = StructuringAgent(settings=settings, session_id="replay_crash_test", llm_router=router, redis_bus=bus)
+
+            agent.notes_path.write_text("Already written clean notes from earlier run.\n", encoding="utf-8")
+            agent.save_notes_marker(200)
+
+            entries = [{"source_type": "transcript", "timestamp_epoch": 10.0, "content": "hello"}]
+            batch = SliceBatch(entries=entries, end_offset=200, start_offset=0)
+
+            await agent.process_single_batch(batch, "")
+
+            self.assertEqual(router.calls, 0)
+            self.assertEqual(len(bus.published), 1)
+            self.assertEqual(bus.published[0].content, "Already written clean notes from earlier run.\n")
+
+    async def test_replay_kill_mid_stream_matches_clean_run(self) -> None:
+        import json
+        with tempfile.TemporaryDirectory() as clean_dir, tempfile.TemporaryDirectory() as crash_dir:
+            from lecturelens.agents.structuring_agent import StructuringAgent
+            from lecturelens.config.settings import Settings
+
+            clean_settings = Settings()
+            clean_settings.output_dir = Path(clean_dir)
+            clean_settings.max_slice_characters = 60
+
+            class DeterministicRouter:
+                async def ainvoke(self, messages: Any) -> Any:
+                    content = str(messages[0].content)
+                    topic = "Topic A" if "part1" in content else "Topic B"
+                    class R:
+                        content = f"Notes on {topic}."
+                    return R()
+
+            clean_agent = StructuringAgent(
+                settings=clean_settings,
+                session_id="lecture_clean",
+                llm_router=DeterministicRouter()
+            )
+
+            lines = [
+                json.dumps({"source_type": "transcript", "timestamp_epoch": 10.0, "content": "part1 content words here"}),
+                json.dumps({"source_type": "transcript", "timestamp_epoch": 20.0, "content": "part1 more content here"}),
+                json.dumps({"source_type": "transcript", "timestamp_epoch": 30.0, "content": "part2 content words here"}),
+                json.dumps({"source_type": "transcript", "timestamp_epoch": 40.0, "content": "part2 more content here"})
+            ]
+            clean_agent.timeline_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            await clean_agent.process_all_pending()
+            clean_notes = clean_agent.notes_path.read_text(encoding="utf-8")
+            self.assertTrue(clean_notes)
+
+            crash_settings = Settings()
+            crash_settings.output_dir = Path(crash_dir)
+            crash_settings.max_slice_characters = 60
+
+            crash_agent = StructuringAgent(
+                settings=crash_settings,
+                session_id="lecture_crash",
+                llm_router=DeterministicRouter()
+            )
+            crash_agent.timeline_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            batches = crash_agent.read_pending_batches()
+            self.assertGreaterEqual(len(batches), 2)
+            await crash_agent.process_single_batch(batches[0], "")
+
+            recovered_agent = StructuringAgent(
+                settings=crash_settings,
+                session_id="lecture_crash",
+                llm_router=DeterministicRouter()
+            )
+            await recovered_agent.process_all_pending()
+            recovered_notes = recovered_agent.notes_path.read_text(encoding="utf-8")
+
+            self.assertEqual(clean_notes, recovered_notes)
 
 
 if __name__ == "__main__":

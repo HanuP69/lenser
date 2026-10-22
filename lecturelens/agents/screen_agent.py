@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 import io
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +54,36 @@ class ScreenFrame:
     width: int
     height: int
     thumbnail: np.ndarray
+
+
+def save_layout_debug_overlay(
+    image_bytes: bytes,
+    regions: list[Any],
+    output_path: Path
+) -> None:
+    try:
+        from PIL import ImageDraw
+
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        draw = ImageDraw.Draw(image)
+        colors = {
+            "figure": (0, 200, 0),
+            "title": (0, 120, 255),
+            "figure_title": (0, 180, 255),
+            "chrome": (255, 0, 0),
+            "text": (160, 160, 160),
+            "code": (255, 165, 0),
+            "formula": (180, 0, 180),
+        }
+        for region in regions:
+            color = colors.get(getattr(region, "kind", ""), (120, 120, 120))
+            draw.rectangle(region.box, outline=color, width=2)
+            label = f"{getattr(region, 'label', '')}:{getattr(region, 'score', 0.0):.2f}"
+            draw.text((region.box[0] + 2, max(0, region.box[1] - 12)), label, fill=color)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        image.save(output_path, format="PNG")
+    except Exception as error:
+        logger.debug("saving debug overlay failed: %s", error)
 
 
 def build_gray_thumbnail(image: Image.Image, thumbnail_width: int) -> np.ndarray:
@@ -180,6 +212,7 @@ class ScreenAgent:
         self.is_running: bool = False
 
         session_dir = settings.create_session_directories(session_id)
+        self.session_dir: Path = session_dir
         self.slides_dir: Path = session_dir / "raw" / "slides"
         # The pictures of the diagrams, which go into the notes.
         self.figures_dir: Path = session_dir / "assets"
@@ -202,6 +235,11 @@ class ScreenAgent:
         # The window that is recorded, when a single window is recorded.
         self.capture_target: str = getattr(settings, "capture_target", "screen") or "screen"
         self.window_handle: Optional[int] = getattr(settings, "window_handle", None)
+        self._figure_box_history: list[tuple[float, float, float, float]] = []
+        self.last_figure_phash: Optional[int] = None
+        self.last_figure_id: str = ""
+        self.last_figure_path: str = ""
+        self.slide_figures: dict[int, dict[str, str]] = {}
 
     def resolve_window_handle(self) -> Optional[int]:
         """Find the window that is recorded.
@@ -266,6 +304,33 @@ class ScreenAgent:
             if removed_number in self.slide_texts:
                 del self.slide_texts[removed_number]
 
+    def _is_repeating_chrome(
+        self,
+        box: tuple[int, int, int, int],
+        image_size: tuple[int, int]
+    ) -> bool:
+        width, height = image_size
+        if width <= 0 or height <= 0:
+            return False
+        norm = (box[0] / float(width), box[1] / float(height), box[2] / float(width), box[3] / float(height))
+        matches = 0
+        for prev in self._figure_box_history:
+            x_left = max(norm[0], prev[0])
+            y_top = max(norm[1], prev[1])
+            x_right = min(norm[2], prev[2])
+            y_bottom = min(norm[3], prev[3])
+            if x_right > x_left and y_bottom > y_top:
+                intersection = (x_right - x_left) * (y_bottom - y_top)
+                area1 = (norm[2] - norm[0]) * (norm[3] - norm[1])
+                area2 = (prev[2] - prev[0]) * (prev[3] - prev[1])
+                union = area1 + area2 - intersection
+                if union > 0 and (intersection / union) >= 0.80:
+                    matches += 1
+        self._figure_box_history.append(norm)
+        if len(self._figure_box_history) > 100:
+            self._figure_box_history.pop(0)
+        return matches >= 2
+
     def save_the_figure(
         self,
         png_bytes: bytes,
@@ -279,33 +344,96 @@ class ScreenAgent:
         """
         from lecturelens.core.layout_model import KIND_FIGURE
 
-        figures = [region for region in regions if region.kind == KIND_FIGURE]
+        figures = [region for region in regions if getattr(region, "kind", "") == KIND_FIGURE]
         if not figures:
             return ""
-        # The biggest diagram is the one that was shown.
-        figure = max(figures, key=lambda region: region.area)
-        if figure.width < 120 or figure.height < 120:
-            return ""
+
         try:
-            import io as _io
-
-            from PIL import Image
-
-            image = Image.open(_io.BytesIO(png_bytes))
+            image = Image.open(io.BytesIO(png_bytes))
             image.load()
+        except Exception as error:
+            logger.warning("failed to open slide image for figure extraction: %s", error)
+            return ""
+
+        width, height = image.size
+        total_frame_area = width * height
+
+        candidates = []
+        for figure in figures:
+            if figure.width < 120 or figure.height < 120:
+                continue
+            if figure.area < total_frame_area * 0.04:
+                continue
+            if getattr(figure, "score", 1.0) < 0.65:
+                continue
+            if self._is_repeating_chrome(figure.box, (width, height)):
+                continue
+            candidates.append(figure)
+
+        if not candidates:
+            return ""
+
+        figure = max(candidates, key=lambda region: region.area)
+        try:
             crop = image.crop(figure.box)
-            # The picture is made smaller, so that the notes stay small.
             if crop.width > FIGURE_MAX_WIDTH:
-                height = max(1, int(crop.height * FIGURE_MAX_WIDTH / crop.width))
-                crop = crop.resize((FIGURE_MAX_WIDTH, height), Image.LANCZOS)
+                crop_height = max(1, int(crop.height * FIGURE_MAX_WIDTH / crop.width))
+                crop = crop.resize((FIGURE_MAX_WIDTH, crop_height), Image.LANCZOS)
+
+            crop_io = io.BytesIO()
+            crop.convert("RGB").save(crop_io, format="PNG")
+            crop_bytes = crop_io.getvalue()
+            sha_hash = hashlib.sha256(crop_bytes).hexdigest()[:16]
+            figure_id = f"fig_{sha_hash}"
+            self.last_figure_id = figure_id
+
+            gray_crop = build_gray_thumbnail(crop, 32)
+            current_phash = compute_difference_hash(gray_crop)
+
             assets_dir = self.figures_dir
             assets_dir.mkdir(parents=True, exist_ok=True)
             path = assets_dir / f"figure_{slide_number:04d}.png"
-            crop.convert("RGB").save(path, format="PNG")
+            id_path = assets_dir / f"{figure_id}.png"
+
+            if self.last_figure_phash is not None:
+                dist = hamming_distance(self.last_figure_phash, current_phash)
+                if dist <= 4:
+                    self.control.increment_stat("slide_figure_deduped")
+
+            self.last_figure_phash = current_phash
+            self.last_figure_path = str(path)
+
+            atomic_write_bytes(path, crop_bytes)
+            if not id_path.exists():
+                atomic_write_bytes(id_path, crop_bytes)
         except Exception as error:
             logger.warning("the picture of the diagram could not be saved: %s", error)
             return ""
         return str(path)
+
+    async def caption_figure_with_vision(
+        self,
+        crop_png: bytes,
+        fallback_caption: str = ""
+    ) -> str:
+        if self.llm_router is None or self.control.stop_requested():
+            return fallback_caption
+        prompt = (
+            "Provide a one-line concise title or caption (under 12 words) describing this diagram or chart. "
+            "Do not include quotes or formatting. Return only the caption."
+        )
+        try:
+            message = build_image_message(prompt, crop_png, "image/png")
+            response = await self.llm_router.ainvoke([message])
+            text = response_to_text(response).strip()
+            if text and not is_refusal_text(text):
+                cleaned = re.sub(r"[\r\n]+", " ", text).strip().strip('"\'')
+                if len(cleaned) > 160:
+                    cleaned = cleaned[:157].rstrip() + "..."
+                return cleaned
+        except Exception as error:
+            logger.debug("vision captioning for diagram failed: %s", error)
+        return fallback_caption
 
     def caption_of_the_figure(
         self,
@@ -483,6 +611,39 @@ class ScreenAgent:
         extracted_text = ""
         if revisited_number > 0 and revisited_number in self.slide_texts:
             extracted_text = self.slide_texts[revisited_number]
+
+        regions = await self.find_the_parts(png_bytes)
+        figure_path = ""
+        figure_caption = ""
+        figure_id = ""
+        if regions:
+            figure_path = await run_in_thread_pool(
+                self.save_the_figure, png_bytes, regions, slide_number
+            )
+            debug_path = self.session_dir / "debug" / "layout" / f"slide_{slide_number:04d}_layout.png"
+            await run_in_thread_pool(
+                save_layout_debug_overlay, png_bytes, regions, debug_path
+            )
+
+        local = await self.read_text_locally(png_bytes, regions)
+        local_text = str(local.get("text", "")).strip()
+        if len(extracted_text.strip()) == 0 and len(local_text) > 0:
+            extracted_text = local_text
+            self.control.increment_stat("slide_text_read_locally")
+
+        if figure_path:
+            figure_caption = self.caption_of_the_figure(
+                regions, local.get("lines"), extracted_text
+            )
+            figure_id = getattr(self, "last_figure_id", "") or f"fig_{slide_number:04d}"
+            self.control.increment_stat("slide_figure_kept")
+
+        self.slide_figures[slide_number] = {
+            "path": figure_path,
+            "caption": figure_caption,
+            "figure_id": figure_id
+        }
+
         if len(extracted_text.strip()) > 0:
             self.remember_slide(slide_number, difference_hash, small_thumbnail, extracted_text)
 
@@ -493,7 +654,10 @@ class ScreenAgent:
             monitor_index=self.settings.monitor_index,
             image_file_path=image_path,
             extracted_text=extracted_text,
-            revisited_slide_number=revisited_number
+            revisited_slide_number=revisited_number,
+            figure_file_path=figure_path,
+            figure_caption=figure_caption,
+            figure_id=figure_id
         )
 
         needs_text_extraction = (
@@ -503,23 +667,17 @@ class ScreenAgent:
             and not self.control.stop_requested()
         )
         if needs_text_extraction:
-            # The vision call runs in the background. It used to run inside
-            # the capture loop, so a slow model blocked the capture for up to
-            # four minutes and every slide change in the meantime was missed.
-            # The slide is published exactly once, by the background task,
-            # with the recovered text.
-            #
-            # The model is shown the part of the screen that changed and
-            # not the whole screen. The request is then a small part of
-            # the size, and the small text of a slide is read properly.
+            if figure_path:
+                published_id = await self.redis_bus.publish_resilient(self.stream_name, slide_event)
+                if published_id is not None:
+                    self.control.increment_stat("slides_published")
+                else:
+                    self.control.increment_stat("slides_buffered")
             self.schedule_text_extraction(
                 slide_number, image_path, capture_timestamp, difference_hash,
                 small_thumbnail, crop_png if crop_png is not None else png_bytes
             )
             self._pending_text_extractions += 1
-            # A gauge, not a counter: it shows how many slides are still
-            # waiting for their text, which is the backlog the provider
-            # budget decides.
             self.control.set_stat("slides_awaiting_text", self._pending_text_extractions)
             return slide_event
 
@@ -578,29 +736,12 @@ class ScreenAgent:
         every screenshot alive for the whole retry schedule.
         """
         recovered_text = ""
-        figure_path = ""
-        figure_caption = ""
+        fig_info = self.slide_figures.get(slide_number, {})
+        figure_path = fig_info.get("path", "")
+        figure_caption = fig_info.get("caption", "")
+        figure_id = fig_info.get("figure_id", "")
 
-        regions = await self.find_the_parts(png_bytes)
-        if regions:
-            figure_path = await run_in_thread_pool(
-                self.save_the_figure, png_bytes, regions, slide_number
-            )
-
-        local = await self.read_text_locally(png_bytes, regions)
-        local_text = str(local.get("text", ""))
-        if figure_path:
-            figure_caption = self.caption_of_the_figure(
-                regions, local.get("lines"), local_text
-            )
-            self.control.increment_stat("slide_figure_kept")
-
-        if len(local_text.strip()) > 0:
-            # The machine read the text, so nothing is asked of the
-            # model.
-            recovered_text = local_text
-            self.control.increment_stat("slide_text_read_locally")
-        elif self.llm_router is not None:
+        if self.llm_router is not None:
             self.control.increment_stat("slide_text_needs_model")
             delays = [0.0] + list(self.settings.vision_retry_delays_seconds)
             for index, delay_seconds in enumerate(delays):
@@ -608,13 +749,16 @@ class ScreenAgent:
                     await asyncio.sleep(delay_seconds)
                 if self.control.stop_requested():
                     return
-                try:
-                    payload = await run_in_thread_pool(Path(image_path).read_bytes)
-                except OSError:
-                    return
-                recovered_text = await self.run_vision_fallback(payload, max_retries=1)
+                recovered_text = await self.run_vision_fallback(png_bytes, max_retries=1)
                 if len(recovered_text.strip()) > 0:
                     break
+                try:
+                    payload = await run_in_thread_pool(Path(image_path).read_bytes)
+                    recovered_text = await self.run_vision_fallback(payload, max_retries=1)
+                    if len(recovered_text.strip()) > 0:
+                        break
+                except OSError:
+                    pass
 
         if len(recovered_text.strip()) > 0:
             self.remember_slide(slide_number, difference_hash, small_thumbnail, recovered_text)
@@ -625,6 +769,9 @@ class ScreenAgent:
         self._pending_text_extractions = max(0, self._pending_text_extractions - 1)
         self.control.set_stat("slides_awaiting_text", self._pending_text_extractions)
 
+        if figure_path and not figure_caption and recovered_text:
+            figure_caption = recovered_text.strip()[:157]
+
         update_event = SlideCaptured(
             session_id=self.session_id,
             timestamp_epoch=capture_timestamp,
@@ -634,7 +781,8 @@ class ScreenAgent:
             extracted_text=recovered_text,
             revisited_slide_number=0,
             figure_file_path=figure_path,
-            figure_caption=figure_caption
+            figure_caption=figure_caption,
+            figure_id=figure_id
         )
         await self.redis_bus.publish_resilient(self.stream_name, update_event)
 

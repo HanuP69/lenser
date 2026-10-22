@@ -202,11 +202,17 @@ def format_group_content(group: dict[str, Any]) -> str:
         if source_type == "transcript":
             parts.append(f"[TRANSCRIPT]{flag_prefix} {content}")
         elif source_type == "slide":
+            fig_path = str(metadata.get("figure_file_path", "") or "")
+            fig_token = ""
+            if fig_path:
+                fig_id = str(metadata.get("figure_id", "") or Path(fig_path).stem)
+                fig_cap = str(metadata.get("figure_caption", "") or "").strip()
+                fig_token = f" [FIGURE {fig_id}: {fig_cap}]" if fig_cap else f" [FIGURE {fig_id}]"
             if revisited > 0:
                 truncated = truncate_text(content, REVISIT_TEXT_LIMIT)
-                parts.append(f"[SLIDE:REVISIT#{revisited}] {truncated}")
+                parts.append(f"[SLIDE:REVISIT#{revisited}] {truncated}{fig_token}")
             else:
-                parts.append(f"[SLIDE] {content}")
+                parts.append(f"[SLIDE] {content}{fig_token}")
     return " | ".join(parts)
 
 
@@ -394,6 +400,7 @@ GUIDELINES:
 - Synthesize spoken explanations with corresponding slide content.
 - Prioritize technical depth, mathematical accuracy, and clarity.
 - Structure using markdown headers, bullet points, and code/math blocks ($...$ for inline, $$...$$ for display).
+- When a [FIGURE id: caption] is present, place [FIGURE id] on its own line where that figure is discussed.
 - Do not repeat or invent facts not grounded in the source text.
 
 PREVIOUS CONTEXT:
@@ -838,15 +845,64 @@ class StructuringAgent:
         if len(confusion_excerpts) > 0:
             section_lines.append("")
 
-        section_lines.append(cleaned_summary)
+        valid_figures: dict[str, dict[str, str]] = {}
+        for entry in batch.entries:
+            if str(entry.get("source_type", "")) != "slide":
+                continue
+            metadata = entry.get("metadata", {}) or {}
+            fig_path = str(metadata.get("figure_file_path", "") or "")
+            if not fig_path:
+                continue
+            fig_id = str(metadata.get("figure_id", "") or Path(fig_path).stem)
+            raw_caption = str(metadata.get("figure_caption", "") or "").strip()
+            caption = re.sub(r"[\[\]\r\n]", " ", raw_caption).strip()
+            relative = self.relative_figure_path(fig_path)
+            info = {
+                "path": fig_path,
+                "relative": relative,
+                "caption": caption
+            }
+            valid_figures[fig_id] = info
+            valid_figures[Path(fig_path).stem] = info
+
+        referenced_figures: set[str] = set()
+
+        def replace_figure_token(match: re.Match) -> str:
+            raw_id = match.group(1).strip()
+            if raw_id in valid_figures:
+                info = valid_figures[raw_id]
+                referenced_figures.add(info["path"])
+                cap = info["caption"]
+                rel = info["relative"]
+                if cap:
+                    return f"\n\n![{cap}]({rel})\n*{cap}*\n\n"
+                return f"\n\n![the picture on the screen]({rel})\n\n"
+            return ""
+
+        token_regex = re.compile(r"\[FIGURE\s+([a-zA-Z0-9_\-]+)(?::\s*[^\]]*)?\]", re.IGNORECASE)
+        processed_summary = token_regex.sub(replace_figure_token, cleaned_summary)
+        processed_summary = re.sub(r"\n{3,}", "\n\n", processed_summary).strip()
+
+        section_lines.append(processed_summary)
         section_lines.append("")
 
-        # The pictures of the diagrams that were on the screen. A
-        # description of a diagram teaches nothing, so the picture itself
-        # goes into the notes.
-        figure_lines = self.collect_figure_references(batch.entries)
-        if len(figure_lines) > 0:
-            section_lines.extend(figure_lines)
+        unreferenced_lines: list[str] = []
+        seen_unref: set[str] = set()
+        for fig_id, info in valid_figures.items():
+            fig_path = info["path"]
+            if fig_path in referenced_figures or fig_path in seen_unref:
+                continue
+            seen_unref.add(fig_path)
+            cap = info["caption"]
+            rel = info["relative"]
+            if cap:
+                unreferenced_lines.append(f"![{cap}]({rel})")
+                unreferenced_lines.append(f"*{cap}*")
+            else:
+                unreferenced_lines.append(f"![the picture on the screen]({rel})")
+
+        if len(unreferenced_lines) > 0:
+            section_lines.extend(unreferenced_lines)
             section_lines.append("")
 
         action_items = result_state.get("action_items", []) or []
@@ -1037,6 +1093,56 @@ class StructuringAgent:
             logger.info("all entries in batch ending at offset %d filtered as drift/ad; skipping synthesis", batch.end_offset)
             self.save_notes_marker(batch.end_offset)
             self.save_state(running_context, batch.end_offset, self.current_overlap)
+            return running_context
+
+        if self.notes_path.exists() and self.load_notes_marker() >= batch.end_offset:
+            logger.info(
+                "batch ending at byte %d already written to notes, republishing saved content without re-synthesis",
+                batch.end_offset
+            )
+            first_timestamp = self.section_start_timestamp(entries)
+            last_timestamp = float(entries[-1].get("timestamp_epoch", first_timestamp))
+            start_time_str = self.session_clock.format_epoch_as_elapsed(first_timestamp)
+            end_time_str = self.session_clock.format_epoch_as_elapsed(last_timestamp)
+            slide_references = []
+            for entry in entries:
+                if str(entry.get("source_type", "")) == "slide":
+                    slide_num = (entry.get("metadata", {}) or {}).get("slide_number")
+                    if slide_num is not None:
+                        try:
+                            slide_references.append(int(slide_num))
+                        except ValueError:
+                            pass
+            saved_notes = self.notes_path.read_text(encoding="utf-8")
+            note_segment = GeneralNoteSegment(
+                session_id=self.session_id,
+                lecture_id=self.settings.course_name,
+                sequence_number=self.sequence_number,
+                timestamp_epoch=first_timestamp,
+                start_time=start_time_str,
+                end_time=end_time_str,
+                heading=f"Section {self.sequence_number} ({start_time_str})",
+                content=saved_notes,
+                key_points=[],
+                concept_tags=[],
+                slide_references=slide_references,
+                definitions=[]
+            )
+            if self.redis_bus is not None:
+                stream_name = f"lecturelens:{self.session_id}:stream:notes"
+                if hasattr(self.redis_bus, "publish_resilient"):
+                    await self.redis_bus.publish_resilient(stream_name, note_segment)
+                else:
+                    try:
+                        await self.redis_bus.publish(stream_name, note_segment)
+                    except Exception as error:
+                        logger.warning("failed to republish note segment to redis: %s", error)
+            self.sequence_number += 1
+            self._batch_attempts.pop(batch.start_offset, None)
+            self._batch_attempts.pop(batch.end_offset, None)
+            next_overlap = extract_overlap_entries(entries, OVERLAP_WINDOW_SECONDS)
+            self.current_overlap = next_overlap
+            self.save_state(running_context, batch.end_offset, next_overlap)
             return running_context
 
         active_batch = SliceBatch(

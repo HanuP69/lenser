@@ -80,6 +80,7 @@ class SlideCaptured(BaseModel):
     figure_file_path: str = Field(default="")
     # The title of the slide, which is the caption of the picture.
     figure_caption: str = Field(default="")
+    figure_id: str = Field(default="")
 
     def to_redis_dict(self) -> dict[str, str]:
         data = self.model_dump()
@@ -107,6 +108,7 @@ class SlideCaptured(BaseModel):
         parsed["ocr_latency_ms"] = float(data.get("ocr_latency_ms", "0.0") or "0.0")
         parsed["figure_file_path"] = data.get("figure_file_path", "")
         parsed["figure_caption"] = data.get("figure_caption", "")
+        parsed["figure_id"] = data.get("figure_id", "")
         return cls(**parsed)
 
 

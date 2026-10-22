@@ -92,6 +92,7 @@ class SyncAgent:
         self.event_id_order: deque = deque()
         self.duplicates_skipped: int = 0
         self.recent_anchors: list[AnchorRecord] = []
+        self.slide_correlations: dict[int, str] = {}
         self.buffer_lock: asyncio.Lock = asyncio.Lock()
         self.entries_written: int = 0
         self.fingerprint_history_limit: int = settings.sync_fingerprint_history_limit
@@ -270,7 +271,8 @@ class SyncAgent:
             "revisited_slide_number": event.revisited_slide_number,
             # The picture of the diagram, which goes into the notes.
             "figure_file_path": event.figure_file_path,
-            "figure_caption": event.figure_caption
+            "figure_caption": event.figure_caption,
+            "figure_id": getattr(event, "figure_id", "")
         }
         elapsed = self.session_clock.elapsed_for_epoch(event.timestamp_epoch)
         return TimelineEntry(
@@ -466,6 +468,11 @@ class SyncAgent:
         for entry in ordered_entries:
             if entry.source_type not in ANCHOR_SOURCE_TYPES:
                 continue
+            slide_num = int(entry.metadata.get("slide_number", 0) or 0)
+            if slide_num > 0 and slide_num in self.slide_correlations:
+                entry.correlation_id = self.slide_correlations[slide_num]
+            elif entry.correlation_id is not None and slide_num > 0:
+                self.slide_correlations[slide_num] = entry.correlation_id
             if entry.correlation_id is not None:
                 continue
             neighbour = self.find_nearest_entry_of_other_type(entry, ordered_entries, window_seconds)
@@ -473,12 +480,17 @@ class SyncAgent:
                 if neighbour.correlation_id is None:
                     neighbour.correlation_id = str(uuid.uuid4())
                 entry.correlation_id = neighbour.correlation_id
+                if slide_num > 0:
+                    self.slide_correlations[slide_num] = entry.correlation_id
 
         for entry in ordered_entries:
             if entry.source_type not in ANCHOR_SOURCE_TYPES:
                 continue
             if entry.correlation_id is None:
                 entry.correlation_id = str(uuid.uuid4())
+            slide_num = int(entry.metadata.get("slide_number", 0) or 0)
+            if slide_num > 0:
+                self.slide_correlations[slide_num] = entry.correlation_id
             already_recorded = False
             for record in self.recent_anchors:
                 if (
