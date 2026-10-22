@@ -736,7 +736,8 @@ async def main() -> None:
         router_config = load_router_config(settings.router_config_path)
         router = build_router_for_task(
             "screen_ocr", redis_bus.client, router_config,
-            settings.ollama_url, settings.llm_mode, settings.llm_timeout_seconds
+            settings.ollama_url, settings.llm_mode, settings.llm_timeout_seconds,
+            settings.local_model
         )
     except Exception as error:
         logger.warning("gateway vision router unavailable: %s", error)

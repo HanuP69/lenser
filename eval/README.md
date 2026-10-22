@@ -82,6 +82,43 @@ the share of the words of the slide that were read, in both directions.
 The model reads the same text just as well, at three hundred times the
 price.
 
+## The parts of the screen
+
+A slide is not only text. It has a title, a list, a diagram, a formula
+and the parts of the window around it that have nothing to do with the
+lecture. The name of the window, the bar at the bottom and the name of
+the speaker in the corner are read on every single slide, and they are
+of no use to the reader of the notes.
+
+A model of the layout of a document (`PP-DocLayoutV3`, in the form of
+ONNX, under the Apache licence) finds the parts of a screen: the text,
+the pictures, the formulas and the parts of the window. It runs on the
+processor and takes about three seconds for a picture of a screen.
+
+The text is read **as a whole** and the parts of the window are taken
+out afterwards. Reading only the parts that hold text was tried and it
+reads less, because a slide whose text the model of the layout did not
+recognise comes out empty. Three ways of reading the same twenty five
+slides were measured against the notes of the course, with the name of
+the course and the licence taken out of the truth, because they are on
+every page of it and say nothing about the slide:
+
+| The reading | The words that were right | The words that were found | F1 |
+| :--- | ---: | ---: | ---: |
+| The whole screen | 0.578 | 0.592 | 0.517 |
+| Only the parts that hold text | 0.590 | 0.531 | 0.530 |
+| **The whole screen, the window taken out** | **0.687** | **0.589** | **0.562** |
+
+**The whole screen with the window taken out is the best one.** The
+words that were right go up by eleven points, because the name of the
+speaker and the name of the course are gone, and the words that were
+found stay the same.
+
+The picture of a diagram is cut out of the screen and kept next to the
+notes. A description of a diagram teaches nothing, so the picture itself
+is what the student needs. The caption of the picture is the title of
+the slide, and not a made up sentence.
+
 ## The numbers that are measured
 
 

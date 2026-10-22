@@ -6,9 +6,12 @@ LaTeX as it is. The notes are turned into a page that draws them, so the
 formulas can be read without any extra program.
 """
 
+import base64
 import html
+import mimetypes
 import re
-from typing import Any
+from pathlib import Path
+from typing import Any, Optional
 
 # A page that works when it is opened in a browser. The formulas are
 # drawn by MathJax, which is loaded from a CDN.
@@ -64,6 +67,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   th, td {{ border: 1px solid var(--border); padding: .5em .75em; text-align: left; }}
   th {{ background: var(--code); }}
   hr {{ border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }}
+  img {{ max-width: 100%; height: auto; border-radius: 8px; margin: 1.2em 0; display: block; }}
+  p > em:only-child {{ display: block; color: var(--muted); font-size: .9em; margin-top: -.6em; }}
   .time-mark {{
     display: inline-block; margin-top: 2.5em; padding: .2em .6em;
     border: 1px solid var(--border); border-radius: 999px;
@@ -110,12 +115,65 @@ def _mathjax_renderer(tex: str, options: dict[str, Any]) -> str:
     return f'<span class="math inline">\\({tex}\\)</span>'
 
 
-def render_notes_html(markdown_text: str, title: str = "Lecture Notes") -> str:
-    """Turn the notes into a page that shows the formulas."""
+def render_notes_html(
+    markdown_text: str,
+    title: str = "Lecture Notes",
+    base_dir: Optional[Path] = None
+) -> str:
+    """Turn the notes into a page that shows the formulas.
+
+    When the folder of the notes is given, the pictures of the diagrams
+    are put inside the page. The page then stands on its own: it can be
+    sent to someone, or opened from anywhere, and the pictures are still
+    there.
+    """
     body = _render_markdown(markdown_text)
     body = _mark_time_stamps(body)
+    if base_dir is not None:
+        body = _inline_images(body, base_dir)
     safe_title = html.escape(title)
     return PAGE_TEMPLATE.format(title=safe_title, body=body)
+
+
+IMAGE_PATTERN = re.compile(r'<img\s+[^>]*?src="([^"]+)"', re.IGNORECASE)
+
+
+def _inline_images(body: str, base_dir: Path) -> str:
+    """Put the pictures of the diagrams inside the page.
+
+    A picture that is linked is a picture that is lost the moment the
+    notes are moved. The bytes of the picture go into the page itself.
+    """
+    folder = Path(base_dir)
+
+    def replace(match: "re.Match[str]") -> str:
+        source = match.group(1)
+        data_uri = _as_data_uri(source, folder)
+        if data_uri is None:
+            return match.group(0)
+        return match.group(0).replace(f'src="{source}"', f'src="{data_uri}"')
+
+    return IMAGE_PATTERN.sub(replace, body)
+
+
+def _as_data_uri(source: str, folder: Path) -> Optional[str]:
+    """The picture as text that a browser can draw."""
+    if source.startswith(("data:", "http://", "https://", "//")):
+        return None
+    candidate = Path(source)
+    if candidate.is_absolute():
+        path = candidate
+    else:
+        path = folder / candidate
+    try:
+        if not path.is_file():
+            return None
+        payload = path.read_bytes()
+    except OSError:
+        return None
+    mime = mimetypes.guess_type(path.name)[0] or "image/png"
+    encoded = base64.b64encode(payload).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
 
 
 def _render_markdown(markdown_text: str) -> str:

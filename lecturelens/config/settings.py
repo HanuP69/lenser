@@ -79,6 +79,11 @@ class Settings(BaseSettings):
     # slide as well as a model does over the network. The model is then
     # only asked for the parts the reader cannot do.
     screen_local_ocr: bool = Field(default=True)
+    # Whether the parts of the screen are found: the text, the pictures
+    # and the parts of the window around the lecture. The pictures of the
+    # diagrams go into the notes, and the parts of the window are left
+    # out of the text.
+    screen_layout_model: bool = Field(default=True)
     slide_diff_threshold: float = Field(default=0.004)
     # The slide text is extracted by a vision model, so the number of slides
     # that can be transcribed is bounded by the provider's budget. The retries

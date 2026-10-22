@@ -391,6 +391,10 @@ class TestScreenAgentHardening(unittest.IsolatedAsyncioTestCase):
         settings = Settings()
         settings.output_dir = Path(temp_dir)
         settings.vision_retry_delays_seconds = [0.05, 0.05]
+        # The model that finds the parts of the screen is not needed here,
+        # and it takes a few seconds to start.
+        settings.screen_layout_model = False
+        settings.screen_local_ocr = False
         bus = RecordingBus()
         return ScreenAgent(settings, bus, SessionClock(), "screen_hardening", router), bus
 
@@ -427,10 +431,30 @@ class TestScreenAgentHardening(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(recovered.timestamp_epoch, first.timestamp_epoch)
 
     async def test_no_retry_scheduled_without_a_vision_router(self) -> None:
+        """Without a model and without the reader of the machine there is
+        nothing to wait for."""
         with tempfile.TemporaryDirectory() as temp_dir:
             agent, _ = self.make_agent(temp_dir, None)
             await agent.ingest_png_bytes(make_png())
             self.assertEqual(len(agent.retry_tasks), 0)
+
+    async def test_the_slide_is_read_on_the_machine_without_a_model(self) -> None:
+        """The reader of the machine is free, so a slide is worth waiting
+        for even when there is no model to ask."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            agent, bus = self.make_agent(temp_dir, None)
+            agent.settings.screen_local_ocr = True
+
+            async def read_locally(*args: Any, **kwargs: Any) -> dict[str, Any]:
+                return {"text": "Binary Search O(log n)", "lines": []}
+
+            with mock.patch.object(agent, "read_text_locally", side_effect=read_locally):
+                await agent.ingest_png_bytes(make_png())
+                await asyncio.wait_for(
+                    asyncio.gather(*list(agent.retry_tasks)), timeout=5
+                )
+            self.assertEqual(len(bus.published), 1)
+            self.assertEqual(bus.published[0].extracted_text, "Binary Search O(log n)")
 
     async def test_stop_cancels_pending_retries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

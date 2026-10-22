@@ -404,6 +404,35 @@ class TestCliCommands(unittest.TestCase):
         with self.assertRaises(typer.Exit):
             export(export_format="docx", session="lec1", output=destination)
 
+    def test_export_copies_the_pictures_of_the_diagrams(self) -> None:
+        """The notes point at the pictures by a path that is relative to
+        them, so the pictures have to travel with the notes."""
+        assets = self.session_dir / "assets"
+        assets.mkdir(parents=True, exist_ok=True)
+        (assets / "figure_0001.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        notes = self.session_dir / "notes.md"
+        notes.write_text(
+            "### 00:01:00\n\n![A neuron](assets/figure_0001.png)\n",
+            encoding="utf-8"
+        )
+        destination = self.output / "out"
+        export(export_format="md", session="lec1", output=destination)
+        self.assertTrue((destination / "assets" / "figure_0001.png").exists())
+
+    def test_export_html_has_the_pictures_inside_it(self) -> None:
+        assets = self.session_dir / "assets"
+        assets.mkdir(parents=True, exist_ok=True)
+        (assets / "figure_0001.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        notes = self.session_dir / "notes.md"
+        notes.write_text(
+            "### 00:01:00\n\n![A neuron](assets/figure_0001.png)\n",
+            encoding="utf-8"
+        )
+        destination = self.output / "out"
+        export(export_format="html", session="lec1", output=destination)
+        page = (destination / "lec1_notes.html").read_text(encoding="utf-8")
+        self.assertIn("data:image/png;base64,", page)
+
     def test_review_command_executes(self) -> None:
         review(course="algorithms", session=None)
         review(course=None, session="lec1")

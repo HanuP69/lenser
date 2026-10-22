@@ -141,6 +141,10 @@ class MockVisionRouter:
 def make_agent(temp_dir: str, router: Any = None) -> tuple[ScreenAgent, FakeBus]:
     settings = Settings()
     settings.output_dir = Path(temp_dir)
+    # The model that finds the parts of the screen is not needed here, and
+    # it takes a few seconds to start.
+    settings.screen_layout_model = False
+    settings.screen_local_ocr = False
     bus = FakeBus()
     return ScreenAgent(settings, bus, SessionClock(), "screen_test", router), bus
 

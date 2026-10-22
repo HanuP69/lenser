@@ -34,6 +34,9 @@ logger = get_logger("lecturelens.screen_agent")
 # referenced by anything.
 MAX_REMEMBERED_SLIDES = 200
 REVISIT_THUMBNAIL_WIDTH = 192
+# The width of the picture of a diagram that goes into the notes. A
+# picture that is wider is made smaller, so that the notes stay small.
+FIGURE_MAX_WIDTH = 900
 REVISIT_MAX_CHANGED_FRACTION = 0.01
 
 SLIDE_VISION_PROMPT = (
@@ -178,6 +181,8 @@ class ScreenAgent:
 
         session_dir = settings.create_session_directories(session_id)
         self.slides_dir: Path = session_dir / "raw" / "slides"
+        # The pictures of the diagrams, which go into the notes.
+        self.figures_dir: Path = session_dir / "assets"
         self.stream_name: str = f"lecturelens:{session_id}:stream:slide"
         self.control: AgentControl = AgentControl(session_dir, "screen_agent")
         self.slide_counter: int = next_file_index(self.slides_dir, "slide_", ".png") - 1
@@ -261,14 +266,123 @@ class ScreenAgent:
             if removed_number in self.slide_texts:
                 del self.slide_texts[removed_number]
 
-    async def read_text_locally(self, png_bytes: bytes) -> str:
+    def save_the_figure(
+        self,
+        png_bytes: bytes,
+        regions: list[Any],
+        slide_number: int
+    ) -> str:
+        """The picture of the diagram on the screen, saved on its own.
+
+        A description of a diagram teaches nothing. The picture itself is
+        what the student needs, so it is kept next to the notes.
+        """
+        from lecturelens.core.layout_model import KIND_FIGURE
+
+        figures = [region for region in regions if region.kind == KIND_FIGURE]
+        if not figures:
+            return ""
+        # The biggest diagram is the one that was shown.
+        figure = max(figures, key=lambda region: region.area)
+        if figure.width < 120 or figure.height < 120:
+            return ""
+        try:
+            import io as _io
+
+            from PIL import Image
+
+            image = Image.open(_io.BytesIO(png_bytes))
+            image.load()
+            crop = image.crop(figure.box)
+            # The picture is made smaller, so that the notes stay small.
+            if crop.width > FIGURE_MAX_WIDTH:
+                height = max(1, int(crop.height * FIGURE_MAX_WIDTH / crop.width))
+                crop = crop.resize((FIGURE_MAX_WIDTH, height), Image.LANCZOS)
+            assets_dir = self.figures_dir
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            path = assets_dir / f"figure_{slide_number:04d}.png"
+            crop.convert("RGB").save(path, format="PNG")
+        except Exception as error:
+            logger.warning("the picture of the diagram could not be saved: %s", error)
+            return ""
+        return str(path)
+
+    def caption_of_the_figure(
+        self,
+        regions: list[Any],
+        lines: Optional[list[dict[str, Any]]] = None,
+        slide_text: str = ""
+    ) -> str:
+        """The caption of the picture: the title of the slide.
+
+        A caption that is made up, such as "the picture on the screen",
+        teaches the reader nothing. The title of the slide says what the
+        diagram is about, so it is used as the caption.
+        """
+        from lecturelens.core.layout_model import KIND_FIGURE_TITLE, KIND_TITLE
+
+        titles = [region for region in regions if region.kind == KIND_TITLE]
+        if not titles:
+            # A slide without a title still has a label under its
+            # picture, which says what the picture is.
+            titles = [region for region in regions if region.kind == KIND_FIGURE_TITLE]
+        caption = self._words_of_the_titles(titles, lines)
+        if not caption:
+            # A slide with neither a title nor a label: the first words
+            # of the slide say what it is about.
+            caption = slide_text.strip()
+        if len(caption) > 160:
+            caption = caption[:157].rstrip() + "..."
+        return caption
+
+    def _words_of_the_titles(
+        self,
+        titles: list[Any],
+        lines: Optional[list[dict[str, Any]]]
+    ) -> str:
+        """The words that were read inside the titles."""
+        if not titles:
+            return ""
+        # The title is the one that is highest on the screen. A title that
+        # sits on the same band belongs to it and is read with it.
+        top = min(titles, key=lambda region: region.box[1])
+        band_bottom = top.box[1] + max(top.height, 40)
+        wanted = [
+            region for region in titles
+            if region.box[1] <= band_bottom
+        ]
+
+        words: list[str] = []
+        for line in lines or []:
+            box = line.get("box")
+            if box is None:
+                continue
+            centre_x = (box[0] + box[2]) / 2.0
+            centre_y = (box[1] + box[3]) / 2.0
+            inside = any(
+                region.box[0] <= centre_x <= region.box[2]
+                and region.box[1] <= centre_y <= region.box[3]
+                for region in wanted
+            )
+            if not inside:
+                continue
+            text = str(line.get("text", "")).strip()
+            if text:
+                words.append(text)
+        return " ".join(words).strip()
+
+    async def read_text_locally(
+        self,
+        png_bytes: bytes,
+        regions: Optional[list[Any]] = None
+    ) -> dict[str, Any]:
         """The text of a picture, read on the machine.
 
         The reader is not there on every machine, and then nothing is
         read and the model is asked as it was before.
         """
         if not self.settings.screen_local_ocr:
-            return ""
+            return {"text": "", "lines": []}
         try:
             import io as _io
 
@@ -278,11 +392,37 @@ class ScreenAgent:
 
             image = Image.open(_io.BytesIO(png_bytes))
             image.load()
-            result = await run_in_thread_pool(read_text, np.array(image))
+            result = await run_in_thread_pool(read_text, np.array(image), regions)
         except Exception as error:
             logger.warning("the local reading of the text failed: %s", error)
-            return ""
-        return str(result.get("text", "")).strip()
+            return {"text": "", "lines": []}
+        result["text"] = str(result.get("text", "")).strip()
+        return result
+
+    async def find_the_parts(self, png_bytes: bytes) -> list[Any]:
+        """The parts of the screen: the text, the pictures, the chrome.
+
+        The model that finds them is not there on every machine, and then
+        the whole screen is read as it was before.
+        """
+        if not self.settings.screen_layout_model:
+            return []
+        try:
+            import io as _io
+
+            from PIL import Image
+
+            from lecturelens.core.layout_model import get_shared_layout_model
+
+            model = get_shared_layout_model()
+            if not model.is_available():
+                return []
+            image = Image.open(_io.BytesIO(png_bytes))
+            image.load()
+            return await run_in_thread_pool(model.detect, np.array(image))
+        except Exception as error:
+            logger.warning("the parts of the screen could not be found: %s", error)
+            return []
 
     async def run_ocr(self, png_bytes: bytes) -> str:
         """Extract the text of a slide.
@@ -309,6 +449,18 @@ class ScreenAgent:
                 if attempt < max_retries - 1:
                     await asyncio.sleep(0.5 * (attempt + 1))
         return ""
+
+    def can_work_in_the_background(self) -> bool:
+        """Whether a slide is worth waiting for.
+
+        The parts of the screen are found and the picture of the diagram
+        is kept on the machine, so a slide is worth waiting for even when
+        there is no model to ask. The model is only needed for a slide
+        whose text the machine could not read.
+        """
+        if self.llm_router is not None:
+            return True
+        return self.settings.screen_local_ocr or self.settings.screen_layout_model
 
     async def accept_png(
         self,
@@ -347,7 +499,7 @@ class ScreenAgent:
         needs_text_extraction = (
             len(extracted_text.strip()) == 0
             and revisited_number == 0
-            and self.llm_router is not None
+            and self.can_work_in_the_background()
             and not self.control.stop_requested()
         )
         if needs_text_extraction:
@@ -405,24 +557,50 @@ class ScreenAgent:
         small_thumbnail: np.ndarray,
         png_bytes: bytes
     ) -> None:
-        """Recover the text of a slide in the background and publish it once.
+        """Read a slide in the background and publish it once.
 
-        The text is read on the machine first, where it is free. The model
-        is only asked when the machine could not read enough of it, which
-        is the case for a picture or a formula.
+        Three things happen here, and all of them are done on the machine
+        where they are free:
+
+        1. The parts of the screen are found: the text, the pictures and
+           the parts of the window around the lecture.
+        2. The picture of the diagram is saved on its own. A description
+           of a diagram teaches nothing, so the picture itself is kept.
+        3. The text is read on the machine, and only the parts of the
+           screen that hold text are read. The title bar and the bar at
+           the bottom of the window are left out.
+
+        The model is only asked when the machine could not read the text,
+        which is the case for a picture or a formula.
 
         The image is read back from the file for every attempt instead of
         being held in memory. A backlog of pending slides would otherwise keep
         every screenshot alive for the whole retry schedule.
         """
         recovered_text = ""
-        local_text = await self.read_text_locally(png_bytes)
+        figure_path = ""
+        figure_caption = ""
+
+        regions = await self.find_the_parts(png_bytes)
+        if regions:
+            figure_path = await run_in_thread_pool(
+                self.save_the_figure, png_bytes, regions, slide_number
+            )
+
+        local = await self.read_text_locally(png_bytes, regions)
+        local_text = str(local.get("text", ""))
+        if figure_path:
+            figure_caption = self.caption_of_the_figure(
+                regions, local.get("lines"), local_text
+            )
+            self.control.increment_stat("slide_figure_kept")
+
         if len(local_text.strip()) > 0:
             # The machine read the text, so nothing is asked of the
             # model.
             recovered_text = local_text
             self.control.increment_stat("slide_text_read_locally")
-        else:
+        elif self.llm_router is not None:
             self.control.increment_stat("slide_text_needs_model")
             delays = [0.0] + list(self.settings.vision_retry_delays_seconds)
             for index, delay_seconds in enumerate(delays):
@@ -454,7 +632,9 @@ class ScreenAgent:
             monitor_index=self.settings.monitor_index,
             image_file_path=image_path,
             extracted_text=recovered_text,
-            revisited_slide_number=0
+            revisited_slide_number=0,
+            figure_file_path=figure_path,
+            figure_caption=figure_caption
         )
         await self.redis_bus.publish_resilient(self.stream_name, update_event)
 
@@ -558,7 +738,8 @@ async def main() -> None:
                 router_config,
                 context.settings.ollama_url,
                 context.settings.llm_mode,
-                context.settings.llm_timeout_seconds
+                context.settings.llm_timeout_seconds,
+                context.settings.local_model
             )
         except Exception as error:
             # There is no local OCR fallback, so the slides will be captured

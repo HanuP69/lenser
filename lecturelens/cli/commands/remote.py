@@ -72,7 +72,8 @@ def student(
             config,
             settings.ollama_url,
             settings.llm_mode,
-            settings.llm_timeout_seconds
+            settings.llm_timeout_seconds,
+            settings.local_model
         )
     except Exception:
         try:

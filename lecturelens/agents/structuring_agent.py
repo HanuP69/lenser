@@ -779,6 +779,38 @@ class StructuringAgent:
                 return float(entry.get("timestamp_epoch", 0.0))
         return float(entries[0].get("timestamp_epoch", 0.0))
 
+    def collect_figure_references(self, entries: list[dict[str, Any]]) -> list[str]:
+        """The pictures of the diagrams that were on the screen.
+
+        The path is relative to the notes, so that the notes and the
+        pictures can be moved together.
+        """
+        lines: list[str] = []
+        seen: set[str] = set()
+        for entry in entries:
+            if str(entry.get("source_type", "")) != "slide":
+                continue
+            metadata = entry.get("metadata", {}) or {}
+            figure_path = str(metadata.get("figure_file_path", "") or "")
+            if not figure_path or figure_path in seen:
+                continue
+            seen.add(figure_path)
+            caption = str(metadata.get("figure_caption", "") or "").strip()
+            relative = self.relative_figure_path(figure_path)
+            if caption:
+                lines.append(f"![{caption}]({relative})")
+                lines.append(f"*{caption}*")
+            else:
+                lines.append(f"![the picture on the screen]({relative})")
+        return lines
+
+    def relative_figure_path(self, figure_path: str) -> str:
+        """The path of a picture, relative to the notes."""
+        try:
+            return Path(figure_path).resolve().relative_to(self.session_dir.resolve()).as_posix()
+        except (ValueError, OSError):
+            return Path(figure_path).name
+
     def build_notes_section(
         self,
         batch: SliceBatch,
@@ -808,6 +840,14 @@ class StructuringAgent:
 
         section_lines.append(cleaned_summary)
         section_lines.append("")
+
+        # The pictures of the diagrams that were on the screen. A
+        # description of a diagram teaches nothing, so the picture itself
+        # goes into the notes.
+        figure_lines = self.collect_figure_references(batch.entries)
+        if len(figure_lines) > 0:
+            section_lines.extend(figure_lines)
+            section_lines.append("")
 
         action_items = result_state.get("action_items", []) or []
         if len(action_items) > 0:
@@ -975,7 +1015,11 @@ class StructuringAgent:
 
             notes_text = self.notes_path.read_text(encoding="utf-8")
             self.notes_html_path.write_text(
-                render_notes_html(notes_text, title=f"Lecture Notes - {self.session_id}"),
+                render_notes_html(
+                    notes_text,
+                    title=f"Lecture Notes - {self.session_id}",
+                    base_dir=self.session_dir
+                ),
                 encoding="utf-8"
             )
         except Exception as error:
@@ -1262,7 +1306,8 @@ async def main() -> None:
             router_config,
             context.settings.ollama_url,
             context.settings.llm_mode,
-            context.settings.llm_timeout_seconds
+            context.settings.llm_timeout_seconds,
+            context.settings.local_model
         )
         return StructuringAgent(
             settings=context.settings,

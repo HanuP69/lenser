@@ -75,6 +75,11 @@ class SlideCaptured(BaseModel):
     extracted_text: str
     revisited_slide_number: int = Field(default=0)
     ocr_latency_ms: float = Field(default=0.0)
+    # The picture of a diagram that was on the screen. A description of a
+    # diagram teaches nothing, so the picture itself is kept.
+    figure_file_path: str = Field(default="")
+    # The title of the slide, which is the caption of the picture.
+    figure_caption: str = Field(default="")
 
     def to_redis_dict(self) -> dict[str, str]:
         data = self.model_dump()
@@ -100,6 +105,8 @@ class SlideCaptured(BaseModel):
         parsed["extracted_text"] = data["extracted_text"]
         parsed["revisited_slide_number"] = int(data.get("revisited_slide_number", "0") or "0")
         parsed["ocr_latency_ms"] = float(data.get("ocr_latency_ms", "0.0") or "0.0")
+        parsed["figure_file_path"] = data.get("figure_file_path", "")
+        parsed["figure_caption"] = data.get("figure_caption", "")
         return cls(**parsed)
 
 

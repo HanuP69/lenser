@@ -267,7 +267,10 @@ class SyncAgent:
             "slide_number": event.slide_number,
             "monitor_index": event.monitor_index,
             "image_file_path": event.image_file_path,
-            "revisited_slide_number": event.revisited_slide_number
+            "revisited_slide_number": event.revisited_slide_number,
+            # The picture of the diagram, which goes into the notes.
+            "figure_file_path": event.figure_file_path,
+            "figure_caption": event.figure_caption
         }
         elapsed = self.session_clock.elapsed_for_epoch(event.timestamp_epoch)
         return TimelineEntry(

@@ -28,7 +28,7 @@ class FakeBus:
         self.published.append((stream_name, event))
         return "1-1"
 
-    async def ensure_consumer_group(self, stream_name: str, group_name: str) -> None:
+    async def ensure_consumer_group(self, stream_name: str, group_name: str, start_id: str = "0") -> None:
         pass
 
     async def consume(self, *args: Any, **kwargs: Any) -> None:

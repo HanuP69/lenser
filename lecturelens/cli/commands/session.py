@@ -22,6 +22,7 @@ from lecturelens.cli.app import (
     check_redis,
     collect_snapshot,
     console,
+    copy_figure_assets,
     display_session_output_summary,
     ensure_session_exists,
     fail,
@@ -421,8 +422,14 @@ def export(
 
         destination = target_dir / f"{session_id}_notes.html"
         notes_text = notes_path.read_text(encoding="utf-8")
+        # The pictures of the diagrams go inside the page, so that the
+        # page stands on its own.
         destination.write_text(
-            render_notes_html(notes_text, title=f"Lecture Notes - {session_id}"),
+            render_notes_html(
+                notes_text,
+                title=f"Lecture Notes - {session_id}",
+                base_dir=session_dir
+            ),
             encoding="utf-8"
         )
         console.print(f"HTML: {destination}")
@@ -432,6 +439,12 @@ def export(
     destination = target_dir / f"{session_id}_notes.md"
     destination.write_bytes(notes_path.read_bytes())
     console.print(f"Markdown: {destination}")
+    # The notes point at the pictures of the diagrams by a path that is
+    # relative to them. The pictures are copied next to the notes, so
+    # that the links keep working.
+    copied = copy_figure_assets(session_dir, target_dir)
+    if copied > 0:
+        console.print(f"Pictures: {copied} copied to {target_dir / 'assets'}")
 
 
 @app.command()
@@ -479,7 +492,8 @@ def reprocess(
         try:
             router = build_router_for_task(
                 "structuring", redis_client, load_router_config(settings.router_config_path),
-                settings.ollama_url, settings.llm_mode, settings.llm_timeout_seconds
+                settings.ollama_url, settings.llm_mode, settings.llm_timeout_seconds,
+                settings.local_model
             )
             agent = StructuringAgent(settings=settings, session_id=session, llm_router=router, redis_bus=None)
             agent.reset_outputs()

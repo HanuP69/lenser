@@ -85,6 +85,34 @@ class TestSchemas(unittest.TestCase):
         del legacy["revisited_slide_number"]
         self.assertEqual(SlideCaptured.from_redis_dict(legacy).revisited_slide_number, 0)
 
+    def test_the_picture_of_a_diagram_travels_with_the_slide(self) -> None:
+        slide = SlideCaptured(
+            session_id="s",
+            timestamp_epoch=1.0,
+            slide_number=4,
+            image_file_path="x.png",
+            extracted_text="text",
+            figure_file_path="output/assets/figure_0004.png",
+            figure_caption="A picture of a neuron"
+        )
+        restored = SlideCaptured.from_redis_dict(slide.to_redis_dict())
+        self.assertEqual(restored.figure_file_path, "output/assets/figure_0004.png")
+        self.assertEqual(restored.figure_caption, "A picture of a neuron")
+
+    def test_an_old_slide_without_a_picture_is_still_read(self) -> None:
+        """The slides of a session that was made before the pictures were
+        kept must still be read."""
+        legacy = {
+            "session_id": "s",
+            "timestamp_epoch": "1.0",
+            "slide_number": "4",
+            "image_file_path": "x.png",
+            "extracted_text": "text"
+        }
+        restored = SlideCaptured.from_redis_dict(legacy)
+        self.assertEqual(restored.figure_file_path, "")
+        self.assertEqual(restored.figure_caption, "")
+
     def test_general_note_segment_handles_serialized_json_strings(self) -> None:
         data = {
             "session_id": "test_sess_note",

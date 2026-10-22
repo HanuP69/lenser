@@ -40,7 +40,8 @@ def ask(
             try:
                 router = build_router_for_task(
                     "qa", bus.client, load_router_config(settings.router_config_path),
-                    settings.ollama_url, settings.llm_mode, settings.llm_timeout_seconds
+                    settings.ollama_url, settings.llm_mode, settings.llm_timeout_seconds,
+                    settings.local_model
                 )
             except Exception as error:
                 console.print(f"[yellow]Router unavailable, using Ollama directly: {error}[/yellow]")

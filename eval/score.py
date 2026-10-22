@@ -262,8 +262,6 @@ def slide_change_times(
     lining up noticed it, it is the moment the new page started to fit
     better than the old one.
     """
-    from rapidfuzz import fuzz
-
     page_texts = [page["text"].lower() for page in pages]
     if not page_texts:
         return []

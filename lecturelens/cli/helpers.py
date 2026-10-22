@@ -1,5 +1,6 @@
 import json
 import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -30,6 +31,31 @@ def validate_start_options(audio_source: str, llm_mode: str, run_mode: str) -> N
 
 def validate_export_format(export_format: str) -> str:
     return validate_choice(export_format, VALID_EXPORT_FORMATS, "--format")
+
+
+def copy_figure_assets(session_dir: Path, target_dir: Path) -> int:
+    """Copy the pictures of the diagrams next to the exported notes.
+
+    The notes point at the pictures by a path that is relative to them,
+    so the pictures have to travel with the notes. The number of pictures
+    that were copied is returned.
+    """
+    source_dir = session_dir / "assets"
+    if not source_dir.is_dir():
+        return 0
+    destination_dir = target_dir / "assets"
+    copied = 0
+    try:
+        destination_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return 0
+    for picture in sorted(source_dir.glob("figure_*.png")):
+        try:
+            shutil.copy2(picture, destination_dir / picture.name)
+            copied += 1
+        except OSError:
+            continue
+    return copied
 
 
 def format_elapsed(seconds_value: float) -> str:

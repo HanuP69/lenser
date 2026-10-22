@@ -448,9 +448,16 @@ def build_router_for_task(
     router_config: dict[str, Any],
     ollama_url: Optional[str] = None,
     llm_mode: str = "local",
-    timeout_seconds: Optional[float] = None
+    timeout_seconds: Optional[float] = None,
+    local_model: Optional[str] = None
 ) -> Any:
     resolved_ollama_url = ollama_url or os.environ.get("LECTURELENS_OLLAMA_URL", "http://127.0.0.1:11434")
+    if local_model:
+        # The name of the local model is a setting of the machine, and the
+        # settings read the .env file. The environment of the process does
+        # not hold it, so the name in router.yaml would win and a machine
+        # with another model would ask for a model it does not have.
+        os.environ["LECTURELENS_LOCAL_MODEL"] = str(local_model)
     providers_config = router_config.get("providers", {})
     task_routing = router_config.get("task_routing", {})
     provider_chain_names = list(task_routing.get(task_type, []))
