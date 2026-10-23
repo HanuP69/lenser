@@ -364,6 +364,11 @@ class ScreenAgent:
                 continue
             if figure.area < total_frame_area * 0.04:
                 continue
+            if figure.area > total_frame_area * 0.60:
+                # A region covering most of the slide is likely a background
+                # photo or full-frame image, not a diagram. The world map
+                # in the video background was caught here.
+                continue
             if getattr(figure, "score", 1.0) < 0.65:
                 continue
             if self._is_repeating_chrome(figure.box, (width, height)):
@@ -374,6 +379,26 @@ class ScreenAgent:
             return ""
 
         figure = max(candidates, key=lambda region: region.area)
+
+        # Reject photographic backgrounds only for large figures (covering
+        # more than 30% of the slide): diagrams have sharp edges and
+        # few colors (low variance, few unique colours), while photos have
+        # gradients and many colors (high variance, many unique colours).
+        # Small figures are always diagrams/charts/formulas.
+        figure_area_ratio = figure.area / total_frame_area
+        if figure_area_ratio > 0.30:
+            crop = image.crop(figure.box)
+            thumb = crop.resize((32, 32), Image.LANCZOS)
+            arr = np.array(thumb).astype(np.float32) / 255.0
+            colour_variance = float(np.var(arr))
+            quantized = (arr * 15).astype(np.int32)
+            unique_colours = int(len(np.unique(quantized.reshape(-1, 3), axis=0)))
+            # A diagram/chart/formula has variance < 0.05 and < 100 unique
+            # quantised colours. A photo/video frame exceeds both.
+            if colour_variance > 0.05 or unique_colours > 100:
+                self.control.increment_stat("figure_rejected_photo")
+                return ""
+
         try:
             crop = image.crop(figure.box)
             if crop.width > FIGURE_MAX_WIDTH:
@@ -390,22 +415,27 @@ class ScreenAgent:
             gray_crop = build_gray_thumbnail(crop, 32)
             current_phash = compute_difference_hash(gray_crop)
 
+            # The same picture as the one just before it: the previous
+            # file is used again and this crop is not written. The check
+            # used to count the dedup stat and then save a near identical
+            # copy anyway, so slides one after another put the same
+            # picture into the notes again as another file.
+            if self.last_figure_phash is not None and self.last_figure_path:
+                dist = hamming_distance(self.last_figure_phash, current_phash)
+                if dist <= 4:
+                    self.control.increment_stat("slide_figure_deduped")
+                    return self.last_figure_path
+
             assets_dir = self.figures_dir
             assets_dir.mkdir(parents=True, exist_ok=True)
             path = assets_dir / f"figure_{slide_number:04d}.png"
             id_path = assets_dir / f"{figure_id}.png"
 
-            if self.last_figure_phash is not None:
-                dist = hamming_distance(self.last_figure_phash, current_phash)
-                if dist <= 4:
-                    self.control.increment_stat("slide_figure_deduped")
-
-            self.last_figure_phash = current_phash
-            self.last_figure_path = str(path)
-
             atomic_write_bytes(path, crop_bytes)
             if not id_path.exists():
                 atomic_write_bytes(id_path, crop_bytes)
+            self.last_figure_phash = current_phash
+            self.last_figure_path = str(path)
         except Exception as error:
             logger.warning("the picture of the diagram could not be saved: %s", error)
             return ""
@@ -662,7 +692,13 @@ class ScreenAgent:
 
         needs_text_extraction = (
             len(extracted_text.strip()) == 0
-            and revisited_number == 0
+            # A revisited slide whose text was never stored is in the
+            # same case as a slide never read before: the retake shows
+            # the same screen, so the text is read from it. The slides
+            # of a re-turn on an old slide used to be published with no
+            # text and no reading was scheduled for them, so the notes
+            # got a slide of nothing every time the lecturer went back.
+            and (revisited_number == 0 or revisited_number not in self.slide_texts)
             and self.can_work_in_the_background()
             and not self.control.stop_requested()
         )
@@ -675,7 +711,8 @@ class ScreenAgent:
                     self.control.increment_stat("slides_buffered")
             self.schedule_text_extraction(
                 slide_number, image_path, capture_timestamp, difference_hash,
-                small_thumbnail, crop_png if crop_png is not None else png_bytes
+                small_thumbnail, crop_png if crop_png is not None else png_bytes,
+                revisited_slide_number=revisited_number
             )
             self._pending_text_extractions += 1
             self.control.set_stat("slides_awaiting_text", self._pending_text_extractions)
@@ -695,16 +732,27 @@ class ScreenAgent:
         capture_timestamp: float,
         difference_hash: int,
         small_thumbnail: np.ndarray,
-        png_bytes: bytes
+        png_bytes: bytes,
+        revisited_slide_number: int = 0
     ) -> None:
         task = asyncio.create_task(
             self.extract_and_publish_slide_text(
                 slide_number, image_path, capture_timestamp, difference_hash,
-                small_thumbnail, png_bytes
+                small_thumbnail, png_bytes, revisited_slide_number
             )
         )
         self.retry_tasks.add(task)
+        # A task that dies with an error used to vanish quietly: the
+        # callback only removed it from the set, so a crash inside the
+        # extraction was visible nowhere.
         task.add_done_callback(self.retry_tasks.discard)
+        def log_task_crash(done: "asyncio.Task[None]") -> None:
+            if not done.cancelled() and done.exception() is not None:
+                logger.error(
+                    "background text extraction for slide %d failed: %s",
+                    slide_number, done.exception()
+                )
+        task.add_done_callback(log_task_crash)
 
     async def extract_and_publish_slide_text(
         self,
@@ -713,7 +761,8 @@ class ScreenAgent:
         capture_timestamp: float,
         difference_hash: int,
         small_thumbnail: np.ndarray,
-        png_bytes: bytes
+        png_bytes: bytes,
+        revisited_slide_number: int = 0
     ) -> None:
         """Read a slide in the background and publish it once.
 
@@ -760,14 +809,30 @@ class ScreenAgent:
                 except OSError:
                     pass
 
-        if len(recovered_text.strip()) > 0:
-            self.remember_slide(slide_number, difference_hash, small_thumbnail, recovered_text)
-            self.control.increment_stat("slide_text_recovered")
-        else:
-            logger.warning("slide %d text could not be recovered after retries", slide_number)
-            self.control.increment_stat("slide_text_unrecovered")
-        self._pending_text_extractions = max(0, self._pending_text_extractions - 1)
-        self.control.set_stat("slides_awaiting_text", self._pending_text_extractions)
+        try:
+            if len(recovered_text.strip()) > 0:
+                self.remember_slide(slide_number, difference_hash, small_thumbnail, recovered_text)
+                if (
+                    revisited_slide_number > 0
+                    and revisited_slide_number not in self.slide_texts
+                ):
+                    # The words were read from the retake, but the screen
+                    # belongs to the older slide: the text is stored
+                    # under its number as well, so the next time the
+                    # lecturer returns to that slide there is no second
+                    # reading to do.
+                    self.slide_texts[revisited_slide_number] = recovered_text
+                self.control.increment_stat("slide_text_recovered")
+            else:
+                logger.warning("slide %d text could not be recovered after retries", slide_number)
+                self.control.increment_stat("slide_text_unrecovered")
+        finally:
+            # The counter belongs to the background task, whether it ends
+            # with text or because the session is stopping. An early return
+            # at the stop request used to leave a count that never came
+            # back to zero.
+            self._pending_text_extractions = max(0, self._pending_text_extractions - 1)
+            self.control.set_stat("slides_awaiting_text", self._pending_text_extractions)
 
         if figure_path and not figure_caption and recovered_text:
             figure_caption = recovered_text.strip()[:157]
@@ -779,7 +844,10 @@ class ScreenAgent:
             monitor_index=self.settings.monitor_index,
             image_file_path=image_path,
             extracted_text=recovered_text,
-            revisited_slide_number=0,
+            # The update belongs to the slide that was revisited, so the
+            # structuring agent keeps it with the same text as a first
+            # visit of that slide had, instead of a slide of nothing.
+            revisited_slide_number=revisited_slide_number,
             figure_file_path=figure_path,
             figure_caption=figure_caption,
             figure_id=figure_id

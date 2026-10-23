@@ -12,16 +12,37 @@ class SessionClock:
         self.reference_wall_time: float = time.time()
         self.reference_monotonic_time: float = time.monotonic()
         self.elapsed_offset_seconds: float = elapsed_offset_seconds
+        # The anchor pair drives the timestamps. It starts on the session
+        # references, and when the wall clock steps (an NTP correction, or
+        # a laptop that slept) it is moved to the wall clock. The
+        # references themselves stay where the session started, so the
+        # elapsed lecture time is not reset by a clock step. Without the
+        # separate anchor the estimate stayed offset from the wall clock
+        # forever after the step and every timestamp came from whatever
+        # side of the tolerance the slew happened to be in, which made
+        # the timeline jumpy.
+        self._anchor_wall_time: float = self.reference_wall_time
+        self._anchor_monotonic_time: float = self.reference_monotonic_time
 
     def get_timestamp(self) -> float:
-        monotonic_elapsed = time.monotonic() - self.reference_monotonic_time
-        monotonic_estimate = self.reference_wall_time + monotonic_elapsed
+        monotonic_elapsed = time.monotonic() - self._anchor_monotonic_time
+        monotonic_estimate = self._anchor_wall_time + monotonic_elapsed
         wall_now = time.time()
         if abs(wall_now - monotonic_estimate) > DRIFT_TOLERANCE_SECONDS:
+            # The wall clock moved against monotonic time. One timestamp
+            # jumps with it, and from here on the monotonic estimate
+            # follows the new anchor instead of disagreeing with the wall
+            # clock for the rest of the session.
+            self._anchor_wall_time = wall_now
+            self._anchor_monotonic_time = time.monotonic()
             return wall_now
         return monotonic_estimate
 
     def get_run_elapsed_seconds(self) -> float:
+        # Measured against the session references, not the anchor: the
+        # anchor only keeps the timestamps smooth, while the elapsed
+        # lecture time and the epoch_for_elapsed mapping have to keep the
+        # same base the session started on.
         elapsed = self.get_timestamp() - self.reference_wall_time
         if elapsed < 0.0:
             return 0.0
@@ -77,6 +98,11 @@ class SessionClock:
             if wall_elapsed < 0.0:
                 wall_elapsed = 0.0
             clock.reference_monotonic_time = monotonic_now - wall_elapsed
+        # The anchor starts on the references that were restored. It was
+        # not saved, because a step of the wall clock between the runs can
+        # be watched here as well as anywhere.
+        clock._anchor_wall_time = clock.reference_wall_time
+        clock._anchor_monotonic_time = clock.reference_monotonic_time
         return clock
 
     def save_to_file(self, file_path: Path) -> None:
@@ -95,7 +121,7 @@ class SessionClock:
         if file_path.exists():
             try:
                 return cls.load_from_file(file_path)
-            except (ValueError, KeyError, OSError):
+            except (ValueError, TypeError, KeyError, OSError):
                 pass
         clock = cls()
         clock.save_to_file(file_path)

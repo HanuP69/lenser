@@ -187,8 +187,6 @@ class StudentChatAgent:
             raw_answer = "No LLM router or Ollama endpoint configured for student chat."
 
         tag_payload, clean_answer = extract_misconception_payload(raw_answer)
-
-        tag_payload, clean_answer = extract_misconception_payload(raw_answer)
         if tag_payload and self.student_graph is not None:
             try:
                 data = json.loads(tag_payload)
@@ -204,10 +202,15 @@ class StudentChatAgent:
                         evidence_type="student_chat_misconception",
                         excerpt=f"Q: {question} | Error: {error}"
                     )
+                else:
+                    # The model annotated a misconception but left the
+                    # name of the concept out, so nothing can be
+                    # recorded. The answer keeps it, but the case used to
+                    # fall into a branch that was unreachable, because its
+                    # condition was identical to the one before it.
+                    logger.warning("misconception annotation without a concept name was ignored")
             except Exception as parse_error:
                 logger.warning("could not parse misconception tag: %s", parse_error)
-        elif tag_payload and self.student_graph is not None:
-            logger.warning("misconception annotation without a concept name was ignored")
 
         citations = TIMESTAMP_PATTERN.findall(clean_answer)
         return clean_answer, citations

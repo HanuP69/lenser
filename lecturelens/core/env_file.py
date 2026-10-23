@@ -43,7 +43,7 @@ def set_env_value(name: str, value: str, env_path: Optional[Path] = None) -> boo
             logger.warning("the .env file could not be read: %s", error)
             return False
 
-    entry = f"{name}={value}"
+    entry = f"{name}={_quote_env_value(value)}"
     replaced = False
     for index, line in enumerate(lines):
         stripped = line.strip()
@@ -122,3 +122,26 @@ def env_file_location() -> str:
     if target is None:
         return str(Path.cwd() / ".env")
     return str(target)
+
+
+def _quote_env_value(value: str) -> str:
+    """A value written so a read of the file comes back with the same value.
+
+    After a # in an unquoted value every reader sees a comment, so a
+    window title like "Slides #1" came back as "Slides" or as nothing at
+    all. The value is quoted when it holds any of the characters that a
+    reader treats specially.
+    """
+    if value == "":
+        return '""'
+    needs_quotes = any(character in value for character in ("#", " ", "\t", "=")) or value != value.strip()
+    if not needs_quotes:
+        return value
+    if '"' not in value:
+        return f'"{value}"'
+    if "'" not in value:
+        return f"'{value}'"
+    # A value with both kinds of quote cannot be wrapped in either. The
+    # double quotes are given up on: the value stays readable, which is
+    # better than a value that later reads as a different one.
+    return f'"{value.replace(chr(34), "")}"'

@@ -86,13 +86,24 @@ class AgentProcessManager:
         if os.name == "nt":
             creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
-        process = subprocess.Popen(
-            command,
-            env=env_vars,
-            stdout=stdout_destination,
-            stderr=stderr_destination,
-            creationflags=creation_flags
-        )
+        try:
+            process = subprocess.Popen(
+                command,
+                env=env_vars,
+                stdout=stdout_destination,
+                stderr=stderr_destination,
+                creationflags=creation_flags
+            )
+        except Exception as spawn_error:
+            # A command cannot always be started: the interpreter of a
+            # rebuilt environment is gone, or the path has moved. Crashing
+            # here took the restart loop down with it and left backoff
+            # bookkeeping behind, so the next retry ran without any wait.
+            # The log handle is closed again, since nothing writes to it.
+            logger.error("agent %s could not be started: %s", agent_name, spawn_error)
+            if agent_name in self.log_handles:
+                self.close_log_handle(agent_name)
+            return False
         self.processes[agent_name] = process
         self.started_at[agent_name] = time.monotonic()
         return True
@@ -110,6 +121,15 @@ class AgentProcessManager:
                 status_map[agent_name] = "STOPPED"
             else:
                 status_map[agent_name] = f"FAILED_EXIT_{exit_code}"
+        for agent_name in self.command_templates:
+            # An agent whose process could never be started is invisible in
+            # the map of processes, and then the restart loop never saw it
+            # again. It is reported as failed, so its backoff schedule
+            # keeps running and the reason shows up in the dashboard.
+            if agent_name in status_map or agent_name in self.gave_up:
+                continue
+            if agent_name not in self.processes:
+                status_map[agent_name] = "FAILED_SPAWN"
         return status_map
 
     def compute_backoff_seconds(self, failure_count: int) -> float:
@@ -238,10 +258,18 @@ class AgentProcessManager:
                 exited_cleanly = False
             for agent_name in running_names:
                 process = self.processes[agent_name]
-                clean = process.poll() is not None
+                # An exit code of 1 is a crash, not a clean end. Counting
+                # every exited agent as clean made the phase report say
+                # that the work was flushed when the agent had died in the
+                # middle of it.
+                exit_code = process.poll()
+                clean = exit_code is not None and exit_code == 0
                 outcomes[agent_name] = clean
                 if not clean and (timeout_seconds is not None and timeout_seconds > 0):
-                    logger.warning("agent %s ignored stop flag, terminating", agent_name)
+                    logger.warning(
+                        "agent %s not finished (exit code %s), terminating",
+                        agent_name, exit_code
+                    )
                     self.terminate_agent(agent_name)
             if not exited_cleanly and (timeout_seconds is not None and timeout_seconds > 0):
                 logger.warning(

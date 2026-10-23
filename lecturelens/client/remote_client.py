@@ -64,6 +64,11 @@ class CaptureSpool:
         # receives that capture.
         self.on_full = on_full
         self.dropped_count = 0
+        # How often each capture failed to be delivered. It lives on the
+        # spool, which survives the reconnects in the same process, so a
+        # capture that the server always refuses is noticed across the
+        # sessions.
+        self.delivery_failures: dict[str, int] = {}
         self.spool_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -156,7 +161,18 @@ class CaptureSpool:
             self.dropped_count
         )
         await run_in_thread_pool(self._evict_oldest)
-        await run_in_thread_pool(self._try_append, capture_id, payload_text)
+        inserted = await run_in_thread_pool(self._try_append, capture_id, payload_text)
+        if not inserted:
+            # The spool filled up again between the eviction and the
+            # second insert. That is two captures lost instead of one,
+            # which the "drop the oldest" policy does not promise, so it
+            # is counted like a normal drop.
+            self.dropped_count += 1
+            logger.error(
+                "capture spool %s filled up again while appending; the capture "
+                "was dropped as well (%d dropped so far)",
+                self.spool_path, self.dropped_count
+            )
 
     def acknowledge(self, capture_id: str) -> None:
         conn = sqlite3.connect(str(self.spool_path), timeout=5.0)
@@ -211,6 +227,22 @@ def is_connection_closed(error: BaseException, websocket: Any = None) -> bool:
     return False
 
 
+# How often a capture may be refused by the server before it is given up
+# on and counted, so it cannot block the rest of the spool forever. Each
+# refusal makes the client reconnect, so the number is small.
+SPOOL_MAX_DELIVERY_ATTEMPTS: int = 3
+
+
+def is_rejection_error(error: BaseException) -> bool:
+    """Whether a failed delivery was the server refusing the capture.
+
+    The rejection is a RuntimeError with the answer of the server in it,
+    which send_and_wait raises after its retries. A timeout or a closed
+    connection says nothing about the capture and is left alone.
+    """
+    return isinstance(error, RuntimeError) and "server rejected" in str(error).lower()
+
+
 async def drain_spool(
     spool: CaptureSpool,
     websocket: Any,
@@ -237,8 +269,30 @@ async def drain_spool(
             try:
                 await send_and_wait(websocket, frame_str, max_retries=2, stop_event=stop_event, timeout=5.0)
             except Exception as send_error:
+                spool.delivery_failures[cap_id] = spool.delivery_failures.get(cap_id, 0) + 1
+                attempts = spool.delivery_failures[cap_id]
                 logger.warning("could not send a spooled capture: %s", send_error)
+                if attempts >= SPOOL_MAX_DELIVERY_ATTEMPTS and is_rejection_error(send_error):
+                    # The server refuses this capture every time it sees
+                    # it, and it is the head of the spool, so a capture
+                    # that stays pending blocks every capture behind it
+                    # for the lifetime of the spool. After enough
+                    # rejections it is given up on and counted, so the
+                    # rest of the backlog can be delivered. A capture
+                    # that failed because the connection was gone is not
+                    # given up on: the network changes, the server's
+                    # answer to the same bytes does not.
+                    await run_in_thread_pool(spool.acknowledge, cap_id)
+                    spool.delivery_failures.pop(cap_id, None)
+                    spool.dropped_count += 1
+                    progressed = True
+                    logger.error(
+                        "capture %s was rejected %d times and is given up on "
+                        "(%d dropped so far); the rest of the spool can drain",
+                        cap_id, attempts, spool.dropped_count
+                    )
                 break
+            spool.delivery_failures.pop(cap_id, None)
             await run_in_thread_pool(spool.acknowledge, cap_id)
             delivered += 1
             progressed = True

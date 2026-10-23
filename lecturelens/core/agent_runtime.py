@@ -44,8 +44,13 @@ def set_flag(session_dir: Path, flag_name: str) -> None:
 
 def clear_flag(session_dir: Path, flag_name: str) -> None:
     flag_path = get_control_directory(session_dir) / flag_name
-    if flag_path.exists():
-        flag_path.unlink()
+    try:
+        flag_path.unlink(missing_ok=True)
+    except OSError as error:
+        # Another process can hold the flag open on Windows (OneDrive and
+        # virus scanners do it too). The flag being unread for one call is
+        # harmless; crashing the agent over it is not.
+        logger.warning("flag %s could not be removed: %s", flag_name, error)
 
 
 def flag_exists(session_dir: Path, flag_name: str) -> bool:
@@ -58,7 +63,10 @@ def clear_all_flags(session_dir: Path) -> None:
         return
     for entry in control_dir.iterdir():
         if entry.name.endswith(".flag"):
-            entry.unlink()
+            try:
+                entry.unlink(missing_ok=True)
+            except OSError as error:
+                logger.warning("flag %s could not be removed: %s", entry.name, error)
 
 
 def read_heartbeats(session_dir: Path) -> dict[str, dict[str, Any]]:

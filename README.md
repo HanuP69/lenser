@@ -439,7 +439,7 @@ lecturelens client --session "cs101_01" --server "ws://192.168.1.20:8765" --api-
 | `LECTURELENS_REDIS_URL` | `redis://127.0.0.1:6379` | Redis connection URL. |
 | `LECTURELENS_POSTGRES_URL` | `postgresql://postgres:postgres@127.0.0.1:5433/lecturelens` | PostgreSQL connection URL. |
 | `LECTURELENS_OLLAMA_URL` | `http://127.0.0.1:11434` | Local Ollama base URL. |
-| `LECTURELENS_LLM_MODE` | `local` | `local` (Ollama), `hybrid` (Cloud with local fallback), or `cloud`. |
+| `LECTURELENS_LLM_MODE` | `hybrid` | `hybrid` (cloud first, local fallback), `cloud`, or `local` (Ollama alone). |
 | `LECTURELENS_LOCAL_MODEL` | `gemma3:4b` | Local model name. Overrides the `model` in `router.yaml`. |
 | `LECTURELENS_EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model name. |
 | `LECTURELENS_GATEWAY_HOST` | `127.0.0.1` | Gateway bind host (`0.0.0.0` for remote clients). |

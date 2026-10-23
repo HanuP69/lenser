@@ -600,6 +600,15 @@ class SyncAgent:
                 self.trigger_fault("crash_after_file_write")
 
             if len(needs_redis) > 0:
+                # `publish_resilient` owns the delivery: it hands the event
+                # to redis, or buffers it in the durable outbox of the bus
+                # and its flush delivers it later. It answers
+                # "published_earlier" when a finished call already
+                # delivered the event, "flushed_from_outbox" when the flush
+                # of the outbox delivered it now, and None when the event
+                # sits in the outbox. All three mean the bus owns the
+                # delivery, so the entry is marked "redis" for each of
+                # them. Only a failure of the outbox itself raises.
                 for buffered in needs_redis:
                     try:
                         await self.redis_bus.publish_resilient(timeline_stream, buffered.entry)

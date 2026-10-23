@@ -710,17 +710,32 @@ class AudioAgent:
             await self.capture_loop(source)
         finally:
             self.is_running = False
-            try:
+            if not transcription_task.done():
                 # The queue can be full and the transcription task can be
                 # gone, in which case a plain put() waits for space that
-                # never arrives and the agent hangs on shutdown.
-                await asyncio.wait_for(self.transcription_queue.put(None), timeout=5.0)
-            except asyncio.TimeoutError:
-                logger.warning("transcription queue was full at shutdown; forcing the stop signal")
-                try:
-                    self.transcription_queue.put_nowait(None)
-                except Exception:
-                    pass
+                # never arrives and the agent hangs on shutdown. The task
+                # keeps consuming, so space usually comes back on its own;
+                # the wait is bound anyway, and the task is cancelled if
+                # the sentinel cannot be delivered at all. A silent
+                # put_nowait into a still full queue is not a fallback,
+                # because it fails in exactly the same way as the put.
+                sentinel_delivered = False
+                deadline = time.monotonic() + 15.0
+                while time.monotonic() < deadline:
+                    try:
+                        self.transcription_queue.put_nowait(None)
+                        sentinel_delivered = True
+                        break
+                    except asyncio.QueueFull:
+                        if transcription_task.done():
+                            break
+                        await asyncio.sleep(0.2)
+                if not sentinel_delivered and not transcription_task.done():
+                    logger.warning(
+                        "transcription queue never freed space at shutdown; "
+                        "cancelling the transcription task"
+                    )
+                    transcription_task.cancel()
             try:
                 await transcription_task
             except asyncio.CancelledError:

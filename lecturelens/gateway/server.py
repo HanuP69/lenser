@@ -4,6 +4,7 @@ import binascii
 import hmac
 import inspect
 import json
+import os
 import re
 import secrets
 import time
@@ -238,7 +239,11 @@ class GatewayServer:
                     dead_sockets.append(ws)
             if dead_sockets and session_id in self.subscribers:
                 for dead in dead_sockets:
-                    self.subscribers[session_id].discard(dead)
+                    current = self.subscribers[session_id]
+                    if isinstance(current, set):
+                        current.discard(dead)
+                    elif isinstance(current, list) and dead in current:
+                        current.remove(dead)
 
     async def run_notes_fanout(self, session_id: str) -> None:
         stream_name = f"lecturelens:{session_id}:stream:notes"
@@ -658,7 +663,17 @@ class GatewayServer:
             elif "token" in query_params:
                 token = query_params["token"][0].strip()
 
-            if not token or not secrets.compare_digest(token, self.api_key):
+            try:
+                # An absent token is not a correct token. Rewriting the
+                # condition as "not token or compare" gave an empty token
+                # the same answer as the right key.
+                token_ok = bool(token) and secrets.compare_digest(token, self.api_key)
+            except TypeError:
+                # compare_digest cannot look at non-ASCII strings. A token
+                # with such characters can never equal the generated key,
+                # so it is simply not accepted instead of raising.
+                token_ok = False
+            if not token_ok:
                 return Response(
                     401,
                     "Unauthorized",
@@ -677,7 +692,7 @@ class GatewayServer:
 
         session_id = parts[2]
         asset_id = parts[3]
-        if not re.match(r"^[a-zA-Z0-9_\-\.]+$", session_id) or not re.match(r"^[a-zA-Z0-9_\-\.]+$", asset_id):
+        if not re.match(r"^[a-zA-Z0-9_\-\.]+$", session_id) or not re.match(r"^[a-zA-Z0-9_\-\.]+$", asset_id) or ".." in session_id or ".." in asset_id:
             return Response(
                 400,
                 "Bad Request",
@@ -689,10 +704,13 @@ class GatewayServer:
         assets_dir = (session_dir / "assets").resolve()
         target_path = (assets_dir / asset_id).resolve()
 
-        if not str(target_path).startswith(str(assets_dir)) or not target_path.is_file():
+        # The containment check needs the separator, otherwise
+        # "assets_evil" starts with "assets" and passes it.
+        assets_prefix = str(assets_dir).rstrip("\\/") + ("\\\\" if os.name == "nt" else "/")
+        if not str(target_path).startswith(assets_prefix) or not target_path.is_file():
             if not asset_id.endswith(".png"):
                 alt_path = (assets_dir / f"{asset_id}.png").resolve()
-                if str(alt_path).startswith(str(assets_dir)) and alt_path.is_file():
+                if str(alt_path).startswith(assets_prefix) and alt_path.is_file():
                     target_path = alt_path
 
         if not target_path.is_file():
@@ -730,7 +748,12 @@ class GatewayServer:
             from websockets import serve
         bind_host = host if host is not None else self.settings.gateway_host
         bind_port = port if port is not None else self.settings.gateway_port
-        validate_gateway_binding(bind_host, self.settings.gateway_api_key)
+        # The key that is actually in effect decides whether a non-local
+        # bind is safe: when none was configured and the gateway generated
+        # an ephemeral one in __init__, the setting itself is still empty
+        # and re-checking with it raised for a bind that was accepted
+        # before.
+        validate_gateway_binding(bind_host, self.api_key if self.api_key else None)
         self.server = await serve(
             self.handle_connection,
             bind_host,

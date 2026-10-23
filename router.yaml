@@ -167,26 +167,30 @@
       cooldown_seconds: 60
 
 task_routing:
+  # Cloud first, local fallback. The local Ollama model is last in every
+  # chain, so it is only asked when every cloud provider of the chain was
+  # refused. Cloud mode leaves it out entirely, and local mode asks for
+  # it alone.
   screen_ocr:
     - unorouter_vl_qwen38
     - unorouter_vl_sealion
     - unorouter_vl_qwen25
-    - gemma
     - openrouter
     - gemini
+    - gemma
   structuring:
     - unorouter_gemma
     - unorouter_structuring
     - unorouter
     - unorouter_glm
-    - gemma
     - openrouter
     - gemini
+    - gemma
   qa:
     - unorouter_gemma
     - unorouter_qa
     - unorouter
     - unorouter_glm
-    - gemma
     - openrouter
     - gemini
+    - gemma

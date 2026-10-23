@@ -122,6 +122,11 @@ class ContextDriftFilter:
         self.accepted_count = 0
         self.drift_count = 0
         self.pending_quarantine_entries = []
+        # The quarantine belongs to the run, like the pending buffer: a
+        # deliberate rebuild used to keep the quarantined entries of the
+        # run before it, and the first batch of the new run wrote them
+        # into the quarantine file of the new session.
+        self.quarantined_entries = []
         self.quarantine_buffer.clear()
         self._batch_snapshots.clear()
         if self.session_topic is not None and len(self.session_topic.strip()) > 0:
@@ -367,7 +372,12 @@ class ContextDriftFilter:
             elif is_drift:
                 self.pending_quarantine_entries.append(entry)
                 if len(self.pending_quarantine_entries) > 20:
-                    self.pending_quarantine_entries.pop(0)
+                    # The pending buffer is bounded, but the entry that
+                    # comes out of it was never lecture material:
+                    # deleting it here threw the content away without a
+                    # trace. It goes to the quarantine that the
+                    # structuring agent writes to disk instead.
+                    self.quarantined_entries.append(self.pending_quarantine_entries.pop(0))
             elif confirmed_on_topic:
                 self.pending_quarantine_entries.clear()
                 filtered.append(entry)

@@ -554,6 +554,13 @@ class StudentClient:
             return ""
 
         last_applied = await self._apply_segment(segment)
+        # A gap was filled: the budget of replay requests guards against a
+        # single gap that can never be filled, not against the whole
+        # lifetime of the client, so it starts over for whatever comes
+        # next. Without this the budget ran out after ten out-of-order
+        # segments across a whole lecture and every later gap stayed
+        # unfilled.
+        self.replay_request_count = 0
         next_expected = self.last_sequence_number + 1
         while next_expected in self.pending_segments:
             next_seg = self.pending_segments.pop(next_expected)
@@ -671,5 +678,10 @@ class StudentClient:
                 if stop_event is not None and stop_event.is_set():
                     break
                 logger.info("connection failed or dropped (%s), reconnecting in %.1fs", error, backoff)
+                # A new connection is given a fresh replay budget as well:
+                # the server replays what the client is missing on the
+                # hello, and the budget of the old connection says nothing
+                # about the new one.
+                self.replay_request_count = 0
                 await asyncio.sleep(backoff)
                 backoff = min(10.0, backoff * 1.5)

@@ -30,6 +30,36 @@ RATE_LIMIT_SIGNATURES: tuple[str, ...] = (
 )
 
 
+def is_key_rotation_error(error: BaseException) -> bool:
+    """Whether the next key has to be tried for this failure.
+
+    The rotation exists to spread a list of keys over the requests, so
+    every failure the *next* key could survive makes the chain move on: a
+    budget that is used up, an outage, and a key that was invalid or was
+    taken away. An error of the request itself (a wrong model name, a bad
+    message) would fail on every key the same way, so it does not rotate.
+    """
+    if is_rate_limit_error(error):
+        return True
+    status_code = getattr(error, "status_code", None)
+    if isinstance(status_code, int):
+        if status_code >= 500:
+            return True
+        # A key that was refused does not refuse the other keys.
+        return status_code in (401, 403, 408)
+    if isinstance(error, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)):
+        return True
+    error_str = str(error).lower()
+    return any(
+        signature in error_str
+        for signature in (
+            "rate limit", "quota", "overloaded", "capacity",
+            "timeout", "timed out", "connection", "unauthorized",
+            "forbidden", "invalid api key", "api key"
+        )
+    )
+
+
 def is_rate_limit_error(error: BaseException) -> bool:
     """Whether the provider refused the call because the budget was used up.
 
@@ -227,11 +257,9 @@ class RotatingChatModel(Runnable):
                 return active_model.invoke(input, config=config, **kwargs)
             except Exception as invocation_error:
                 last_error = invocation_error
-                error_str = str(invocation_error).lower()
-                status_code = getattr(invocation_error, "status_code", None)
-                if status_code in (429, 500, 502, 503, 504) or "rate limit" in error_str or "quota" in error_str:
+                if is_key_rotation_error(invocation_error):
                     logger.warning(
-                        "key index %d hit rate limit/error (%s), rotating to next key (attempt %d/%d)",
+                        "key index %d hit a retryable error (%s), rotating to next key (attempt %d/%d)",
                         active_idx, invocation_error, attempt + 1, len(self.models)
                     )
                     continue
@@ -254,11 +282,9 @@ class RotatingChatModel(Runnable):
                 return await active_model.ainvoke(input, config=config, **kwargs)
             except Exception as invocation_error:
                 last_error = invocation_error
-                error_str = str(invocation_error).lower()
-                status_code = getattr(invocation_error, "status_code", None)
-                if status_code in (429, 500, 502, 503, 504) or "rate limit" in error_str or "quota" in error_str:
+                if is_key_rotation_error(invocation_error):
                     logger.warning(
-                        "key index %d hit rate limit/error (%s), rotating to next key (attempt %d/%d)",
+                        "key index %d hit a retryable error (%s), rotating to next key (attempt %d/%d)",
                         active_idx, invocation_error, attempt + 1, len(self.models)
                     )
                     continue

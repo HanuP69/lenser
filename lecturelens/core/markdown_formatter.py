@@ -146,6 +146,11 @@ def normalize_headings(text: str) -> str:
             and not is_equation_or_code
             and not stripped.endswith((".", ":", ",", ";", "?", "!"))
             and not stripped.startswith(("-", "*", ">", "$", "#", "|"))
+            # A line in square brackets is a marker or a link, not a
+            # heading. The [FIGURE id: caption] marker was promoted to a
+            # heading, and the token was replaced with the picture
+            # afterwards, which left a lone "####" in the notes.
+            and not stripped.startswith("[")
             and not re.match(r"^\d+\.", stripped)
             and any(w[0].isupper() for w in words if len(w) > 0 and w[0].isalpha())
             and len(stripped) <= 60

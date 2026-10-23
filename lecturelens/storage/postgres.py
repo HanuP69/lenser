@@ -406,7 +406,7 @@ class PostgresStorage:
         query = """
         SELECT session_id, lecture_id, sequence_number, heading, content,
                key_points, concept_tags, slide_references, timestamp_epoch,
-               start_time, end_time
+               start_time, end_time, definitions
         FROM general_notes
         WHERE session_id = %s AND sequence_number > %s
         ORDER BY sequence_number ASC;

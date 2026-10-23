@@ -55,6 +55,29 @@ from lecturelens.core.clock import SessionClock
 from lecturelens.core.process_manager import AgentProcessManager as AgentMonitor
 from lecturelens.core.validation import is_valid_course_name, is_valid_session_id
 
+
+def has_cloud_provider(settings: Settings) -> bool:
+    """Whether at least one cloud provider has a key configured.
+
+    The chain of the hybrid mode ends at the local model, so a hybrid
+    session without a single cloud key is a local session by other means,
+    and the warning about a missing Ollama has to say so instead of
+    promising a cloud provider that is not there.
+    """
+    for key in (
+        settings.unorouter_api_key,
+        settings.unorouter_api_keys,
+        settings.openrouter_api_key,
+        settings.openrouter_api_keys,
+        settings.google_api_key,
+        settings.google_api_keys,
+        settings.gemini_api_key,
+        settings.gemini_api_keys,
+    ):
+        if isinstance(key, str) and len(key.strip()) > 0:
+            return True
+    return False
+
 # How old a heartbeat may be before the agent is taken to be gone.
 LIVE_HEARTBEAT_MAX_AGE_SECONDS: float = 15.0
 
@@ -140,10 +163,17 @@ def start(
     if not check_redis(settings):
         fail(f"Redis is not reachable at {settings.redis_url}")
     if resolved_llm_mode != "cloud" and not check_ollama(settings):
-        console.print(
-            f"[yellow]Ollama not reachable at {settings.ollama_url}. "
-            "Capture continues; structuring will retry when it returns.[/yellow]"
-        )
+        if resolved_llm_mode == "hybrid" and has_cloud_provider(settings):
+            console.print(
+                f"[yellow]Ollama is not reachable at {settings.ollama_url}. "
+                "The cloud providers carry the work; the local model is only "
+                "a fallback and will be asked when it is back.[/yellow]"
+            )
+        else:
+            console.print(
+                f"[yellow]Ollama not reachable at {settings.ollama_url}. "
+                "Capture continues; structuring will retry when it returns.[/yellow]"
+            )
 
     settings.create_session_directories(session_id)
     disk_warning = format_low_disk_warning(get_free_disk_bytes(settings.output_dir), settings.low_disk_bytes)
@@ -192,7 +222,11 @@ def start(
             "llm_mode": resolved_llm_mode,
             "audio_only": audio_only,
             "no_screen": no_screen,
-            "persist": persist
+            # What was decided after the Postgres check, not what the flag
+            # asked for: a session that was started with --persist but
+            # without a reachable Postgres runs without it, and the
+            # metadata used to say otherwise.
+            "persist": should_persist
         },
         planned_agents
     )
@@ -320,6 +354,21 @@ def stop(
         fail("--timeout must be greater than 0 seconds (use --no-wait to return immediately).")
     session_id = resolve_session(settings, session)
     session_dir = ensure_session_exists(settings, session_id)
+    if agents_are_gone(session_dir):
+        # No process of the session is alive, so a shutdown flag would
+        # never be read by anybody. A second stop on a session that ended
+        # a while ago used to clear the finished flag, wait out the whole
+        # grace period and then report that the session was "still
+        # finishing".
+        if flag_exists(session_dir, SESSION_FINISHED_FLAG_NAME):
+            console.print(f"[green]Session {session_id} already stopped.[/green]")
+            display_session_output_summary(session_dir, console)
+        else:
+            console.print(f"[yellow]Session {session_id} is not running.[/yellow]")
+        return
+    # The finished flag of an earlier run of the session would end the
+    # wait below immediately, so it is cleared exactly when a shutdown
+    # request goes out to agents that are actually running.
     clear_flag(session_dir, SESSION_FINISHED_FLAG_NAME)
     set_flag(session_dir, SHUTDOWN_REQUEST_FLAG_NAME)
     console.print(f"Shutdown requested for session {session_id}.")

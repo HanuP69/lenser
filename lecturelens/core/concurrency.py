@@ -130,19 +130,15 @@ async def run_in_process_pool(
             )
             reset_process_pool()
         except Exception as error:
-            # The pool infrastructure failed, for example the worker could
-            # not be started after a native crash in the parent. Without
-            # this the whole feature stops working, because the pool is
-            # never usable again.
-            last_error = error
-            last_failure_was_broken_pool = False
-            logger.error(
-                "process pool worker failed on attempt %d: %s",
-                attempt_number + 1,
-                error
-            )
-            reset_process_pool()
-            break
+            # Only a broken pool is a failure of the pool infrastructure.
+            # An exception that the work itself raised arrives here too,
+            # and treating it as a broken pool did three wrong things: the
+            # pool was thrown away while other coroutines still waited on
+            # it, the same work was then run a second time in a thread
+            # (so a write or a publish happened twice), and the error the
+            # caller should have seen was replaced by a generic one. The
+            # error is handed on untouched instead.
+            raise
     if allow_thread_fallback and not last_failure_was_broken_pool:
         # The work still gets done, it is just slower because it shares the
         # process with the event loop. A dead pool is worse than a slow one.

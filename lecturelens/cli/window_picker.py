@@ -96,22 +96,27 @@ def prompt_for_window(
             "\nEnter the number of the window to record, "
             "or press enter to record the whole screen."
         )
-    try:
-        answer = console.input("> ").strip()
-    except (EOFError, KeyboardInterrupt):
-        return None
-    if not answer:
-        return None
-    if answer.isdigit():
-        index = int(answer) - 1
-        if 0 <= index < len(windows):
-            return windows[index]
-        console.print(f"[red]There is no window number {answer}.[/red]")
-        return None
-    window = find_window(answer, windows)
-    if window is None:
-        console.print(f"[red]No window matches {answer!r}.[/red]")
-    return window
+    while True:
+        try:
+            answer = console.input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not answer:
+            return None
+        if answer.isdigit():
+            index = int(answer) - 1
+            if 0 <= index < len(windows):
+                return windows[index]
+            # A wrong number is a typo, not a choice. Falling through to
+            # the whole ended with the desktop being recorded when a
+            # window was wanted, so the question is asked again.
+            console.print(f"[red]There is no window number {answer}. Try again.[/red]")
+            continue
+        window = find_window(answer, windows)
+        if window is None:
+            console.print(f"[red]No window matches {answer!r}. Try again.[/red]")
+            continue
+        return window
 
 
 def resolve_capture_target(

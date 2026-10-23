@@ -272,6 +272,8 @@ RULES:
   dollar signs.
 - Keep every heading, list, table, code block and every word of the text
   exactly as it is. Change only the mathematics.
+- A line that marks where a picture goes, written as [FIGURE id] or
+  [FIGURE id: caption], must stay exactly as it is, word for word.
 - Do not add anything that is not in the text.
 - Reply with the rewritten markdown only. No commentary, no code fence around
   the whole answer.
@@ -289,11 +291,6 @@ MATHEMATICS_MARKERS: tuple[str, ...] = (
     "$",
     "^",
     "%",
-    "log",
-    "mod ",
-    "sqrt",
-    "ln(",
-    "sum",
     "∫",
     "≤",
     "≥",
@@ -313,6 +310,15 @@ MATHEMATICS_MARKERS: tuple[str, ...] = (
     "Σ",
 )
 
+# The words of the mathematical notation are searched with their own
+# boundaries. A plain substring match answered "yes" to any prose with
+# "assume" (sum), "catalog" (log), "dialogue" (log) or "100% sure" in it,
+# and every one of those answers cost an extra request to a provider on
+# a free tier for nothing.
+MATHEMATICS_WORDS = re.compile(
+    r"\b(log|mod|sqrt|ln)\b|\bsum\s+(of|over)\b", re.IGNORECASE
+)
+
 # A letter followed by a bracket, such as H(x) or f(n), is a function.
 FUNCTION_MARKER = re.compile(r"\b[A-Za-z]\([A-Za-z0-9_]")
 
@@ -321,13 +327,96 @@ def text_has_mathematics(text: str) -> bool:
     """Whether the text has something in it that is mathematics."""
     if FUNCTION_MARKER.search(text):
         return True
-    lowered = text.lower()
-    return any(marker in text or marker in lowered for marker in MATHEMATICS_MARKERS)
+    if MATHEMATICS_WORDS.search(text):
+        return True
+    return any(marker in text for marker in MATHEMATICS_MARKERS)
 
 
 # A heading at the start of a line, so the count is right for a heading
 # that is the first thing in the text as well.
 HEADING_PATTERN = re.compile(r"^#{1,6}\s", re.MULTILINE)
+
+# The token that says where the picture of a diagram goes in the notes.
+# Written with or without the colon: [FIGURE fig_1] and [FIGURE: fig_1]
+# both name the picture fig_1.
+FIGURE_TOKEN_PATTERN = re.compile(
+    r"\[FIGURE\s*:?\s*([a-zA-Z0-9_\-]+)", re.IGNORECASE
+)
+
+
+# Words that say nothing about where a picture belongs. A caption built
+# from the title of the slide ("Binary Search: Insertion and Deletion")
+# must be matched by the words of the topic, not by the small words of
+# any sentence.
+FIGURE_CAPTION_STOP_WORDS = frozenset({
+    "the", "a", "an", "of", "and", "or", "to", "in", "on", "at", "by", "for",
+    "with", "from", "as", "is", "are", "was", "were", "be", "into", "about",
+    "it", "its", "this", "that", "these", "those", "how", "why", "what",
+    "when", "image", "picture", "diagram", "slide", "lecture", "chapter",
+    "week", "part", "introduction",
+})
+
+
+def caption_keywords(caption: str) -> list[str]:
+    """The words of a caption that can find the paragraph it belongs to."""
+    words = re.findall(r"[a-z0-9]+", caption.lower())
+    return [word for word in words if len(word) >= 3 and word not in FIGURE_CAPTION_STOP_WORDS]
+
+
+def best_paragraph_for_caption(
+    paragraphs: list[str],
+    caption: str
+) -> Optional[int]:
+    """The paragraph of the notes a figure belongs after.
+
+    The token ([FIGURE id]) is the spoken sentence of the model, and the
+    model does not always answer it. The caption of the picture, which is
+    the title of the slide it was cut from, is then compared with every
+    paragraph of the section: the paragraph that shares the words of the
+    caption is the one that talks about the picture. Two shared words, or
+    one long word (such as backpropagation), count as a place worth
+    putting the picture at. One short word is a coincidence of language
+    and does not move anything.
+    """
+    keywords = caption_keywords(caption)
+    if len(keywords) == 0 or len(paragraphs) == 0:
+        return None
+    unique_keywords = list(dict.fromkeys(keywords))
+    long_words = [word for word in unique_keywords if len(word) >= 6]
+    best_index: Optional[int] = None
+    best_hits = 0
+    best_long_hit = False
+    for index, paragraph in enumerate(paragraphs):
+        if len(paragraph.strip()) == 0:
+            continue
+        lowered = paragraph.lower()
+        hits = sum(
+            1 for word in unique_keywords
+            if re.search(rf"\b{re.escape(word)}", lowered) is not None
+        )
+        if hits == 0:
+            continue
+        long_hit = any(
+            re.search(rf"\b{re.escape(word)}", lowered) is not None
+            for word in long_words
+        )
+        # One short hit answers too easily ("tree" is in every talk about
+        # trees). A picture moves only for two words, or for one long
+        # word, or for a single hit on the very first paragraph, which is
+        # often the overview of the slide that was on the screen.
+        confident = hits >= 2 or long_hit or (len(paragraphs) > 0 and index == 0)
+        if not confident:
+            continue
+        if hits > best_hits or (hits == best_hits and long_hit and not best_long_hit):
+            best_hits = hits
+            best_long_hit = long_hit
+            best_index = index
+    return best_index if best_hits > 0 else None
+
+
+def figure_token_ids(text: str) -> set[str]:
+    """The names of the pictures the text asks for."""
+    return {match.group(1).lower() for match in FIGURE_TOKEN_PATTERN.finditer(text)}
 
 
 def latex_result_is_usable(original: str, rewritten: str) -> bool:
@@ -350,6 +439,13 @@ def latex_result_is_usable(original: str, rewritten: str) -> bool:
     # Every heading of the section has to be there.
     original_headings = len(HEADING_PATTERN.findall(original))
     if len(HEADING_PATTERN.findall(candidate)) < original_headings:
+        return False
+    # Every picture token has to be there too. The pass was asked for
+    # mathematics and the model sometimes swallowed the [FIGURE id]
+    # lines while it rewrote, and then the picture had no place in the
+    # notes and was pushed to the end of the section instead.
+    missing_tokens = figure_token_ids(original) - figure_token_ids(candidate)
+    if missing_tokens:
         return False
     return True
 
@@ -400,8 +496,17 @@ GUIDELINES:
 - Synthesize spoken explanations with corresponding slide content.
 - Prioritize technical depth, mathematical accuracy, and clarity.
 - Structure using markdown headers, bullet points, and code/math blocks ($...$ for inline, $$...$$ for display).
-- When a [FIGURE id: caption] is present, place [FIGURE id] on its own line where that figure is discussed.
 - Do not repeat or invent facts not grounded in the source text.
+
+FIGURE PLACEMENT RULES:
+- Some [SLIDE] events carry a marker like [FIGURE fig_12: caption]. That marker is
+  a picture of a diagram. The picture belongs IN the notes, and the token is the
+  only way for it to get there.
+- For every [FIGURE id] marker you see in the events, write the token [FIGURE id]
+  on its own line exactly where the notes discuss that slide: right after the
+  bullet or paragraph about it. Never omit one, never repeat one.
+- Never place several [FIGURE id] tokens together in one pile. Each token sits
+  next to the text that talks about that picture.
 
 PREVIOUS CONTEXT:
 {previous_context}
@@ -719,6 +824,21 @@ class StructuringAgent:
             return []
         state = self.load_state()
         offset = state["timeline_byte_offset"]
+        # A saved offset can point past the end of the file, when the
+        # timeline was deleted or shortened without clearing the state of
+        # the agent. readline from there reads nothing forever, and the
+        # offset saved back was the impossible one, so the agent lived but
+        # never wrote another note without a word in the log. The offset
+        # is clamped to the file, so at least the appended entries are
+        # read from now on.
+        file_size = self.timeline_path.stat().st_size
+        if offset > file_size:
+            logger.warning(
+                "saved timeline offset %d is past the end of the file (%d bytes); "
+                "reading again from the end of the file",
+                offset, file_size
+            )
+            offset = file_size
 
         records: list[dict[str, Any]] = []
         final_offset = offset
@@ -871,6 +991,13 @@ class StructuringAgent:
             raw_id = match.group(1).strip()
             if raw_id in valid_figures:
                 info = valid_figures[raw_id]
+                if info["path"] in referenced_figures:
+                    # The same picture marked twice: the model answered
+                    # the token for the slide that holds it and then
+                    # repeated the token while the slide was discussed
+                    # again. The picture is shown where it was placed
+                    # the first time, so an extra copy is left out.
+                    return ""
                 referenced_figures.add(info["path"])
                 cap = info["caption"]
                 rel = info["relative"]
@@ -879,30 +1006,59 @@ class StructuringAgent:
                 return f"\n\n![the picture on the screen]({rel})\n\n"
             return ""
 
-        token_regex = re.compile(r"\[FIGURE\s+([a-zA-Z0-9_\-]+)(?::\s*[^\]]*)?\]", re.IGNORECASE)
+        # Written without or with the colon: [FIGURE fig_1] and
+        # [FIGURE: fig_1] both name the picture fig_1. The colon form was
+        # not accepted, and a note that the model answered in that form
+        # lost its picture to the end of the section.
+        token_regex = re.compile(r"\[FIGURE\s*:?\s*([a-zA-Z0-9_\-]+)(?::\s*[^\]]*)?\]", re.IGNORECASE)
         processed_summary = token_regex.sub(replace_figure_token, cleaned_summary)
         processed_summary = re.sub(r"\n{3,}", "\n\n", processed_summary).strip()
+
+        # The pictures the model never marked with a token are still part
+        # of the lecture, and throwing them into one pile at the end of
+        # the section tears them away from the paragraphs that talk about
+        # them. Each unplaced picture is put after the paragraph that
+        # matches the words of its caption (the title of the slide). One
+        # that matches nothing keeps the old place at the end.
+        ordered_figures: list[dict[str, str]] = []
+        seen_figure_paths: set[str] = set()
+        for _fig_id, info in valid_figures.items():
+            if info["path"] in referenced_figures or info["path"] in seen_figure_paths:
+                continue
+            seen_figure_paths.add(info["path"])
+            ordered_figures.append(info)
+
+        def figure_markdown(info: dict[str, str]) -> list[str]:
+            cap = info["caption"]
+            rel = info["relative"]
+            if cap:
+                return [f"![{cap}]({rel})", f"*{cap}*"]
+            return [f"![the picture on the screen]({rel})"]
+
+        paragraphs = processed_summary.split("\n\n") if processed_summary else []
+        insertions: dict[int, list[list[str]]] = {}
+        leftover_figures: list[dict[str, str]] = []
+        for info in ordered_figures:
+            paragraph_index = best_paragraph_for_caption(paragraphs, info["caption"])
+            if paragraph_index is None:
+                leftover_figures.append(info)
+            else:
+                insertions.setdefault(paragraph_index, []).append(figure_markdown(info))
+        if insertions:
+            rebuilt: list[str] = []
+            for index, paragraph in enumerate(paragraphs):
+                rebuilt.append(paragraph)
+                if index in insertions:
+                    for lines in insertions[index]:
+                        rebuilt.extend(lines)
+            processed_summary = re.sub(r"\n{3,}", "\n\n", "\n\n".join(rebuilt)).strip()
 
         section_lines.append(processed_summary)
         section_lines.append("")
 
-        unreferenced_lines: list[str] = []
-        seen_unref: set[str] = set()
-        for fig_id, info in valid_figures.items():
-            fig_path = info["path"]
-            if fig_path in referenced_figures or fig_path in seen_unref:
-                continue
-            seen_unref.add(fig_path)
-            cap = info["caption"]
-            rel = info["relative"]
-            if cap:
-                unreferenced_lines.append(f"![{cap}]({rel})")
-                unreferenced_lines.append(f"*{cap}*")
-            else:
-                unreferenced_lines.append(f"![the picture on the screen]({rel})")
-
-        if len(unreferenced_lines) > 0:
-            section_lines.extend(unreferenced_lines)
+        if len(leftover_figures) > 0:
+            for info in leftover_figures:
+                section_lines.extend(figure_markdown(info))
             section_lines.append("")
 
         action_items = result_state.get("action_items", []) or []
@@ -1379,9 +1535,11 @@ class StructuringAgent:
             now = time.monotonic()
             if (now - last_heartbeat_time) >= heartbeat_interval:
                 # How often each fault happened is in the heartbeat, so a
-                # fault that is said once is not forgotten.
-                for name, count in self.drift_filter.guards().counts().items():
-                    self.control.set_stat(f"fault_{name}", count)
+                # fault that is said once is not forgotten. The filter is
+                # optional, so the loop cannot count on it being there.
+                if self.drift_filter is not None:
+                    for name, count in self.drift_filter.guards().counts().items():
+                        self.control.set_stat(f"fault_{name}", count)
                 if self.consecutive_failures >= self.max_consecutive_failures:
                     # Keep reporting the failure instead of flipping straight
                     # back to "live" on the next heartbeat.

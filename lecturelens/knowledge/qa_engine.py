@@ -464,7 +464,9 @@ class QAEngine:
         if "_" in source_id:
             prefix = source_id.rsplit("_", 1)[0]
             if prefix in ("timeline", "notes"):
-                return f"{prefix}.md"
+                # The name has to be the one the files really have, for a
+                # citation to be followed by hand.
+                return f"{prefix}.jsonl" if prefix == "timeline" else f"{prefix}.md"
             return prefix
         return source_id
 

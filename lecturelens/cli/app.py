@@ -121,6 +121,13 @@ def _use_utf_8_output() -> None:
             pass
 
 
+# Every command answered to the console, so the console has to be ready
+# before the command runs. Calling it here runs it for every command of
+# the package. It used to exist without ever being called, and the
+# cp1252 crash it was written against still happened.
+_use_utf_8_output()
+
+
 def fail(message: str) -> None:
     console.print(f"[red]{message}[/red]")
     raise typer.Exit(code=1)

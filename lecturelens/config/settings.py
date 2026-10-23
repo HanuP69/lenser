@@ -169,7 +169,12 @@ class Settings(BaseSettings):
     sync_consumer_group: str = Field(default=SYNC_CONSUMER_GROUP)
     sync_consumer_prefix: str = Field(default=SYNC_CONSUMER_PREFIX)
 
-    llm_mode: str = Field(default="local")
+    # Cloud first, local fallback if there is one. In "hybrid" mode every
+    # provider of the chain is allowed and the order of the chain decides:
+    # the cloud providers are asked first, and the local model is only
+    # asked when every cloud provider was refused. "local" asks the local
+    # model alone, and "cloud" leaves the local model out entirely.
+    llm_mode: str = Field(default="hybrid")
     llm_timeout_seconds: float = Field(default=120.0)
 
     primary_provider: Optional[str] = Field(default=None)

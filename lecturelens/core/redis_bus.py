@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+from collections import OrderedDict
 from pathlib import Path
 import sqlite3
 import time
@@ -80,8 +81,16 @@ class RedisBus:
         self.outbox: list[tuple[str, Any]] = []
         self._outbox_row_ids: list[int] = []
         self._outbox_lock: asyncio.Lock = asyncio.Lock()
-        self._inflight_event_ids: set[str] = set()
+        self._inflight_event_ids: dict[str, object] = {}
         self._inflight_wait_seconds: float = 5.0
+        # The event ids that a call of this process delivered most
+        # recently. A second call with the same id (a replay that runs
+        # twice) stops there instead of putting the event in the stream
+        # again. The list is bounded, so a short-lived replayed event that
+        # arrives again much later is delivered again, which downstream
+        # deduplication by event id handles.
+        self._recently_published: OrderedDict[str, None] = OrderedDict()
+        self._recently_published_capacity: int = 4096
         self._reclaim_cursors: dict[str, str] = {}
         self.failure_counts: dict[str, int] = {}
         self._last_flush_attempt: float = 0.0
@@ -425,14 +434,27 @@ class RedisBus:
                 try:
                     await self.publish(stream_name, event)
                     flushed += 1
-                    if self._db_conn is not None and idx < len(self._outbox_row_ids):
-                        row_id = self._outbox_row_ids[idx]
-                        self._db_conn.execute("DELETE FROM outbox_entries WHERE id = ?", (row_id,))
-                        self._db_conn.commit()
                 except (redis.RedisError, OSError):
                     fail_idx = idx
                     self._flush_backoff_seconds = min(60.0, max(2.0, self._flush_backoff_seconds * 2.0))
                     break
+                # The row of a published event is removed afterwards, and
+                # that removal has to be its own attempt: a throwing away of
+                # the row is only bookkeeping, while the event is already in
+                # the stream. If the removal failed inside the same attempt
+                # as the publish, the event was kept in the outbox and
+                # XADDed a second time on the next flush.
+                if self._db_conn is not None and idx < len(self._outbox_row_ids):
+                    row_id = self._outbox_row_ids[idx]
+                    try:
+                        self._db_conn.execute("DELETE FROM outbox_entries WHERE id = ?", (row_id,))
+                        self._db_conn.commit()
+                    except Exception as cleanup_error:
+                        logger.warning(
+                            "published event could not be removed from the outbox (%s); "
+                            "it may be delivered again on the next flush",
+                            cleanup_error
+                        )
 
             if fail_idx is not None:
                 self.outbox = self.outbox[fail_idx:]
@@ -468,27 +490,49 @@ class RedisBus:
         if not ev_id and hasattr(event, "session_id") and hasattr(event, "sequence_number"):
             ev_id = f"note_{getattr(event, 'session_id')}_{getattr(event, 'sequence_number')}"
 
+        token: object = object()
         if ev_id:
-            # Two coroutines can publish the same event at the same time. The
-            # second one has to wait for the first to finish, otherwise both
-            # can publish it, or one publishes it while the other buffers it,
-            # and the event ends up in the stream twice.
+            # Two coroutines can publish the same event at the same time,
+            # and a call whose event was already delivered (a replay that
+            # runs twice, a retry after a lost answer) would put it in the
+            # stream a second time. The marker holds the token of the call
+            # that owns it, so a waiter never removes a marker that belongs
+            # to somebody else.
             waited = 0.0
             while True:
                 async with self._outbox_lock:
+                    if ev_id in self._recently_published:
+                        # A finished call already delivered this exact
+                        # event. Saying so is better than delivering it
+                        # again; the event id of a finished event does not
+                        # change.
+                        return "published_earlier"
                     if ev_id not in self._inflight_event_ids:
-                        self._inflight_event_ids.add(ev_id)
+                        self._inflight_event_ids[ev_id] = token
                         break
                 if waited >= self._inflight_wait_seconds:
+                    # The owner still holds the marker. A call that gave up
+                    # waiting publishes alongside it and does not touch a
+                    # marker that belongs to somebody else.
                     break
                 await asyncio.sleep(0.01)
                 waited += 0.01
         try:
-            return await self._publish_resilient_once(stream_name, event, ev_id)
+            result = await self._publish_resilient_once(stream_name, event, ev_id)
+            if ev_id and result is not None:
+                async with self._outbox_lock:
+                    self._recently_published[ev_id] = None
+                    while len(self._recently_published) > self._recently_published_capacity:
+                        self._recently_published.popitem(last=False)
+            return result
         finally:
             if ev_id:
                 async with self._outbox_lock:
-                    self._inflight_event_ids.discard(ev_id)
+                    # The marker is only removed by the call that created
+                    # it. A call that gave up waiting leaves the owner's
+                    # marker, and the owner removes its own.
+                    if self._inflight_event_ids.get(ev_id) is token:
+                        self._inflight_event_ids.pop(ev_id, None)
 
     async def _publish_resilient_once(
         self, stream_name: str, event: BaseModel, ev_id: Optional[str]
@@ -617,7 +661,13 @@ class RedisBus:
         next_cursor = result[0]
         if isinstance(next_cursor, str) and len(next_cursor) > 0:
             self._reclaim_cursors[cursor_key] = next_cursor
-        for message_id, message_data in result[1]:
+        for entry in result[1]:
+            # Redis answers with the id and the fields of every message it
+            # kept, but a message that vanished from the stream while it
+            # waited in the pending list comes back with only its id.
+            if not isinstance(entry, (tuple, list)) or len(entry) < 2:
+                continue
+            message_id, message_data = entry[0], entry[1]
             if message_data is None:
                 continue
             claimed.append((message_id, message_data))
@@ -684,7 +734,18 @@ class RedisBus:
                     except Exception as dead_err:
                         logger.warning("failed to write to dead letter stream %s: %s", dead_stream, dead_err)
                     if dead_written:
-                        await self.client.xack(stream_name, group_name, message_id)
+                        try:
+                            await self.client.xack(stream_name, group_name, message_id)
+                        except Exception as ack_error:
+                            # The message stays in the pending list when the
+                            # ack failed. It is delivered again, and it
+                            # reaches the dead letter stream a second time,
+                            # but the message is not lost.
+                            logger.warning(
+                                "dead letter ack failed for %s on %s: %s",
+                                message_id, stream_name, ack_error
+                            )
+                            continue
                         try:
                             await self.client.delete(redis_retry_key)
                         except Exception:
@@ -749,7 +810,13 @@ class RedisBus:
                             "leaving remaining messages pending",
                             self.backlog_drain_budget_seconds, stream_name
                         )
-                        return
+                        # The drain is bounded, the consumer is not: the live
+                        # messages still have to be read, otherwise a gateway
+                        # that started with a large pending list stopped
+                        # fanning out notes for good. The messages left in the
+                        # pending entries list are replayed on the next start.
+                        backlog_drained = True
+                        continue
                     messages = await self.read_group_messages(
                         stream_name, group_name, consumer_name, backlog_cursor, batch_size, None
                     )

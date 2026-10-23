@@ -54,11 +54,26 @@ class TestWindowPicker(unittest.TestCase):
             window = window_picker.prompt_for_window(console)
         self.assertIsNone(window)
 
-    def test_a_number_that_does_not_exist_records_the_whole_screen(self) -> None:
-        console = FakeConsole(answer="99")
-        with mock.patch("lecturelens.core.window_capture.list_windows", return_value=WINDOWS):
+    def test_a_number_that_does_not_exist_is_asked_again(self) -> None:
+        """A wrong number is a typo, not a choice.
+
+        The command used to fall through to recording the whole screen, so
+        a mistyped number recorded something the user never asked for. The
+        question is asked again instead, and the loop only ends when an
+        answer that fits is given, the whole screen is chosen with an
+        empty answer, or the input ends.
+        """
+        console = FakeConsole(answer="")
+        console.answers = ["99", "1"]
+        with mock.patch("lecturelens.core.window_capture.list_windows", return_value=WINDOWS), \
+                mock.patch.object(console, "input", side_effect=lambda prompt="": console.answers.pop(0)):
             window = window_picker.prompt_for_window(console)
-        self.assertIsNone(window)
+        self.assertIsNotNone(window)
+        self.assertEqual(window.handle, WINDOWS[0].handle)
+        # The typo was answered with an explanation, not with a decision.
+        self.assertTrue(
+            any("no window number 99" in line for line in console.printed)
+        )
 
     def test_a_title_picks_the_window(self) -> None:
         console = FakeConsole(answer="Redis Talk")
