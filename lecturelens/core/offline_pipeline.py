@@ -267,7 +267,16 @@ async def _run_screen_leg(
         # still missing the text a second later.
         await asyncio.gather(*list(screen_agent.retry_tasks), return_exceptions=True)
 
-    return bus.events_of_type(SlideCaptured)
+    events = bus.events_of_type(SlideCaptured)
+    unique_events: dict[int, SlideCaptured] = {}
+    for event in events:
+        if event.slide_number in screen_agent.slide_texts:
+            settled_text = screen_agent.slide_texts[event.slide_number]
+            if len(settled_text) > len(event.extracted_text):
+                event.extracted_text = settled_text
+        if event.slide_number not in unique_events or len(event.extracted_text) >= len(unique_events[event.slide_number].extracted_text):
+            unique_events[event.slide_number] = event
+    return list(unique_events.values())
 
 
 async def _write_timeline(
