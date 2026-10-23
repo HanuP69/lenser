@@ -324,14 +324,14 @@ def create_base_chat_model(
                 base_url=base_url,
                 api_key=api_keys[0],
                 model=model_name,
-                max_retries=2
+                max_retries=0
             )
         models = [
             ChatOpenAI(
                 base_url=base_url,
                 api_key=key,
                 model=model_name,
-                max_retries=1
+                max_retries=0
             )
             for key in api_keys
         ]
@@ -466,6 +466,10 @@ def wrap_model_with_circuit_breaker(
                         logger.warning("failure not recorded for %s: %s", provider_name, guard_error)
                 else:
                     # The budget was used up, the provider is still healthy.
+                    try:
+                        await rate_limiter.record_limited()
+                    except Exception:
+                        pass
                     logger.info(
                         "%s reached its request limit, moving on without tripping the breaker",
                         provider_name

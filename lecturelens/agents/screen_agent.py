@@ -242,6 +242,9 @@ class ScreenAgent:
         self.last_figure_id: str = ""
         self.last_figure_path: str = ""
         self.slide_figures: dict[int, dict[str, str]] = {}
+        self.vision_semaphore: asyncio.Semaphore = asyncio.Semaphore(1)
+        self.last_board_phash: Optional[int] = None
+        self.last_board_text: str = ""
 
     def resolve_window_handle(self) -> Optional[int]:
         """Find the window that is recorded.
@@ -587,7 +590,7 @@ class ScreenAgent:
             except Exception as error:
                 logger.error("slide vision fallback failed (attempt %d/%d): %s", attempt + 1, max_retries, error)
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(0.5 * (attempt + 1))
+                    await asyncio.sleep(20.0 * (attempt + 1))
         return ""
 
     def can_work_in_the_background(self) -> bool:
@@ -625,6 +628,10 @@ class ScreenAgent:
             extracted_text = self.slide_texts[revisited_number]
 
         is_board, board_kind = detect_board_surface(thumbnail)
+        if is_board and self.last_board_phash is not None:
+            dist = hamming_distance(self.last_board_phash, difference_hash)
+            if dist <= 3 and self.last_board_text:
+                extracted_text = self.last_board_text
         regions = await self.find_the_parts(png_bytes)
         figure_path = ""
         figure_caption = ""
@@ -679,7 +686,7 @@ class ScreenAgent:
         )
 
         needs_text_extraction = (
-            (len(extracted_text.strip()) == 0 or is_board)
+            (len(extracted_text.strip()) == 0 or (is_board and not extracted_text.strip()))
             # A revisited slide whose text was never stored is in the
             # same case as a slide never read before: the retake shows
             # the same screen, so the text is read from it. The slides
@@ -777,60 +784,51 @@ class ScreenAgent:
         being held in memory. A backlog of pending slides would otherwise keep
         every screenshot alive for the whole retry schedule.
         """
-        recovered_text = ""
-        fig_info = self.slide_figures.get(slide_number, {})
-        figure_path = fig_info.get("path", "")
-        figure_caption = fig_info.get("caption", "")
-        figure_id = fig_info.get("figure_id", "")
-        vision_prompt = BOARD_VISION_PROMPT if is_board else None
+        async with self.vision_semaphore:
+            recovered_text = ""
+            fig_info = self.slide_figures.get(slide_number, {})
+            figure_path = fig_info.get("path", "")
+            figure_caption = fig_info.get("caption", "")
+            figure_id = fig_info.get("figure_id", "")
+            vision_prompt = BOARD_VISION_PROMPT if is_board else None
 
-        if self.llm_router is not None:
-            self.control.increment_stat("slide_text_needs_model")
-            delays = [0.0] + list(self.settings.vision_retry_delays_seconds)
-            for index, delay_seconds in enumerate(delays):
-                if delay_seconds > 0:
-                    await asyncio.sleep(delay_seconds)
-                if self.control.stop_requested():
-                    return
-                recovered_text = await self.run_vision_fallback(
-                    png_bytes, max_retries=1, prompt=vision_prompt
-                )
+            try:
+                if self.llm_router is not None:
+                    self.control.increment_stat("slide_text_needs_model")
+                    delays = [0.0] + list(self.settings.vision_retry_delays_seconds)
+                    for index, delay_seconds in enumerate(delays):
+                        if delay_seconds > 0:
+                            await asyncio.sleep(delay_seconds)
+                        if self.control.stop_requested():
+                            return
+                        recovered_text = await self.run_vision_fallback(
+                            png_bytes, max_retries=1, prompt=vision_prompt
+                        )
+                        if len(recovered_text.strip()) > 0:
+                            break
+
+                if is_board and len(recovered_text.strip()) > 0:
+                    self.last_board_phash = difference_hash
+                    self.last_board_text = recovered_text
+
                 if len(recovered_text.strip()) > 0:
-                    break
-                try:
-                    payload = await run_in_thread_pool(Path(image_path).read_bytes)
-                    recovered_text = await self.run_vision_fallback(
-                        payload, max_retries=1, prompt=vision_prompt
-                    )
-                    if len(recovered_text.strip()) > 0:
-                        break
-                except OSError:
-                    pass
-
-        try:
-            if len(recovered_text.strip()) > 0:
-                self.remember_slide(slide_number, difference_hash, small_thumbnail, recovered_text)
-                if (
-                    revisited_slide_number > 0
-                    and revisited_slide_number not in self.slide_texts
-                ):
-                    # The words were read from the retake, but the screen
-                    # belongs to the older slide: the text is stored
-                    # under its number as well, so the next time the
-                    # lecturer returns to that slide there is no second
-                    # reading to do.
-                    self.slide_texts[revisited_slide_number] = recovered_text
-                self.control.increment_stat("slide_text_recovered")
-            else:
-                logger.warning("slide %d text could not be recovered after retries", slide_number)
-                self.control.increment_stat("slide_text_unrecovered")
-        finally:
-            # The counter belongs to the background task, whether it ends
-            # with text or because the session is stopping. An early return
-            # at the stop request used to leave a count that never came
-            # back to zero.
-            self._pending_text_extractions = max(0, self._pending_text_extractions - 1)
-            self.control.set_stat("slides_awaiting_text", self._pending_text_extractions)
+                    self.remember_slide(slide_number, difference_hash, small_thumbnail, recovered_text)
+                    if (
+                        revisited_slide_number > 0
+                        and revisited_slide_number not in self.slide_texts
+                    ):
+                        self.slide_texts[revisited_slide_number] = recovered_text
+                    self.control.increment_stat("slide_text_recovered")
+                else:
+                    logger.warning("slide %d text could not be recovered after retries", slide_number)
+                    self.control.increment_stat("slide_text_unrecovered")
+            finally:
+                # The counter belongs to the background task, whether it ends
+                # with text or because the session is stopping. An early return
+                # at the stop request used to leave a count that never came
+                # back to zero.
+                self._pending_text_extractions = max(0, self._pending_text_extractions - 1)
+                self.control.set_stat("slides_awaiting_text", self._pending_text_extractions)
 
         if figure_path and not figure_caption and recovered_text:
             figure_caption = recovered_text.strip()[:157]

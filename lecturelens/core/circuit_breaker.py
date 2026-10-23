@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 import uuid
@@ -59,12 +60,12 @@ class RedisRateLimiter:
         self.provider_name: str = provider_name
         self.max_requests_per_window: int = max_requests_per_window
         self.window_seconds: int = window_seconds
-        # Injectable so the window can be pinned in tests.
         self.time_provider: Callable[[], float] = time_provider or time.time
         self._scripts: dict[str, object] = {}
+        self._local_history: list[float] = []
+        self._local_lock: asyncio.Lock = asyncio.Lock()
 
     def _script(self, source: str) -> object:
-        """Register the Lua script once and reuse it."""
         if self.redis_client is None:
             return None
         script = self._scripts.get(source)
@@ -74,20 +75,19 @@ class RedisRateLimiter:
         return script
 
     def generate_window_key(self) -> str:
-        """The key that holds the request timestamps.
-
-        It used to be a key per wall clock bucket. There is one key now, the
-        entries are scored by their own timestamp, so the window slides.
-        """
         return f"lecturelens:ratelimit:{self.provider_name}"
 
     async def is_allowed(self) -> bool:
-        if self.redis_client is None:
-            return True
-        key_name = self.generate_window_key()
         now = float(self.time_provider())
-        # The member has to be unique, two requests in the same millisecond
-        # would otherwise collapse into one entry.
+        if self.redis_client is None:
+            async with self._local_lock:
+                cutoff = now - float(self.window_seconds)
+                self._local_history = [t for t in self._local_history if t > cutoff]
+                if len(self._local_history) < self.max_requests_per_window:
+                    self._local_history.append(now)
+                    return True
+                return False
+        key_name = self.generate_window_key()
         member = f"{now:.6f}:{uuid.uuid4().hex[:8]}"
         try:
             script = self._script(SLIDING_WINDOW_SCRIPT)
@@ -97,16 +97,32 @@ class RedisRateLimiter:
             )
             return int(allowed) == 1
         except Exception as error:
-            # The guard store is unavailable. Fail open, the provider is
-            # still the thing that decides whether a call is allowed.
             logger.warning("rate limiter unavailable for %s: %s", self.provider_name, error)
             return True
 
-    async def get_current_count(self) -> int:
-        if self.redis_client is None:
-            return 0
-        key_name = self.generate_window_key()
+    async def record_limited(self, duration: Optional[float] = None) -> None:
+        block_duration = duration if (duration is not None and duration > 0) else float(self.window_seconds)
         now = float(self.time_provider())
+        if self.redis_client is None:
+            async with self._local_lock:
+                self._local_history = [now + block_duration] * self.max_requests_per_window
+            return
+        key_name = self.generate_window_key()
+        try:
+            for _ in range(self.max_requests_per_window):
+                member = f"{now:.6f}:{uuid.uuid4().hex[:8]}"
+                await self.redis_client.zadd(key_name, {member: now + block_duration})
+            await self.redis_client.expire(key_name, int(block_duration * 2))
+        except Exception:
+            pass
+
+    async def get_current_count(self) -> int:
+        now = float(self.time_provider())
+        if self.redis_client is None:
+            cutoff = now - float(self.window_seconds)
+            self._local_history = [t for t in self._local_history if t > cutoff]
+            return len(self._local_history)
+        key_name = self.generate_window_key()
         try:
             script = self._script(SLIDING_WINDOW_COUNT_SCRIPT)
             count = await script(
@@ -137,6 +153,8 @@ class RedisCircuitBreaker:
         self.provider_name: str = provider_name
         self.failure_threshold: int = failure_threshold
         self.cooldown_seconds: int = cooldown_seconds
+        self._local_failures: int = 0
+        self._local_open_until: float = 0.0
 
     def get_breaker_key(self) -> str:
         return f"lecturelens:breaker:{self.provider_name}:open"
@@ -146,7 +164,7 @@ class RedisCircuitBreaker:
 
     async def is_open(self) -> bool:
         if self.redis_client is None:
-            return False
+            return time.time() < self._local_open_until
         breaker_key = self.get_breaker_key()
         exists = await self.redis_client.get(breaker_key)
         if exists is not None:
@@ -155,6 +173,8 @@ class RedisCircuitBreaker:
 
     async def record_success(self) -> None:
         if self.redis_client is None:
+            self._local_failures = 0
+            self._local_open_until = 0.0
             return
         failure_key = self.get_failure_key()
         breaker_key = self.get_breaker_key()
@@ -163,6 +183,9 @@ class RedisCircuitBreaker:
 
     async def record_failure(self) -> None:
         if self.redis_client is None:
+            self._local_failures += 1
+            if self._local_failures >= self.failure_threshold:
+                self._local_open_until = time.time() + self.cooldown_seconds
             return
         failure_key = self.get_failure_key()
         breaker_key = self.get_breaker_key()
