@@ -173,6 +173,18 @@ class TestAudioHelpers(unittest.TestCase):
             is_hallucinated_text("pause and resume", extra_phrases=["pause and resume"])
         )
 
+    def test_hallucination_filter_catches_number_and_phrase_loops(self) -> None:
+        self.assertTrue(is_hallucinated_text("2. 2. 7. 7. SN1. 7. 12. 8. 9. 10. 9. 9. 11. 9. 7. 14. 11. 11. 11."))
+        self.assertTrue(is_hallucinated_text("2 is one step, 2 is one step, 2 is one step, 2 is one step"))
+        self.assertFalse(is_hallucinated_text("SN1 reaction occurs via carbocation intermediate in polar protic solvent"))
+
+    def test_whisper_repetition_settings_defaults(self) -> None:
+        settings = Settings()
+        self.assertEqual(settings.whisper_repetition_penalty, 1.2)
+        self.assertEqual(settings.whisper_no_repeat_ngram_size, 3)
+        self.assertEqual(settings.whisper_vad_min_silence_duration_ms, 500)
+        self.assertEqual(settings.whisper_vad_speech_pad_ms, 200)
+
     def test_wav_conversion_round_trip(self) -> None:
         samples = np.linspace(-0.5, 0.5, 1600, dtype=np.float32)
         wav_bytes = convert_numpy_to_wav_bytes(samples, SAMPLE_RATE)

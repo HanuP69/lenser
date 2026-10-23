@@ -1,10 +1,10 @@
-{"start": 60.0, "end": 90.0, "text": ""}
-{"start": 90.0, "end": 120.0, "text": ""}
-{"start": 120.0, "end": 150.0, "text": ""}
-{"start": 150.0, "end": 180.0, "text": ""}
-{"start": 180.0, "end": 210.0, "text": ""}
-{"start": 210.0, "end": 240.0, "text": ""}
-{"start": 240.0, "end": 270.0, "text": ""}
-{"start": 270.0, "end": 300.0, "text": ""}
-{"start": 300.0, "end": 330.0, "text": ""}
-{"start": 330.0, "end": 360.0, "text": ""}
+{"start": 60.0, "end": 90.0, "text": "We will start without wasting time, let us start. First of all, we will talk about the reaction of SN1."}
+{"start": 90.0, "end": 120.0, "text": "Remember, SN1 is a multi-step reaction. If a multi-step reaction happens, what will be formed? It will be a carbocation. What is the stability of the carbocation?"}
+{"start": 120.0, "end": 150.0, "text": "Simply solvent water, polar protic solvent is added. Ethanol or methanol in solvolysis gives SN1. Carbocation stability is very important. For degree of alkyl halide, it should be 2 degree or 3 degree."}
+{"start": 150.0, "end": 180.0, "text": "Primary carbocation is not stable, so SN1 is not favorable at room temperature. But if allylic or benzylic 1 degree halide is present, it can give SN1 because allylic carbocation is relatively stable."}
+{"start": 180.0, "end": 210.0, "text": "If simply moist Ag2O is given or aqueous AgNO3, silver nitrate can be used in 1 degree alkyl halide to give SN1. All these points are important for SN1."}
+{"start": 210.0, "end": 240.0, "text": "Now let's talk about SN2. SN2 is substitution nucleophilic bimolecular. Remember, 2 means it is a single step mechanism. Alkyl halide degree is crucial."}
+{"start": 240.0, "end": 270.0, "text": "For SN2, 1 degree is possible, 2 degree is possible, but tertiary or 3 degree is not possible due to steric hindrance. In that scenario, SN2 is not possible."}
+{"start": 270.0, "end": 300.0, "text": "In general, negatively charged nucleophiles like CN- or N3- favor SN2. Competition between SN2 and E2 will be discussed later."}
+{"start": 300.0, "end": 330.0, "text": "Primary alkyl halide is possible for SN2, 2 degree is possible, but tertiary 3 degree is not possible in this scenario. Strong negatively charged nucleophile favors SN2."}
+{"start": 330.0, "end": 360.0, "text": "In general, negatively charged nucleophiles like CN- or N3- or I-, these negatively charged species favor SN2 reactions."}

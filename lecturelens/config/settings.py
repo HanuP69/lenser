@@ -72,6 +72,11 @@ class Settings(BaseSettings):
     whisper_compute_type: Optional[str] = Field(default=None)
     whisper_preload_in_every_worker: bool = Field(default=True)
     whisper_hallucination_phrases: list[str] = Field(default_factory=list)
+    whisper_repetition_penalty: float = Field(default=1.2)
+    whisper_no_repeat_ngram_size: int = Field(default=3)
+    whisper_initial_prompt: Optional[str] = Field(default=None)
+    whisper_vad_min_silence_duration_ms: int = Field(default=500)
+    whisper_vad_speech_pad_ms: int = Field(default=200)
 
     screenshot_interval_seconds: float = Field(default=1.0)
     # The frames per second sampled from a video file in video mode. The

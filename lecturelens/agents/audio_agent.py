@@ -162,10 +162,21 @@ def is_hallucinated_text(
     if normalized in phrases:
         return True
     words = normalized.split()
-    if len(words) >= 8:
+    if len(words) >= 6:
         distinct_words = set(words)
         if len(distinct_words) <= 2:
             return True
+        if len(words) >= 8 and (len(distinct_words) / float(len(words))) < 0.35:
+            return True
+        digit_count = sum(1 for c in normalized if c.isdigit())
+        char_count = sum(1 for c in normalized if c.isalnum())
+        if char_count >= 10 and (digit_count / float(char_count)) > 0.60:
+            return True
+        for window_size in (2, 3):
+            if len(words) >= window_size * 3:
+                ngrams = [tuple(words[i:i + window_size]) for i in range(0, len(words) - window_size + 1, window_size)]
+                if len(ngrams) >= 3 and len(set(ngrams)) == 1:
+                    return True
     return False
 
 
@@ -201,15 +212,31 @@ def transcribe_audio_chunk(
     beam_size: int = 3,
     min_avg_logprob: float = -1.0,
     max_no_speech_prob: float = 0.6,
-    compute_type: Optional[str] = None
+    compute_type: Optional[str] = None,
+    repetition_penalty: float = 1.2,
+    no_repeat_ngram_size: int = 3,
+    initial_prompt: Optional[str] = None,
+    vad_min_silence_duration_ms: int = 500,
+    vad_speech_pad_ms: int = 200
 ) -> dict:
     model = load_whisper_model(model_size, device, compute_type)
+    transcribe_options: dict[str, Any] = {
+        "beam_size": beam_size,
+        "language": language,
+        "vad_filter": True,
+        "condition_on_previous_text": False,
+        "repetition_penalty": repetition_penalty,
+        "no_repeat_ngram_size": no_repeat_ngram_size,
+        "vad_parameters": dict(
+            min_silence_duration_ms=vad_min_silence_duration_ms,
+            speech_pad_ms=vad_speech_pad_ms
+        )
+    }
+    if initial_prompt:
+        transcribe_options["initial_prompt"] = initial_prompt
     segments, info = model.transcribe(
         io.BytesIO(audio_bytes),
-        beam_size=beam_size,
-        language=language,
-        vad_filter=True,
-        condition_on_previous_text=False
+        **transcribe_options
     )
 
     kept_texts: list[str] = []
@@ -875,7 +902,12 @@ class AudioAgent:
             self.settings.whisper_beam_size,
             self.settings.whisper_min_avg_logprob,
             self.settings.whisper_max_no_speech_prob,
-            self.settings.whisper_compute_type
+            self.settings.whisper_compute_type,
+            self.settings.whisper_repetition_penalty,
+            self.settings.whisper_no_repeat_ngram_size,
+            self.settings.whisper_initial_prompt,
+            self.settings.whisper_vad_min_silence_duration_ms,
+            self.settings.whisper_vad_speech_pad_ms
         )
         transcript_text = str(result.get("text", "")).strip()
         detected_language = str(result.get("language", "en"))
