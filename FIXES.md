@@ -177,3 +177,24 @@ One batch of notes used to cost the free tier six to eight requests: summarize, 
 ## The numbers (3-minute Redis clip, same lecture as the baseline)
 8. Baseline `output/baseline_slides`: 8 requests, 10,875 input tokens, 6,814 output tokens, one stage failed. Phase 1 `output/p1_slides`: 3 batches → 3 requests, 0 failed, 3,455 input tokens (avg 1,152/batch, ~89% less), 8,007 output — roughly 1 request and ~1.2k input tokens per batch where it used to be ~2.7k input across 8 asks. All calls carry the `notes` stage; no repair call was needed on this run. (`eval/baseline_v0.5.0.md`, `eval/usage_report.py`)
 9. Regression tests: the one-call contract (notes + delimiter + JSON in one reply, one repair at most, an empty batch costs no call, the LaTeX pass only when the checks fail), the trimming by counting, the deterministic running context, the parser of the delimiter and of a lost delimiter, and the scrub against the exact shapes that were leaked live. 616 tests pass. (`tests/test_structuring_agent.py`)
+
+# Fix log (v0.7.0, improvement plan Phase 2 — lectures that are already files)
+
+A recorded lecture file could not be turned into notes; it had to be played on a screen while the capture devices ran. The file itself holds everything the devices would collect, so `lecturelens offline <video> --session <name>` plays the file through the same agents the live session uses, writes the notes in one process, and needs no Redis and no Postgres.
+
+## The decode
+1. The audio track is resampled to the 16 kHz mono float blocks the microphone feeds, in the block size of the capture settings, so the speech segmenter and the transcription agent run on numbers identical to the live path. The video track is sampled at `video_frame_fps` (one frame per second) and handed to the ingest as PNG bytes, exactly like a screen capture. The two legs open their own container, because demuxing walks a file in order and a drained video leg would leave the audio reader sitting past the end of the stream. A damaged audio packet loses a whisper, not the run. (`core/video_decoder.py`, `pyproject.toml`)
+2. The PyAV wheel was in the virtual machine but never declared; `av>=12` is now a dependency.
+
+## The run
+3. The clock is anchored once at the start of the run and saved as `clock.json`: video time is the elapsed lecture time, so the notes carry the minutes of the file (`### 00:03:23` means 3:23 inside the recording), not the wall clock of the evening the run happened. The structuring agent loads the same anchor. (`core/offline_pipeline.py`)
+4. The speech goes through the transcription agent's ingest whole — the chunk saving, the hallucination filter, the language lock and the counters stay the live path's, not copies. The frames go through the screen agent's ingest with the change gate on; the gate now takes an explicit time (`gate_now`), and the offline run feeds it the seconds of the file (live capture keeps the monotonic clock as the default). (`agents/audio_agent.py`, `agents/screen_agent.py`, `core/offline_pipeline.py`)
+5. A slide whose text the machine could not read is waited for before the process exits, so the notes never miss a text that a second later existed in live mode. The timeline is written by the sync agent in one final forced flush: sorted by event time, with correlations assigned, ordered by where things sit in the lecture rather than the order the machine finished them in. The structuring pass runs in-process, the same way the `reprocess` command runs it, with the notes router built for the task. The usage account points at the session's logs, so `eval/usage_report.py` reads an offline session like a live one. (`core/offline_pipeline.py`)
+
+## The numbers (the same Redis lecture, 669 s of file time)
+6. The command wrote the notes in 605 s — under the length of the lecture, without watching it in real time. Listening was local and free: the whisper transcription and the local reading covered every slide, zero vision-model calls. The structuring pass asked 5 batch attempts plus one repair: 7,280 input tokens and 13,479 output tokens for a session of 45 transcript events and 20 slides, with sections at `00:00:00`, `00:03:23` and `00:08:11`, a picture of a diagram kept in the assets, and 65 timeline rows ordered by event time. (`output/p2_redis`, `eval/usage_report.py`)
+
+## Tests
+7. The synthetic clip of the tests is written with PyAV itself — mpeg4 and aac — so the tests run against the real shape of file. They cover the decode primitives (frame times on the video clock, the block energy pattern, the probe), the full run through the agents into notes with a stub structuring router and a canned whisper, and the gate accepting video time the way the live polls settle. 626 tests pass. (`tests/test_offline_mode.py`)
+
+Loose end: the improvement plan also names a JEE clip for acceptance; it is not in the repository yet, so that run is still pending the file.

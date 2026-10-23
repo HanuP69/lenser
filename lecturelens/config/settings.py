@@ -74,6 +74,11 @@ class Settings(BaseSettings):
     whisper_hallucination_phrases: list[str] = Field(default_factory=list)
 
     screenshot_interval_seconds: float = Field(default=1.0)
+    # The frames per second sampled from a video file in video mode. The
+    # live capture takes one frame per interval; one per second is also
+    # enough for a recording, because the change gate keeps the frames
+    # that matter and drops the ones that repeat.
+    video_frame_fps: float = Field(default=1.0)
     # Whether the text of the screen is read on the machine. The reader
     # runs on the processor and costs nothing, and it reads the text of a
     # slide as well as a model does over the network. The model is then

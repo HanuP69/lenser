@@ -863,7 +863,8 @@ class ScreenAgent:
         self,
         png_bytes: bytes,
         capture_epoch: Optional[float] = None,
-        enforce_gate: bool = False
+        enforce_gate: bool = False,
+        gate_now: Optional[float] = None
     ) -> Optional[SlideCaptured]:
         thumbnail = await run_in_thread_pool(
             build_thumbnail_from_png, png_bytes, self.settings.slide_thumbnail_width
@@ -873,8 +874,14 @@ class ScreenAgent:
             # The capture epoch is a wall-clock timestamp used for the event
             # itself; feeding it into the gate froze slide capture for the
             # rest of the session.
+            if gate_now is None:
+                # Live capture measures the wall of the recording session,
+                # so the monotonic clock is the default. Video mode passes
+                # the elapsed seconds of the file instead, once per frame,
+                # so every call feeds the gate the same video timeline.
+                gate_now = time.monotonic()
             gate_accepted = await run_in_thread_pool(
-                self.gate.evaluate, thumbnail, time.monotonic()
+                self.gate.evaluate, thumbnail, gate_now
             )
             if not gate_accepted:
                 return None
