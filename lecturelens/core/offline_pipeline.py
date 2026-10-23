@@ -194,7 +194,11 @@ async def _run_audio_leg(
         target_sample_rate=settings.mic_sample_rate,
         block_seconds=settings.audio_block_seconds
     ):
-        for chunk in segmenter.push(block, stream_elapsed):
+        # The segmenter expects the elapsed time at the end of the block,
+        # the way the live capture passes it. stream_elapsed is the start of
+        # the block, so the end is added here.
+        block_end_elapsed = stream_elapsed + (block.size / float(settings.mic_sample_rate))
+        for chunk in segmenter.push(block, block_end_elapsed):
             await transcribe_chunk(chunk)
         stream_elapsed += settings.audio_block_seconds
     for chunk in segmenter.flush():

@@ -412,7 +412,6 @@ class ScreenAgent:
             crop_bytes = crop_io.getvalue()
             sha_hash = hashlib.sha256(crop_bytes).hexdigest()[:16]
             figure_id = f"fig_{sha_hash}"
-            self.last_figure_id = figure_id
 
             gray_crop = build_gray_thumbnail(crop, 32)
             current_phash = compute_difference_hash(gray_crop)
@@ -426,6 +425,8 @@ class ScreenAgent:
                 dist = hamming_distance(self.last_figure_phash, current_phash)
                 if dist <= 4:
                     self.control.increment_stat("slide_figure_deduped")
+                    # Keep the identity of the reused picture, not the new
+                    # crop that was never written.
                     return self.last_figure_path
 
             assets_dir = self.figures_dir
@@ -438,6 +439,7 @@ class ScreenAgent:
                 atomic_write_bytes(id_path, crop_bytes)
             self.last_figure_phash = current_phash
             self.last_figure_path = str(path)
+            self.last_figure_id = figure_id
         except Exception as error:
             logger.warning("the picture of the diagram could not be saved: %s", error)
             return ""

@@ -226,3 +226,10 @@ un_ocr from lecturelens/agents/screen_agent.py, WindowCapture.describe from lect
 2. Declared undeclared opencv-python>=4.8 dependency in pyproject.toml.
 3. Eliminated websocket context leaks on cancellation during client handshake: connect_and_auth safely tracks context entry before awaiting socket.recv(), ensuring clean __aexit__ teardown on shutdown. (client/remote_client.py)
 4. Hardened remote client shutdown tests with deterministic event synchronization. (	ests/test_gateway.py)
+
+# Fix log (v0.12.0 — unbounded shutdown and direct video input support)
+
+1. Removed all hard shutdown deadlines across agent shutdown phases in cli/app.py, core/process_manager.py, and cli/commands/session.py, allowing sync, structuring, and persister agents to flush backlogs completely without premature SIGTERM or work discarding.
+2. Removed Redis backlog drain budget timeout so consumer message streams drain without truncation. (core/redis_bus.py, config/settings.py)
+3. Added --video option to lecturelens start and --llm-mode option to lecturelens offline to seamlessly process recorded lecture videos. (cli/commands/session.py, cli/commands/offline.py)
+4. Configured cloud LLM mode in .env to route through online UnoRouter models with no local Ollama dependencies.

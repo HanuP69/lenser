@@ -168,7 +168,7 @@ class Settings(BaseSettings):
     redis_consumer_block_ms: int = Field(default=2000)
     redis_max_delivery_attempts: int = Field(default=5)
     redis_reclaim_interval_seconds: float = Field(default=15.0)
-    redis_backlog_drain_budget_seconds: float = Field(default=60.0)
+    redis_backlog_drain_budget_seconds: float = Field(default=0.0)
     redis_socket_connect_timeout_seconds: float = Field(default=5.0)
     redis_socket_timeout_seconds: float = Field(default=30.0)
     capture_spool_max_size: int = Field(default=500)

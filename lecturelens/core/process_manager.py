@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 # single local LLM call on CPU, or a rate limited cloud retry, can take
 # minutes without writing anything, so the limit is generous and the phase
 # deadline is the real backstop.
-PROGRESS_STALL_SECONDS: float = 180.0
+PROGRESS_STALL_SECONDS: Optional[float] = None
 
 
 class AgentProcessManager:
@@ -242,8 +242,8 @@ class AgentProcessManager:
                 exited_cleanly = self.wait_for_exit(
                     running_names,
                     timeout_seconds,
-                    progress_probe=self._phase_progress_probe(session_dir),
-                    progress_timeout_seconds=PROGRESS_STALL_SECONDS,
+                    progress_probe=self._phase_progress_probe(session_dir) if (timeout_seconds is not None and timeout_seconds > 0) else None,
+                    progress_timeout_seconds=PROGRESS_STALL_SECONDS if (timeout_seconds is not None and timeout_seconds > 0) else None,
                 )
             except KeyboardInterrupt:
                 # The user pressed the key again while the session was

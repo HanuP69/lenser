@@ -345,7 +345,7 @@ FIGURE_CAPTION_STOP_WORDS = frozenset({
 
 def caption_keywords(caption: str) -> list[str]:
     """The words of a caption that can find the paragraph it belongs to."""
-    words = re.findall(r"[a-z0-9]+", caption.lower())
+    words = re.findall(r"\w+", caption.lower(), re.UNICODE)
     return [word for word in words if len(word) >= 3 and word not in FIGURE_CAPTION_STOP_WORDS]
 
 
@@ -388,9 +388,9 @@ def best_paragraph_for_caption(
         )
         # One short hit answers too easily ("tree" is in every talk about
         # trees). A picture moves only for two words, or for one long
-        # word, or for a single hit on the very first paragraph, which is
-        # often the overview of the slide that was on the screen.
-        confident = hits >= 2 or long_hit or (len(paragraphs) > 0 and index == 0)
+        # word. A single short hit on the first paragraph is not enough:
+        # it used to put unrelated pictures under the opening paragraph.
+        confident = hits >= 2 or long_hit
         if not confident:
             continue
         if hits > best_hits or (hits == best_hits and long_hit and not best_long_hit):

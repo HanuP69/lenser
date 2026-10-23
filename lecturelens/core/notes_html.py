@@ -166,9 +166,18 @@ def _as_data_uri(source: str, folder: Path) -> Optional[str]:
     else:
         path = folder / candidate
     try:
-        if not path.is_file():
+        resolved_folder = folder.resolve()
+        resolved_path = path.resolve()
+        # A picture is inlined only when it lives inside the folder of the
+        # notes. An absolute path or a "../" that points elsewhere would
+        # otherwise copy bytes from anywhere on the machine into the page.
+        resolved_path.relative_to(resolved_folder)
+    except (OSError, ValueError):
+        return None
+    try:
+        if not resolved_path.is_file():
             return None
-        payload = path.read_bytes()
+        payload = resolved_path.read_bytes()
     except OSError:
         return None
     mime = mimetypes.guess_type(path.name)[0] or "image/png"
@@ -185,7 +194,10 @@ def _render_markdown(markdown_text: str) -> str:
         # only not drawn.
         return "<pre>" + html.escape(markdown_text) + "</pre>"
 
-    parser = MarkdownIt("commonmark", {"html": True, "linkify": True})
+    # Raw HTML in the notes is not rendered: the notes are written by a
+    # model, and a page that draws them must not run markup that came from
+    # the lecture. Links are still turned into links.
+    parser = MarkdownIt("commonmark", {"html": False, "linkify": True})
     parser.enable("table")
     try:
         parser.enable("strikethrough")

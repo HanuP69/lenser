@@ -495,7 +495,7 @@ def wrap_model_with_circuit_breaker(
 
 def build_router_for_task(
     task_type: str,
-    redis_client: redis.Redis,
+    redis_client: Optional[redis.Redis],
     router_config: dict[str, Any],
     ollama_url: Optional[str] = None,
     llm_mode: str = "local",
@@ -593,7 +593,7 @@ def build_router_for_task(
 
 
 async def get_router_status(
-    redis_client: redis.Redis,
+    redis_client: Optional[redis.Redis],
     router_config: dict[str, Any],
     task_type: str,
     llm_mode: str = "local"

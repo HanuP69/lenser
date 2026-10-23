@@ -223,9 +223,9 @@ Each student maintains an isolated, private SQLite database (`student_graph.db`)
 
 ---
 
-## Automated Test Suite (423 Tests)
+## Automated Test Suite (638 Tests)
 
-LectureLens maintains an automated test suite of **470 unit and integration tests** verifying concurrency, resilience, audio processing, screen capture, window capture, Postgres persistence, gateway fan-out, client personalization, and knowledge graphs:
+LectureLens maintains an automated test suite of **638 unit and integration tests** verifying concurrency, resilience, audio processing, screen capture, window capture, Postgres persistence, gateway fan-out, client personalization, and knowledge graphs:
 
 ```
 ================= 423 passed in 69.84s =================

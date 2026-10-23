@@ -99,6 +99,7 @@ def start(
     ),
     llm_mode: Optional[str] = typer.Option(None, "--llm-mode", help="local, hybrid or cloud"),
     resume: bool = typer.Option(False, "--resume", help="continue an existing session"),
+    video: Optional[Path] = typer.Option(None, "--video", help="Lecture video file to process directly"),
 ) -> None:
     settings = Settings()
 
@@ -113,6 +114,17 @@ def start(
     resolved_audio_source = audio_source if audio_source is not None else settings.audio_source
     resolved_monitor_index = monitor_index if monitor_index is not None else settings.monitor_index
     resolved_llm_mode = llm_mode if llm_mode is not None else settings.llm_mode
+    video_opt = option_value(video)
+    if video_opt is not None:
+        from lecturelens.cli.commands.offline import offline
+        offline(
+            video=Path(video_opt),
+            session=session or datetime.now().strftime("%Y-%m-%d_%H%M%S"),
+            course=course,
+            fps=None,
+            llm_mode=resolved_llm_mode
+        )
+        return
 
     try:
         validate_start_options(resolved_audio_source, resolved_llm_mode, mode)
@@ -347,10 +359,10 @@ def _process_is_alive(pid: int) -> bool:
 def stop(
     session: Optional[str] = typer.Option(None, "--session"),
     wait: bool = typer.Option(True, "--wait/--no-wait"),
-    timeout_seconds: float = typer.Option(300.0, "--timeout"),
+    timeout_seconds: Optional[float] = typer.Option(None, "--timeout"),
 ) -> None:
     settings = Settings()
-    if timeout_seconds <= 0:
+    if timeout_seconds is not None and timeout_seconds <= 0:
         fail("--timeout must be greater than 0 seconds (use --no-wait to return immediately).")
     session_id = resolve_session(settings, session)
     session_dir = ensure_session_exists(settings, session_id)
@@ -374,13 +386,13 @@ def stop(
     console.print(f"Shutdown requested for session {session_id}.")
     if not wait:
         return
-    deadline = time.monotonic() + timeout_seconds
-    # The agents are stopped by the process that owns the session, and the
-    # flag is set after that. So the agents being gone is the normal way
-    # a session ends, and the stop waits a little for the flag instead of
-    # giving up at once.
+    deadline = (
+        time.monotonic() + timeout_seconds
+        if (timeout_seconds is not None and timeout_seconds > 0)
+        else None
+    )
     agents_gone_since: Optional[float] = None
-    while time.monotonic() < deadline:
+    while deadline is None or time.monotonic() < deadline:
         if flag_exists(session_dir, SESSION_FINISHED_FLAG_NAME):
             console.print("[green]Session stopped.[/green]")
             display_session_output_summary(session_dir, console)

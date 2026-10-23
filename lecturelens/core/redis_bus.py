@@ -59,7 +59,7 @@ class RedisBus:
         retry_ttl_seconds: int = 86400,
         outbox_max_size: int = 1000,
         outbox_path: Optional[Path] = None,
-        backlog_drain_budget_seconds: float = 60.0,
+        backlog_drain_budget_seconds: float = 0.0,
         socket_connect_timeout: float = 5.0,
         socket_timeout: float = 30.0
     ) -> None:

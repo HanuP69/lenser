@@ -517,7 +517,11 @@ class GatewayServer:
                 await websocket.close()
                 return
 
-            await self.send_json(websocket, {"status": "authenticated", "session_id": session_id})
+            await self.send_json(websocket, {
+                "status": "authenticated",
+                "session_id": session_id,
+                "server_time": time.time()
+            })
 
             if is_subscriber:
                 if session_id in self.sessions:

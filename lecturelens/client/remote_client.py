@@ -365,7 +365,8 @@ async def stream_audio(
     websocket: Any,
     settings: Settings,
     stop_event: asyncio.Event,
-    spool: Optional[CaptureSpool] = None
+    spool: Optional[CaptureSpool] = None,
+    server_time_offset: float = 0.0
 ) -> None:
     source = build_block_source(settings)
     try:
@@ -390,7 +391,7 @@ async def stream_audio(
             for chunk in segmenter.push(block, time.monotonic() - started):
                 wav_bytes = convert_numpy_to_wav_bytes(chunk.samples, settings.mic_sample_rate)
                 cap_id = uuid.uuid4().hex
-                msg_text = encode_message("audio", "wav_b64", wav_bytes, time.time(), capture_id=cap_id)
+                msg_text = encode_message("audio", "wav_b64", wav_bytes, time.time() + server_time_offset, capture_id=cap_id)
                 if spool is not None:
                     try:
                         await spool.append(cap_id, msg_text)
@@ -415,7 +416,8 @@ async def stream_screen(
     websocket: Any,
     settings: Settings,
     stop_event: asyncio.Event,
-    spool: Optional[CaptureSpool] = None
+    spool: Optional[CaptureSpool] = None,
+    server_time_offset: float = 0.0
 ) -> None:
     gate = SlideChangeGate(
         settings.slide_diff_threshold,
@@ -435,7 +437,7 @@ async def stream_screen(
             )
             gate_accepted = await run_in_thread_pool(gate.evaluate, frame.thumbnail, time.monotonic())
             if gate_accepted:
-                captured_at = time.time()
+                captured_at = time.time() + server_time_offset
                 png_bytes = await run_in_thread_pool(encode_frame_as_png, frame)
                 cap_id = uuid.uuid4().hex
                 msg_text = encode_message("screen", "png_b64", png_bytes, captured_at, capture_id=cap_id)
@@ -464,7 +466,7 @@ async def connect_and_auth(
     api_key: Optional[str],
     session_id: str,
     stop_event: asyncio.Event
-) -> tuple[Any, Any]:
+) -> tuple[Any, Any, Optional[float]]:
     from websockets import connect
     ctx = connect(server_url, max_size=max_bytes)
     entered = False
@@ -477,7 +479,12 @@ async def connect_and_auth(
         reply = json.loads(raw_reply)
         if reply.get("status") != "authenticated":
             raise PermissionError(str(reply))
-        return ctx, socket
+        server_time = reply.get("server_time")
+        if isinstance(server_time, (int, float)) and not isinstance(server_time, bool):
+            server_time = float(server_time)
+        else:
+            server_time = None
+        return ctx, socket, server_time
     except BaseException:
         if entered:
             try:
@@ -526,20 +533,26 @@ async def run_remote_client(
         tasks.append(stop_watcher)
 
         try:
-            audio_ctx, audio_socket = await connect_and_auth(
+            audio_ctx, audio_socket, audio_server_time = await connect_and_auth(
                 server_url, settings.gateway_max_message_bytes, api_key, session_id, stop_event
             )
             contexts.append(audio_ctx)
+            audio_offset = (audio_server_time - time.time()) if audio_server_time is not None else 0.0
 
             if use_audio:
-                tasks.append(asyncio.create_task(stream_audio(audio_socket, settings, session_stop_event, spool=audio_spool)))
+                tasks.append(asyncio.create_task(
+                    stream_audio(audio_socket, settings, session_stop_event, spool=audio_spool, server_time_offset=audio_offset)
+                ))
 
             if use_screen:
-                screen_ctx, screen_socket = await connect_and_auth(
+                screen_ctx, screen_socket, screen_server_time = await connect_and_auth(
                     server_url, settings.gateway_max_message_bytes, api_key, session_id, stop_event
                 )
                 contexts.append(screen_ctx)
-                tasks.append(asyncio.create_task(stream_screen(screen_socket, settings, session_stop_event, spool=screen_spool)))
+                screen_offset = (screen_server_time - time.time()) if screen_server_time is not None else 0.0
+                tasks.append(asyncio.create_task(
+                    stream_screen(screen_socket, settings, session_stop_event, spool=screen_spool, server_time_offset=screen_offset)
+                ))
 
             if len(tasks) == 1 and tasks[0] is stop_watcher:
                 return

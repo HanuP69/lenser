@@ -477,10 +477,10 @@ def run_shutdown(monitor: AgentMonitor, session_dir: Path, planned_agents: list[
         if name in CAPTURE_AGENT_NAMES or name == "gateway":
             capture_names.append(name)
     phases: list[tuple[list[str], str, Optional[float]]] = [
-        (capture_names, STOP_FLAG_NAME, 30.0),
-        (["sync_agent"], SYNC_STOP_FLAG_NAME, 60.0),
-        (["structuring_agent"], FINALIZE_FLAG_NAME, 300.0),
-        (["persister"], PERSISTER_STOP_FLAG_NAME, 30.0)
+        (capture_names, STOP_FLAG_NAME, None),
+        (["sync_agent"], SYNC_STOP_FLAG_NAME, None),
+        (["structuring_agent"], FINALIZE_FLAG_NAME, None),
+        (["persister"], PERSISTER_STOP_FLAG_NAME, None)
     ]
     unfinished: list[str] = []
     try:

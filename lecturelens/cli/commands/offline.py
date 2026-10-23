@@ -6,7 +6,7 @@ from typing import Optional
 
 import typer
 
-from lecturelens.cli.app import app, console, fail, logger
+from lecturelens.cli.app import app, console, fail, logger, option_value
 from lecturelens.config.settings import Settings
 from lecturelens.core.offline_pipeline import run_offline_video
 from lecturelens.core.validation import is_valid_session_id
@@ -23,7 +23,8 @@ def offline(
     ),
     session: str = typer.Option(..., "--session", help="The name of the session folder."),
     course: Optional[str] = typer.Option(None, "--course", help="Overrides the course name for the prompts."),
-    fps: Optional[float] = typer.Option(None, "--fps", help="Frames per second sampled from the video.")
+    fps: Optional[float] = typer.Option(None, "--fps", help="Frames per second sampled from the video."),
+    llm_mode: Optional[str] = typer.Option(None, "--llm-mode", help="local, hybrid or cloud")
 ) -> None:
     """Notes from a recording, without any live devices.
 
@@ -35,6 +36,9 @@ def offline(
     settings = Settings()
     if course:
         settings.course_name = course
+    resolved_llm_mode = option_value(llm_mode)
+    if resolved_llm_mode:
+        settings.llm_mode = resolved_llm_mode
     if not is_valid_session_id(session):
         fail(f"Invalid session name: {session}")
 

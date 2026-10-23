@@ -49,13 +49,13 @@ return redis.call('ZCARD', key)
 class RedisRateLimiter:
     def __init__(
         self,
-        redis_client: redis.Redis,
+        redis_client: Optional[redis.Redis],
         provider_name: str,
         max_requests_per_window: int = 60,
         window_seconds: int = 60,
         time_provider: Optional[Callable[[], float]] = None
     ) -> None:
-        self.redis_client: redis.Redis = redis_client
+        self.redis_client: Optional[redis.Redis] = redis_client
         self.provider_name: str = provider_name
         self.max_requests_per_window: int = max_requests_per_window
         self.window_seconds: int = window_seconds
@@ -65,6 +65,8 @@ class RedisRateLimiter:
 
     def _script(self, source: str) -> object:
         """Register the Lua script once and reuse it."""
+        if self.redis_client is None:
+            return None
         script = self._scripts.get(source)
         if script is None:
             script = self.redis_client.register_script(source)
@@ -80,6 +82,8 @@ class RedisRateLimiter:
         return f"lecturelens:ratelimit:{self.provider_name}"
 
     async def is_allowed(self) -> bool:
+        if self.redis_client is None:
+            return True
         key_name = self.generate_window_key()
         now = float(self.time_provider())
         # The member has to be unique, two requests in the same millisecond
@@ -99,6 +103,8 @@ class RedisRateLimiter:
             return True
 
     async def get_current_count(self) -> int:
+        if self.redis_client is None:
+            return 0
         key_name = self.generate_window_key()
         now = float(self.time_provider())
         try:
@@ -122,12 +128,12 @@ class RedisRateLimiter:
 class RedisCircuitBreaker:
     def __init__(
         self,
-        redis_client: redis.Redis,
+        redis_client: Optional[redis.Redis],
         provider_name: str,
         failure_threshold: int = 5,
         cooldown_seconds: int = 60
     ) -> None:
-        self.redis_client: redis.Redis = redis_client
+        self.redis_client: Optional[redis.Redis] = redis_client
         self.provider_name: str = provider_name
         self.failure_threshold: int = failure_threshold
         self.cooldown_seconds: int = cooldown_seconds
@@ -139,6 +145,8 @@ class RedisCircuitBreaker:
         return f"lecturelens:breaker:{self.provider_name}:failures"
 
     async def is_open(self) -> bool:
+        if self.redis_client is None:
+            return False
         breaker_key = self.get_breaker_key()
         exists = await self.redis_client.get(breaker_key)
         if exists is not None:
@@ -146,12 +154,16 @@ class RedisCircuitBreaker:
         return False
 
     async def record_success(self) -> None:
+        if self.redis_client is None:
+            return
         failure_key = self.get_failure_key()
         breaker_key = self.get_breaker_key()
         await self.redis_client.delete(failure_key)
         await self.redis_client.delete(breaker_key)
 
     async def record_failure(self) -> None:
+        if self.redis_client is None:
+            return
         failure_key = self.get_failure_key()
         breaker_key = self.get_breaker_key()
         failure_count = await self.redis_client.incr(failure_key)
