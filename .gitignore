@@ -23,3 +23,4 @@ __pycache__/
 lecturelens.egg-info/
 
 eval/audio_pack/*.wav
+input_video/*.mp4
