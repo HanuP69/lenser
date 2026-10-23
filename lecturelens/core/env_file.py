@@ -7,6 +7,9 @@ asked the first time.
 
 from pathlib import Path
 from typing import Optional
+
+import dotenv
+
 from lecturelens.core.logging_setup import get_logger
 
 logger = get_logger("lecturelens.env_file")
@@ -34,37 +37,13 @@ def set_env_value(name: str, value: str, env_path: Optional[Path] = None) -> boo
     target = env_path if env_path is not None else find_env_file()
     if target is None:
         target = Path.cwd() / ".env"
-
-    lines: list[str] = []
-    if target.is_file():
-        try:
-            lines = target.read_text(encoding="utf-8").splitlines()
-        except OSError as error:
-            logger.warning("the .env file could not be read: %s", error)
-            return False
-
-    entry = f"{name}={_quote_env_value(value)}"
-    replaced = False
-    for index, line in enumerate(lines):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if stripped.split("=", 1)[0].strip() == name:
-            lines[index] = entry
-            replaced = True
-            break
-    if not replaced:
-        if lines and lines[-1].strip():
-            lines.append("")
-        lines.append(entry)
-
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        success, _, _ = dotenv.set_key(str(target), name, value, quote_mode="auto", encoding="utf-8")
+        return bool(success)
     except OSError as error:
         logger.warning("the .env file could not be written: %s", error)
         return False
-    return True
 
 
 def remove_env_value(name: str, env_path: Optional[Path] = None) -> bool:
@@ -73,27 +52,11 @@ def remove_env_value(name: str, env_path: Optional[Path] = None) -> bool:
     if target is None or not target.is_file():
         return False
     try:
-        lines = target.read_text(encoding="utf-8").splitlines()
-    except OSError as error:
-        logger.warning("the .env file could not be read: %s", error)
-        return False
-
-    kept: list[str] = []
-    removed = False
-    for line in lines:
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#") and stripped.split("=", 1)[0].strip() == name:
-            removed = True
-            continue
-        kept.append(line)
-    if not removed:
-        return False
-    try:
-        target.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        success, _ = dotenv.unset_key(str(target), name, quote_mode="always", encoding="utf-8")
+        return bool(success)
     except OSError as error:
         logger.warning("the .env file could not be written: %s", error)
         return False
-    return True
 
 
 def read_env_value(name: str, env_path: Optional[Path] = None) -> Optional[str]:
@@ -102,18 +65,9 @@ def read_env_value(name: str, env_path: Optional[Path] = None) -> Optional[str]:
     if target is None or not target.is_file():
         return None
     try:
-        lines = target.read_text(encoding="utf-8").splitlines()
+        return dotenv.get_key(str(target), name, encoding="utf-8")
     except OSError:
         return None
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if stripped.split("=", 1)[0].strip() == name:
-            parts = stripped.split("=", 1)
-            if len(parts) == 2:
-                return parts[1].strip().strip('"').strip("'")
-    return None
 
 
 def env_file_location() -> str:
@@ -122,26 +76,3 @@ def env_file_location() -> str:
     if target is None:
         return str(Path.cwd() / ".env")
     return str(target)
-
-
-def _quote_env_value(value: str) -> str:
-    """A value written so a read of the file comes back with the same value.
-
-    After a # in an unquoted value every reader sees a comment, so a
-    window title like "Slides #1" came back as "Slides" or as nothing at
-    all. The value is quoted when it holds any of the characters that a
-    reader treats specially.
-    """
-    if value == "":
-        return '""'
-    needs_quotes = any(character in value for character in ("#", " ", "\t", "=")) or value != value.strip()
-    if not needs_quotes:
-        return value
-    if '"' not in value:
-        return f'"{value}"'
-    if "'" not in value:
-        return f"'{value}'"
-    # A value with both kinds of quote cannot be wrapped in either. The
-    # double quotes are given up on: the value stays readable, which is
-    # better than a value that later reads as a different one.
-    return f'"{value.replace(chr(34), "")}"'
