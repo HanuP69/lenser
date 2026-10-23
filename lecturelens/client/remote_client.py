@@ -467,8 +467,10 @@ async def connect_and_auth(
 ) -> tuple[Any, Any]:
     from websockets import connect
     ctx = connect(server_url, max_size=max_bytes)
-    socket = await wait_with_stop(ctx.__aenter__(), stop_event, timeout=10.0)
+    entered = False
     try:
+        socket = await wait_with_stop(ctx.__aenter__(), stop_event, timeout=10.0)
+        entered = True
         hello_payload = json.dumps({"type": "hello", "api_key": api_key, "session_id": session_id})
         await wait_with_stop(socket.send(hello_payload), stop_event, timeout=5.0)
         raw_reply = await wait_with_stop(socket.recv(), stop_event, timeout=10.0)
@@ -477,10 +479,11 @@ async def connect_and_auth(
             raise PermissionError(str(reply))
         return ctx, socket
     except BaseException:
-        try:
-            await ctx.__aexit__(None, None, None)
-        except Exception:
-            pass
+        if entered:
+            try:
+                await ctx.__aexit__(None, None, None)
+            except Exception:
+                pass
         raise
 
 

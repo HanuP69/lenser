@@ -443,30 +443,6 @@ class ScreenAgent:
             return ""
         return str(path)
 
-    async def caption_figure_with_vision(
-        self,
-        crop_png: bytes,
-        fallback_caption: str = ""
-    ) -> str:
-        if self.llm_router is None or self.control.stop_requested():
-            return fallback_caption
-        prompt = (
-            "Provide a one-line concise title or caption (under 12 words) describing this diagram or chart. "
-            "Do not include quotes or formatting. Return only the caption."
-        )
-        try:
-            message = build_image_message(prompt, crop_png, "image/png")
-            response = await self.llm_router.ainvoke([message])
-            text = response_to_text(response).strip()
-            if text and not is_refusal_text(text):
-                cleaned = re.sub(r"[\r\n]+", " ", text).strip().strip('"\'')
-                if len(cleaned) > 160:
-                    cleaned = cleaned[:157].rstrip() + "..."
-                return cleaned
-        except Exception as error:
-            logger.debug("vision captioning for diagram failed: %s", error)
-        return fallback_caption
-
     def caption_of_the_figure(
         self,
         regions: list[Any],
@@ -583,15 +559,6 @@ class ScreenAgent:
         except Exception as error:
             logger.warning("the parts of the screen could not be found: %s", error)
             return []
-
-    async def run_ocr(self, png_bytes: bytes) -> str:
-        """Extract the text of a slide.
-
-        This runs a vision model, not a local OCR engine, so the name is
-        misleading. The local Tesseract configuration that used to sit next
-        to it was never referenced by anything.
-        """
-        return await self.run_vision_fallback(png_bytes)
 
     async def run_vision_fallback(
         self,

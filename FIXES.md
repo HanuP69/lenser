@@ -218,3 +218,11 @@ Physical blackboard and whiteboard lectures were failing to produce notes becaus
 1. Filled ground truth transcript pack for the chemistry lecture across all 10 half-minute segments. (`eval/audio_pack/chem_truth.jsonl`)
 2. Added repetition loop and number chain filtering to hallucination detection. (`agents/audio_agent.py`)
 3. Wired faster-whisper `repetition_penalty`, `no_repeat_ngram_size`, `initial_prompt`, and tuned VAD speech padding into transcription. (`agents/audio_agent.py`, `config/settings.py`)
+
+# Fix log (v0.11.0, improvement plan Phase 6 — code reduction, dead code removal, and client shutdown hardening)
+
+1. Removed dead and unused code with zero callers across the codebase: eliminated caption_figure_with_vision and 
+un_ocr from lecturelens/agents/screen_agent.py, WindowCapture.describe from lecturelens/core/window_capture.py, and AgentProcessManager.stop_agent from lecturelens/core/process_manager.py.
+2. Declared undeclared opencv-python>=4.8 dependency in pyproject.toml.
+3. Eliminated websocket context leaks on cancellation during client handshake: connect_and_auth safely tracks context entry before awaiting socket.recv(), ensuring clean __aexit__ teardown on shutdown. (client/remote_client.py)
+4. Hardened remote client shutdown tests with deterministic event synchronization. (	ests/test_gateway.py)

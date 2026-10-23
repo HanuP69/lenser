@@ -666,11 +666,14 @@ class TestRemoteClientShutdown(unittest.IsolatedAsyncioTestCase):
     async def test_remote_client_terminates_immediately_on_cancellation(self) -> None:
         from lecturelens.client.remote_client import run_remote_client
 
+        entered_recv = asyncio.Event()
+
         class HangingSocket:
             async def send(self, data: str) -> None:
                 pass
 
             async def recv(self) -> str:
+                entered_recv.set()
                 await asyncio.sleep(60.0)
                 return "{}"
 
@@ -699,7 +702,7 @@ class TestRemoteClientShutdown(unittest.IsolatedAsyncioTestCase):
                     stop_event=None
                 )
             )
-            await asyncio.sleep(0.05)
+            await asyncio.wait_for(entered_recv.wait(), timeout=5.0)
             task.cancel()
             start_t = time.monotonic()
             await asyncio.gather(task, return_exceptions=True)

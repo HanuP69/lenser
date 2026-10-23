@@ -333,9 +333,5 @@ class AgentProcessManager:
                 except subprocess.TimeoutExpired:
                     logger.error("agent %s did not die after kill", agent_name)
 
-    def stop_agent(self, agent_name: str) -> None:
-        self.terminate_agent(agent_name)
-        self.close_log_handle(agent_name)
-
 
 AgentMonitor = AgentProcessManager

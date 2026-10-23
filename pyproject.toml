@@ -21,6 +21,7 @@ dependencies = [
     # Video mode decodes a recorded lecture file with PyAV, so the audio
     # track and the frames come without any external capture.
     "av>=12",
+    "opencv-python>=4.8",
     "websockets>=12.0",
     "psycopg[binary]>=3.1.0",
     # Required by the default `lecturelens start` flow: the structuring agent

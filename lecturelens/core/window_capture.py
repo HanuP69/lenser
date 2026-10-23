@@ -64,13 +64,6 @@ class WindowInfo:
     def bottom(self) -> int:
         return self.top + self.height
 
-    def describe(self) -> str:
-        state = "minimized" if self.is_minimized else "visible"
-        return (
-            f"{self.title!r} - {self.width}x{self.height} at "
-            f"({self.left}, {self.top}) [{state}]"
-        )
-
 
 class WindowCaptureUnavailable(RuntimeError):
     """The windows of the desktop cannot be listed or captured."""
