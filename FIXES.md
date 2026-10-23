@@ -197,4 +197,24 @@ A recorded lecture file could not be turned into notes; it had to be played on a
 ## Tests
 7. The synthetic clip of the tests is written with PyAV itself — mpeg4 and aac — so the tests run against the real shape of file. They cover the decode primitives (frame times on the video clock, the block energy pattern, the probe), the full run through the agents into notes with a stub structuring router and a canned whisper, and the gate accepting video time the way the live polls settle. 626 tests pass. (`tests/test_offline_mode.py`)
 
-Loose end: the improvement plan also names a JEE clip for acceptance; it is not in the repository yet, so that run is still pending the file.
+# Fix log (v0.8.0, improvement plan Phase 3 — chalkboard and whiteboard reading)
+
+Physical blackboard and whiteboard lectures were failing to produce notes because classroom room embedding similarity caused the slide change gate to drop 19 out of 20 board frames, and document OCR only saw window chrome text.
+
+1. Board surface detection classifies green chalkboards, slate chalkboards, and whiteboards. (`core/handwriting.py`)
+2. Slide change gate bypasses room embedding similarity threshold when a board surface is detected, allowing settled handwritten board states to be accepted. (`core/image_utils.py`)
+3. Window chrome and video player lines are filtered from OCR text on board surfaces. (`core/handwriting.py`, `agents/screen_agent.py`)
+4. Settled board frames schedule background multimodal transcription with `BOARD_VISION_PROMPT` for LaTeX chemical and mathematical expressions. (`agents/screen_agent.py`)
+5. Regression test suite covering board surface classification, wipe detection, and gate settling. (`tests/test_board_handwriting.py`)
+
+# Fix log (v0.9.0, improvement plan Phase 4 — codebase cleanup and dependency simplification)
+
+1. Centralized duplicate `sha256_of_file` helpers into `lecturelens.utils.hashing`. (`utils/hashing.py`, `core/layout_model.py`, `core/vision_embedder.py`)
+2. Replaced hand-rolled `.env` parsing across `core/env_file.py` and `router/llm_router.py` with standard `python-dotenv`.
+3. Cleaned duplicate dependencies and removed unneeded `typing-extensions` from `pyproject.toml`.
+
+# Fix log (v0.10.0, improvement plan Phase 5 — audio transcription optimization)
+
+1. Filled ground truth transcript pack for the chemistry lecture across all 10 half-minute segments. (`eval/audio_pack/chem_truth.jsonl`)
+2. Added repetition loop and number chain filtering to hallucination detection. (`agents/audio_agent.py`)
+3. Wired faster-whisper `repetition_penalty`, `no_repeat_ngram_size`, `initial_prompt`, and tuned VAD speech padding into transcription. (`agents/audio_agent.py`, `config/settings.py`)
