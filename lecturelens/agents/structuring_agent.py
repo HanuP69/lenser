@@ -729,7 +729,8 @@ def build_running_context(
     previous: str,
     summary: str,
     definitions: list[dict[str, str]],
-    key_points: list[str]
+    key_points: list[str],
+    max_lines: int = 50
 ) -> str:
     """The context of the next batch, built by counting, not by asking.
 
@@ -777,11 +778,17 @@ def build_running_context(
         for point in points:
             lines.append(f"- {point}")
     if not lines:
-        # Nothing new was named. Keeping the old context trimmed beats
-        # replacing it with empty, because the next section still talks
-        # about the lecture before it.
-        return truncate_text(previous or "", RUNNING_CONTEXT_TARGET)
+        text = truncate_text(previous or "", RUNNING_CONTEXT_TARGET)
+        if max_lines > 0:
+            split_lines = text.splitlines()
+            if len(split_lines) > max_lines:
+                text = "\n".join(split_lines[-max_lines:])
+        return text
     text = "\n".join(lines)
+    if max_lines > 0:
+        split_lines = text.splitlines()
+        if len(split_lines) > max_lines:
+            text = "\n".join(split_lines[-max_lines:])
     if len(text) > RUNNING_CONTEXT_TARGET:
         text = text[:RUNNING_CONTEXT_TARGET - 3].rstrip() + "..."
     return text
@@ -997,7 +1004,12 @@ class StructuringAgent:
 
     def save_state(self, running_context: str, timeline_byte_offset: int, overlap_entries: list[dict[str, Any]]) -> None:
         max_context = self.settings.context_max_characters
+        max_lines = getattr(self.settings, "context_max_lines", 0)
         trimmed_context = running_context
+        if max_lines > 0:
+            lines = trimmed_context.splitlines()
+            if len(lines) > max_lines:
+                trimmed_context = "\n".join(lines[-max_lines:])
         if max_context > 0 and len(trimmed_context) > max_context:
             trimmed_context = trimmed_context[-max_context:]
         payload = {
@@ -1381,8 +1393,9 @@ class StructuringAgent:
                 "concept_tags": [],
             }
         notes_text = await self._rewrite_latex_if_needed(notes_text)
+        max_lines = int(getattr(self.settings, "context_max_lines", 50))
         new_context = build_running_context(
-            running_context, notes_text, structured["definitions"], structured["key_points"]
+            running_context, notes_text, structured["definitions"], structured["key_points"], max_lines=max_lines
         )
         return {
             "summary": notes_text,
@@ -1812,6 +1825,11 @@ class StructuringAgent:
 
         new_context = str(result_state.get("running_context", running_context))
         max_context = self.settings.context_max_characters
+        max_lines = getattr(self.settings, "context_max_lines", 0)
+        if max_lines > 0:
+            lines = new_context.splitlines()
+            if len(lines) > max_lines:
+                new_context = "\n".join(lines[-max_lines:])
         if max_context > 0 and len(new_context) > max_context:
             new_context = new_context[-max_context:]
         self.save_state(new_context, batch.end_offset, next_overlap)

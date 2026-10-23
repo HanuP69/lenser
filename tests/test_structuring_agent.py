@@ -376,6 +376,15 @@ class TestStructuringBasics(StructuringTestBase):
         self.assertLessEqual(len(returned_context), 10)
         self.assertEqual(len(agent.load_state()["running_context"]), len(returned_context))
 
+    async def test_returned_running_context_respects_max_lines(self) -> None:
+        self.settings.context_max_lines = 2
+        agent = self.make_agent()
+        batches = agent.read_pending_batches()
+        multi_line_context = "Line 1\nLine 2\nLine 3\nLine 4"
+        returned_context = await agent.process_single_batch(batches[0], multi_line_context)
+        self.assertLessEqual(len(returned_context.splitlines()), 2)
+        self.assertEqual(agent.load_state()["running_context"], returned_context)
+
 
 class TestStructuringRestartAndIdempotency(StructuringTestBase):
     async def test_restart_does_not_duplicate_notes(self) -> None:

@@ -138,6 +138,7 @@ class Settings(BaseSettings):
     # provider says that the message is too long.
     max_slice_characters: int = Field(default=6000)
     context_max_characters: int = Field(default=4000)
+    context_max_lines: int = Field(default=50)
     correlation_window_seconds: float = Field(default=5.0)
     correlation_active_seconds: float = Field(default=600.0)
     correlation_lead_seconds: float = Field(default=3.0)
