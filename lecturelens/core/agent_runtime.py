@@ -233,6 +233,12 @@ def build_runtime_context(
         raise ValueError(f"invalid session id: {session_id}")
 
     session_dir = settings.create_session_directories(session_id)
+    # Every model call of this process is accounted into the session's
+    # logs, one line of JSON per call. The report in eval/ reads the
+    # file back to compare the cost of one phase of the plan with
+    # another.
+    from lecturelens.router import usage as router_usage
+    router_usage.set_sink(session_dir / "logs" / "llm_usage.jsonl")
     session_clock = SessionClock.load_or_create(session_dir / "clock.json")
     comp = agent_name or "runtime"
     redis_bus = create_redis_bus(

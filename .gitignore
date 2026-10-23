@@ -21,3 +21,5 @@ __pycache__/
 *.pyc
 .venv/
 lecturelens.egg-info/
+
+eval/audio_pack/*.wav

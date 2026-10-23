@@ -13,6 +13,7 @@ from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
 from lecturelens.config.settings import Settings
+from lecturelens.router.usage import stage as usage_stage
 from lecturelens.core.agent_runtime import (
     AgentControl,
     FINALIZE_FLAG_NAME,
@@ -451,9 +452,12 @@ def latex_result_is_usable(original: str, rewritten: str) -> bool:
 
 
 def create_structuring_graph(llm_router: Any, enforce_latex: bool = True) -> Any:
-    async def call_llm(prompt: str) -> str:
-        response = await llm_router.ainvoke([HumanMessage(content=prompt)])
-        return response_to_text(response)
+    async def call_llm(prompt: str, stage_name: str = "") -> str:
+        # The stage name travels with the call into the usage account, so
+        # the report can say which piece of the work spent the tokens.
+        with usage_stage(stage_name):
+            response = await llm_router.ainvoke([HumanMessage(content=prompt)])
+            return response_to_text(response)
 
     async def group_correlated_events_node(state: StructuringState) -> dict[str, Any]:
         slice_entries = state.get("timeline_slice", [])
@@ -514,7 +518,7 @@ PREVIOUS CONTEXT:
 CURRENT LECTURE EVENTS:
 {formatted_slice}
 """
-        summary_text = await call_llm(prompt)
+        summary_text = await call_llm(prompt, "summarize")
         return {"summary": summary_text}
 
     async def enforce_latex_node(state: StructuringState) -> dict[str, Any]:
@@ -538,7 +542,8 @@ CURRENT LECTURE EVENTS:
             # together with str.format, which would read {Index} as a
             # field and fail.
             rewritten = await call_llm(
-                LATEX_ENFORCEMENT_PROMPT.replace("%%SUMMARY%%", summary_text)
+                LATEX_ENFORCEMENT_PROMPT.replace("%%SUMMARY%%", summary_text),
+                "latex"
             )
         except Exception as error:
             logger.warning("the latex pass failed, the notes are kept as they are: %s", error)
@@ -569,7 +574,7 @@ LECTURE SUMMARY:
   {{"term": "Term Name", "definition": "Clear concise academic definition."}}
 ]
 """
-        raw_output = await call_llm(prompt)
+        raw_output = await call_llm(prompt, "definitions")
         parsed = extract_json_payload(raw_output)
         definitions: list[dict[str, str]] = []
         if isinstance(parsed, list):
@@ -596,7 +601,7 @@ LECTURE SUMMARY:
 
 ["Action item 1", "Action item 2"]
 """
-        raw_output = await call_llm(prompt)
+        raw_output = await call_llm(prompt, "action_items")
         parsed = extract_json_payload(raw_output)
         action_items: list[str] = []
         if isinstance(parsed, list):
@@ -617,7 +622,7 @@ Respond strictly in valid JSON format as a list of strings:
 LECTURE SUMMARY:
 {summary_text}
 """
-        raw_output = await call_llm(prompt)
+        raw_output = await call_llm(prompt, "key_points")
         parsed = extract_json_payload(raw_output)
         key_points: list[str] = []
         if isinstance(parsed, list):
@@ -641,7 +646,7 @@ EARLIER CONTEXT:
 NEW NOTES:
 {summary_text}
 """
-        compressed = await call_llm(prompt)
+        compressed = await call_llm(prompt, "compress")
         return {"running_context": compressed}
 
     graph_builder = StateGraph(StructuringState)

@@ -27,6 +27,7 @@ from lecturelens.core.logging_setup import get_logger
 from lecturelens.core.redis_bus import RedisBus
 from lecturelens.core.vision_embedder import get_shared_vision_embedder
 from lecturelens.router.messages import build_image_message, response_to_text
+from lecturelens.router.usage import stage as usage_stage
 from lecturelens.schemas.events import SlideCaptured
 
 logger = get_logger("lecturelens.screen_agent")
@@ -597,7 +598,11 @@ class ScreenAgent:
         message = build_image_message(SLIDE_VISION_PROMPT, png_bytes, "image/png")
         for attempt in range(max_retries):
             try:
-                response = await self.llm_router.ainvoke([message])
+                # The reading of a screen by a vision model is the task
+                # the account names, so the report can tell it apart
+                # from the notes work.
+                with usage_stage("slide_vision"):
+                    response = await self.llm_router.ainvoke([message])
                 text = response_to_text(response).strip()
                 if is_refusal_text(text):
                     return ""

@@ -22,6 +22,33 @@ are.
 | `G_hinglish` | A lecture in Hindi and English together | The case the notes have to work in |
 | `H_handwriting` | A board written on by hand | That the reading of printed text cannot read it, and that this is known |
 
+## The truth by hand
+
+Two kinds of truth are filled by hand, because no machine answer may
+be the ground truth of a machine.
+
+- **The board.** `python eval/board_pack.py <clip> --count 20 --out
+  eval/board_pack/<name>` cuts a clip into frames spread over its time,
+  and leaves an empty `text` beside every frame in `truth.jsonl`. The
+  row is filled with what the board shows at that moment. The filled
+  pack is the ground truth of the reading of a board and of the board
+  states of Phase 3.
+- **The speech.** `python eval/audio_truth_pack.py <clip> --start 60
+  --seconds 300` pulls a window out as a 16 kHz mono wav and leaves a
+  row for every half a minute in `<name>_truth.jsonl`. The row is
+  filled with what was said in it. The filled pack is the ground truth
+  of the audio work (Phase 5).
+
+## The account of the model calls
+
+Every session keeps `logs/llm_usage.jsonl`, one line of JSON per try
+of one provider. The report reads it back:
+
+```bash
+python eval/usage_report.py output/<session>
+```
+
+
 ## How it is run
 
 ```bash

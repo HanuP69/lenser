@@ -2,6 +2,7 @@ import asyncio
 import os
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -12,6 +13,7 @@ from langchain_core.runnables import Runnable, RunnableLambda
 
 from lecturelens.core.circuit_breaker import RedisRateLimiter, RedisCircuitBreaker
 from lecturelens.core.logging_setup import get_logger
+from lecturelens.router import usage as router_usage
 
 logger = get_logger("lecturelens.router")
 
@@ -406,26 +408,58 @@ def tag_response_with_provider(response: Any, provider_name: str) -> Any:
     return response
 
 
+def model_display_name(model: Any) -> str:
+    """The name of the model behind a wrapper, as far as it tells."""
+    inner = model
+    models = getattr(inner, "models", None)
+    if isinstance(models, list) and models:
+        inner = models[0]
+    for attribute in ("model_name", "model"):
+        value = getattr(inner, attribute, None)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
 def wrap_model_with_circuit_breaker(
     model: BaseChatModel,
     provider_name: str,
     rate_limiter: RedisRateLimiter,
     circuit_breaker: RedisCircuitBreaker,
-    timeout_seconds: Optional[float] = None
+    timeout_seconds: Optional[float] = None,
+    task_type: str = "",
+    display_model: str = ""
 ) -> Any:
     async def invoke_guarded(messages: Any) -> Any:
+        entry_time = time.monotonic()
+
+        def refused(outcome: str) -> ProviderUnavailableError:
+            # The provider was not even asked. The try is still written
+            # down, because the burn of the chain of fallbacks is part
+            # of the cost that the measurement counts.
+            router_usage.record(
+                task_type, provider_name, outcome,
+                request_seconds=0.0,
+                total_seconds=time.monotonic() - entry_time,
+                model=display_model,
+            )
+            return ProviderUnavailableError(f"{outcome} for {provider_name}")
+
         try:
             breaker_open = await circuit_breaker.is_open()
             if breaker_open:
-                raise ProviderUnavailableError(f"circuit breaker open for {provider_name}")
+                raise refused("breaker_open")
             allowed = await rate_limiter.is_allowed()
             if not allowed:
-                raise ProviderUnavailableError(f"rate limit reached for {provider_name}")
+                raise refused("limited")
         except ProviderUnavailableError:
             raise
         except Exception as guard_error:
+            # The guard store is down. The provider is still tried, and
+            # the call itself is what gets recorded.
             logger.warning("guard store unavailable for %s: %s", provider_name, guard_error)
 
+        call_time = time.monotonic()
         try:
             if timeout_seconds is not None and timeout_seconds > 0:
                 result = await asyncio.wait_for(model.ainvoke(messages), timeout_seconds)
@@ -434,6 +468,16 @@ def wrap_model_with_circuit_breaker(
         except asyncio.CancelledError:
             raise
         except Exception as invocation_error:
+            total_seconds = time.monotonic() - entry_time
+            request_seconds = time.monotonic() - call_time
+            router_usage.record(
+                task_type, provider_name,
+                "limited" if is_rate_limit_error(invocation_error) else "failed",
+                request_seconds=request_seconds,
+                total_seconds=total_seconds,
+                model=display_model,
+                error=str(invocation_error),
+            )
             if is_configuration_error(invocation_error):
                 # A misconfigured model is not an outage, so the circuit
                 # breaker is left alone, but the chain has to move on to the
@@ -463,6 +507,15 @@ def wrap_model_with_circuit_breaker(
             await circuit_breaker.record_success()
         except Exception as guard_error:
             logger.warning("success not recorded for %s: %s", provider_name, guard_error)
+        input_tokens, output_tokens = router_usage.tokens_from_response(result)
+        router_usage.record(
+            task_type, provider_name, "ok",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            request_seconds=time.monotonic() - call_time,
+            total_seconds=time.monotonic() - entry_time,
+            model=display_model,
+        )
         return tag_response_with_provider(result, provider_name)
 
     return RunnableLambda(invoke_guarded)
@@ -542,7 +595,9 @@ def build_router_for_task(
             provider_name=provider_name,
             rate_limiter=rate_limiter,
             circuit_breaker=circuit_breaker,
-            timeout_seconds=timeout_val
+            timeout_seconds=timeout_val,
+            task_type=task_type,
+            display_model=model_display_name(base_model)
         )
         wrapped_models.append(wrapped)
 

@@ -147,3 +147,14 @@ Fourth review round. The notes have to be proper and every picture of a slide ha
 ## Lecture content is not thrown away
 8. The pending quarantine holds the entries of speech that risks to be off topic. When more than twenty of them came, the oldest one was dropped from everywhere — not into the notes and not into the quarantine either. It goes to the quarantine that the structuring agent writes to disk instead. (`core/drift_filter.py`)
 9. A deliberate rebuild left the quarantined entries of the run before it in the filter, and the first batch of the new run wrote them into the quarantine file of the new session. (`core/drift_filter.py`)
+
+# Fix log (v0.5.0, improvement plan Phase 0)
+
+The plan for the next rounds (fewer model calls, board capture, offline mode) is judged against numbers, and there were none. This round writes them down.
+
+## The account of every model call
+1. Every call through the router is written into the session's logs folder as one line of JSON: the provider, the piece of work (stage), the tokens read and written, how long the call took, and what became of the try. A provider that was refused by its own budget, or that the breaker had closed, is written down too — the burn of the fallback chain is part of the cost, and until now it was invisible. (`router/usage.py`, `router/llm_router.py`)
+2. The token counts are read from the three shapes the provider wrappers use (`usage_metadata`, `tokenUsage`, and the Google usage block), and a count that was never sent is left unknown instead of being counted as zero. (`router/usage.py`)
+3. Each ask of the structuring graph names its stage in the account (summarize, latex, definitions, action_items, key_points, compress), and the vision reading names its stage (slide_vision). This is how the report says which piece of the work spent the tokens. (`agents/structuring_agent.py`, `agents/screen_agent.py`)
+4. The report reads the sessions back and prints the tables: per provider and per stage, and an estimate of the requests one batch of notes takes (a silence longer than the batch gap ends a batch). `python eval/usage_report.py output/<session>` (`eval/usage_report.py`)
+5. Regression tests: the sink, the stage window, the totals, and every outcome of the guarded call (ok, limited, breaker open, failed) with their token counts. (`tests/test_router_usage.py`)
