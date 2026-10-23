@@ -2,6 +2,8 @@ from typing import Any, Optional
 
 import numpy as np
 
+from lecturelens.core.handwriting import detect_board_surface
+
 # The parts of the screen that are compared to find out where it
 # changed. More parts than the ones that decide whether it changed, so
 # that the part is found more closely.
@@ -36,6 +38,9 @@ def compute_block_similarities(
     """
     if first_gray.shape != second_gray.shape or first_gray.size == 0:
         return []
+    if first_gray.ndim == 3:
+        first_gray = first_gray.mean(axis=2).astype(np.uint8)
+        second_gray = second_gray.mean(axis=2).astype(np.uint8)
     grid_rows, grid_cols = grid
     height, width = first_gray.shape
     block_h = height // grid_rows
@@ -100,6 +105,9 @@ def changed_region(
     """
     if first_gray.shape != second_gray.shape or first_gray.size == 0:
         return None
+    if first_gray.ndim == 3:
+        first_gray = first_gray.mean(axis=2).astype(np.uint8)
+        second_gray = second_gray.mean(axis=2).astype(np.uint8)
     similarities = compute_block_similarities(first_gray, second_gray, grid)
     if not similarities:
         return None
@@ -165,6 +173,8 @@ def _exact_changed_box(
 
 
 def compute_difference_hash(gray_thumbnail: np.ndarray) -> int:
+    if gray_thumbnail.ndim == 3:
+        gray_thumbnail = gray_thumbnail.mean(axis=2).astype(np.uint8)
     height, width = gray_thumbnail.shape
     row_indices = np.linspace(0, height - 1, 8).astype(int)
     column_indices = np.linspace(0, width - 1, 9).astype(int)
@@ -232,8 +242,9 @@ class SlideChangeGate:
             self.settle_polls = 0
             return False
 
+        is_board, _ = detect_board_surface(thumbnail)
         current_embedding: Optional[np.ndarray] = None
-        if self.embedder is not None and (not hasattr(self.embedder, "is_available") or self.embedder.is_available()):
+        if not is_board and self.embedder is not None and (not hasattr(self.embedder, "is_available") or self.embedder.is_available()):
             current_embedding = self.embedder.embed(thumbnail)
             if current_embedding is not None and self.last_accepted_embedding is not None:
                 sim = self.embedder.similarity(self.last_accepted_embedding, current_embedding)

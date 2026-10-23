@@ -23,6 +23,7 @@ from lecturelens.core.image_utils import (
     hamming_distance
 )
 from lecturelens.core.drift_filter import is_refusal_text
+from lecturelens.core.handwriting import BOARD_VISION_PROMPT, detect_board_surface, filter_chrome_lines
 from lecturelens.core.logging_setup import get_logger
 from lecturelens.core.redis_bus import RedisBus
 from lecturelens.core.vision_embedder import get_shared_vision_embedder
@@ -592,16 +593,23 @@ class ScreenAgent:
         """
         return await self.run_vision_fallback(png_bytes)
 
-    async def run_vision_fallback(self, png_bytes: bytes, max_retries: int = 2) -> str:
+    async def run_vision_fallback(
+        self,
+        png_bytes: bytes,
+        max_retries: int = 2,
+        prompt: Optional[str] = None
+    ) -> str:
         if self.llm_router is None or self.control.stop_requested():
             return ""
-        message = build_image_message(SLIDE_VISION_PROMPT, png_bytes, "image/png")
+        vision_prompt = prompt or SLIDE_VISION_PROMPT
+        message = build_image_message(vision_prompt, png_bytes, "image/png")
         for attempt in range(max_retries):
             try:
                 # The reading of a screen by a vision model is the task
                 # the account names, so the report can tell it apart
                 # from the notes work.
-                with usage_stage("slide_vision"):
+                stage_name = "board_vision" if prompt == BOARD_VISION_PROMPT else "slide_vision"
+                with usage_stage(stage_name):
                     response = await self.llm_router.ainvoke([message])
                 text = response_to_text(response).strip()
                 if is_refusal_text(text):
@@ -647,6 +655,7 @@ class ScreenAgent:
         if revisited_number > 0 and revisited_number in self.slide_texts:
             extracted_text = self.slide_texts[revisited_number]
 
+        is_board, board_kind = detect_board_surface(thumbnail)
         regions = await self.find_the_parts(png_bytes)
         figure_path = ""
         figure_caption = ""
@@ -661,8 +670,13 @@ class ScreenAgent:
             )
 
         local = await self.read_text_locally(png_bytes, regions)
+        if is_board and local.get("lines"):
+            img_h, img_w = thumbnail.shape[:2]
+            clean_lines = filter_chrome_lines(local.get("lines", []), img_h, img_w)
+            local["lines"] = clean_lines
+            local["text"] = " ".join(str(line_item.get("text", "")) for line_item in clean_lines).strip()
         local_text = str(local.get("text", "")).strip()
-        if len(extracted_text.strip()) == 0 and len(local_text) > 0:
+        if len(extracted_text.strip()) == 0 and len(local_text) > 0 and not is_board:
             extracted_text = local_text
             self.control.increment_stat("slide_text_read_locally")
 
@@ -696,7 +710,7 @@ class ScreenAgent:
         )
 
         needs_text_extraction = (
-            len(extracted_text.strip()) == 0
+            (len(extracted_text.strip()) == 0 or is_board)
             # A revisited slide whose text was never stored is in the
             # same case as a slide never read before: the retake shows
             # the same screen, so the text is read from it. The slides
@@ -717,7 +731,8 @@ class ScreenAgent:
             self.schedule_text_extraction(
                 slide_number, image_path, capture_timestamp, difference_hash,
                 small_thumbnail, crop_png if crop_png is not None else png_bytes,
-                revisited_slide_number=revisited_number
+                revisited_slide_number=revisited_number,
+                is_board=is_board
             )
             self._pending_text_extractions += 1
             self.control.set_stat("slides_awaiting_text", self._pending_text_extractions)
@@ -738,12 +753,13 @@ class ScreenAgent:
         difference_hash: int,
         small_thumbnail: np.ndarray,
         png_bytes: bytes,
-        revisited_slide_number: int = 0
+        revisited_slide_number: int = 0,
+        is_board: bool = False
     ) -> None:
         task = asyncio.create_task(
             self.extract_and_publish_slide_text(
                 slide_number, image_path, capture_timestamp, difference_hash,
-                small_thumbnail, png_bytes, revisited_slide_number
+                small_thumbnail, png_bytes, revisited_slide_number, is_board
             )
         )
         self.retry_tasks.add(task)
@@ -767,11 +783,14 @@ class ScreenAgent:
         difference_hash: int,
         small_thumbnail: np.ndarray,
         png_bytes: bytes,
-        revisited_slide_number: int = 0
+        revisited_slide_number: int = 0,
+        is_board: bool = False
     ) -> None:
         """Read a slide in the background and publish it once.
 
-        Three things happen here, and all of them are done on the machine
+        The reading of a slide is divided into several steps. The free
+        ones that are easy to run on the machine are run before the
+        model is asked to read anything. Many of them are done on the machine
         where they are free:
 
         1. The parts of the screen are found: the text, the pictures and
@@ -794,6 +813,7 @@ class ScreenAgent:
         figure_path = fig_info.get("path", "")
         figure_caption = fig_info.get("caption", "")
         figure_id = fig_info.get("figure_id", "")
+        vision_prompt = BOARD_VISION_PROMPT if is_board else None
 
         if self.llm_router is not None:
             self.control.increment_stat("slide_text_needs_model")
@@ -803,12 +823,16 @@ class ScreenAgent:
                     await asyncio.sleep(delay_seconds)
                 if self.control.stop_requested():
                     return
-                recovered_text = await self.run_vision_fallback(png_bytes, max_retries=1)
+                recovered_text = await self.run_vision_fallback(
+                    png_bytes, max_retries=1, prompt=vision_prompt
+                )
                 if len(recovered_text.strip()) > 0:
                     break
                 try:
                     payload = await run_in_thread_pool(Path(image_path).read_bytes)
-                    recovered_text = await self.run_vision_fallback(payload, max_retries=1)
+                    recovered_text = await self.run_vision_fallback(
+                        payload, max_retries=1, prompt=vision_prompt
+                    )
                     if len(recovered_text.strip()) > 0:
                         break
                 except OSError:
