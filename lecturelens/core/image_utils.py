@@ -192,6 +192,61 @@ def hamming_distance(first_hash: int, second_hash: int) -> int:
     return bin(first_hash ^ second_hash).count("1")
 
 
+def compute_edge_count(image_array: np.ndarray) -> int:
+    if image_array is None or image_array.size == 0:
+        return 0
+    if image_array.ndim == 3:
+        if image_array.shape[2] == 4:
+            gray = image_array[:, :, :3].mean(axis=2).astype(np.uint8)
+        else:
+            gray = image_array.mean(axis=2).astype(np.uint8)
+    else:
+        gray = image_array
+    try:
+        import cv2
+        edges = cv2.Canny(gray, 50, 150)
+        return int(np.count_nonzero(edges))
+    except Exception:
+        diff_y = np.abs(gray[1:, :] - gray[:-1, :])
+        diff_x = np.abs(gray[:, 1:] - gray[:, :-1])
+        return int(np.count_nonzero(diff_y > 20) + np.count_nonzero(diff_x > 20))
+
+
+def is_content_building_on_top(
+    prev_text: str,
+    curr_text: str,
+    prev_edges: int,
+    curr_edges: int
+) -> tuple[bool, str]:
+    prev_clean = " ".join(prev_text.lower().split())
+    curr_clean = " ".join(curr_text.lower().split())
+
+    if len(prev_clean) < 6 and len(curr_clean) < 6:
+        if curr_edges >= int(prev_edges * 0.85):
+            return True, "diagram_edges_growing"
+        return False, "diagram_edges_dropped"
+
+    if len(prev_clean) < 6 and len(curr_clean) >= 6:
+        return True, "new_text_introduced"
+
+    if len(curr_clean) < int(len(prev_clean) * 0.60):
+        return False, "text_erased_len_drop"
+
+    if prev_clean in curr_clean or curr_clean.startswith(prev_clean[:min(len(prev_clean), 25)]):
+        return True, "substring_prefix_expansion"
+
+    import difflib
+    ratio = difflib.SequenceMatcher(None, prev_clean, curr_clean).ratio()
+    prev_words = set(prev_clean.split())
+    curr_words = set(curr_clean.split())
+    token_overlap = len(prev_words.intersection(curr_words)) / max(1, len(prev_words))
+
+    if ratio >= 0.60 or token_overlap >= 0.60:
+        return True, "fuzzy_text_match"
+
+    return False, "unrelated_content_change"
+
+
 class SlideChangeGate:
     def __init__(
         self,
@@ -210,6 +265,7 @@ class SlideChangeGate:
         self.similarity_threshold: float = similarity_threshold
         self.last_accepted: Optional[np.ndarray] = None
         self.last_accepted_embedding: Optional[np.ndarray] = None
+        self.last_accepted_edges: int = 0
         self.previous_poll: Optional[np.ndarray] = None
         self.last_accept_time: float = 0.0
         self.settle_polls: int = 0
@@ -277,6 +333,7 @@ class SlideChangeGate:
         else:
             self.last_changed_region = None
         self.last_accepted = thumbnail
+        self.last_accepted_edges = compute_edge_count(thumbnail)
         if embedding is not None:
             self.last_accepted_embedding = embedding
         elif self.embedder is not None:

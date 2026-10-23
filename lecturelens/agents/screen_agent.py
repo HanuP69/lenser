@@ -19,8 +19,10 @@ from lecturelens.core.image_utils import (
     SlideChangeGate,
     compute_changed_fraction,
     compute_difference_hash,
+    compute_edge_count,
     compute_spatial_block_similarity,
-    hamming_distance
+    hamming_distance,
+    is_content_building_on_top
 )
 from lecturelens.core.drift_filter import is_refusal_text
 from lecturelens.core.handwriting import BOARD_VISION_PROMPT, detect_board_surface, filter_chrome_lines
@@ -245,6 +247,11 @@ class ScreenAgent:
         self.vision_semaphore: asyncio.Semaphore = asyncio.Semaphore(1)
         self.last_board_phash: Optional[int] = None
         self.last_board_text: str = ""
+        self.current_slide_text: str = ""
+        self.current_slide_edges: int = 0
+        self.current_slide_emb: Optional[np.ndarray] = None
+        self.current_slide_number: int = 0
+        self.has_active_slide: bool = False
 
     def resolve_window_handle(self) -> Optional[int]:
         """Find the window that is recorded.
@@ -652,7 +659,7 @@ class ScreenAgent:
             local["lines"] = clean_lines
             local["text"] = " ".join(str(line_item.get("text", "")) for line_item in clean_lines).strip()
         local_text = str(local.get("text", "")).strip()
-        if len(extracted_text.strip()) == 0 and len(local_text) > 0 and not is_board:
+        if len(extracted_text.strip()) == 0 and len(local_text) > 0 and (not is_board or len(local_text) >= 12):
             extracted_text = local_text
             self.control.increment_stat("slide_text_read_locally")
 
@@ -860,23 +867,58 @@ class ScreenAgent:
         thumbnail = await run_in_thread_pool(
             build_thumbnail_from_png, png_bytes, self.settings.slide_thumbnail_width
         )
-        if enforce_gate:
-            # The gate is a rate limiter and must always use one clock base.
-            # The capture epoch is a wall-clock timestamp used for the event
-            # itself; feeding it into the gate froze slide capture for the
-            # rest of the session.
-            if gate_now is None:
-                # Live capture measures the wall of the recording session,
-                # so the monotonic clock is the default. Video mode passes
-                # the elapsed seconds of the file instead, once per frame,
-                # so every call feeds the gate the same video timeline.
-                gate_now = time.monotonic()
-            gate_accepted = await run_in_thread_pool(
-                self.gate.evaluate, thumbnail, gate_now
+        if not enforce_gate:
+            return await self.accept_png(png_bytes, thumbnail, capture_epoch)
+
+        if gate_now is None:
+            gate_now = time.monotonic()
+
+        gate_accepted = await run_in_thread_pool(
+            self.gate.evaluate, thumbnail, gate_now
+        )
+        if not gate_accepted:
+            return None
+
+        curr_edges = compute_edge_count(thumbnail)
+        curr_emb = self.vision_embedder.embed(thumbnail) if self.vision_embedder else None
+
+        if not self.has_active_slide:
+            event = await self.accept_png(png_bytes, thumbnail, capture_epoch)
+            self.has_active_slide = True
+            self.current_slide_number = self.slide_counter
+            self.current_slide_edges = curr_edges
+            self.current_slide_emb = curr_emb
+            local = await self.read_text_locally(png_bytes)
+            self.current_slide_text = str(local.get("text", "")).strip()
+            return event
+
+        sim = 1.0
+        if self.current_slide_emb is not None and curr_emb is not None:
+            sim = float(self.vision_embedder.similarity(self.current_slide_emb, curr_emb))
+
+        if sim >= 0.94:
+            local = await self.read_text_locally(png_bytes)
+            curr_text = str(local.get("text", "")).strip()
+            building, _ = is_content_building_on_top(
+                self.current_slide_text, curr_text, self.current_slide_edges, curr_edges
             )
-            if not gate_accepted:
+            if building:
+                image_path = str(self.slides_dir / f"slide_{self.current_slide_number:04d}.png")
+                await run_in_thread_pool(atomic_write_bytes, Path(image_path), png_bytes)
+                self.current_slide_edges = curr_edges
+                if len(curr_text) > 0:
+                    self.current_slide_text = curr_text
+                    self.slide_texts[self.current_slide_number] = curr_text
+                self.current_slide_emb = curr_emb
                 return None
-        return await self.accept_png(png_bytes, thumbnail, capture_epoch)
+
+        event = await self.accept_png(png_bytes, thumbnail, capture_epoch)
+        self.current_slide_number = self.slide_counter
+        self.current_slide_edges = curr_edges
+        self.current_slide_emb = curr_emb
+        local = await self.read_text_locally(png_bytes)
+        self.current_slide_text = str(local.get("text", "")).strip()
+        return event
 
     async def run(self) -> None:
         self.is_running = True
