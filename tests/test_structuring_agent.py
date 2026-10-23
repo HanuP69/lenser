@@ -4,13 +4,17 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any, Optional
-from unittest import mock
 
 from lecturelens.agents.structuring_agent import (
+    STRUCTURED_DELIMITER,
     StructuringAgent,
     StructuringBatchError,
+    build_running_context,
     extract_json_payload,
-    split_entries_into_batches
+    scrub_reasoning_chatter,
+    split_entries_into_batches,
+    split_notes_and_structured,
+    trim_prompt_groups
 )
 from lecturelens.config.settings import Settings
 from lecturelens.core.agent_runtime import FINALIZE_FLAG_NAME, set_flag
@@ -21,21 +25,90 @@ class MockRouter:
         self.prompts: list[str] = []
         self.fail = False
         self.definition_term = "Binary Search"
+        # When the structured block comes back broken, the repair call is
+        # expected to fix it, and the number of prompts says how many
+        # requests the batch took.
+        self.break_json = False
+        self.bare_math = False
+        # When the notes come back with the model's reasoning inside,
+        # the scrub has to take the self-talk out without a second ask.
+        self.leaky_notes = False
 
     async def ainvoke(self, messages: list) -> str:
         if self.fail:
             raise RuntimeError("llm unavailable")
         text = str(messages[0].content)
         self.prompts.append(text)
-        if "Extract all technical terms" in text:
-            return json.dumps([{"term": self.definition_term, "definition": "A search algorithm that runs in logarithmic time."}])
-        if "action items" in text:
-            return json.dumps(["Complete homework 3 by Friday."])
-        if "core key points" in text:
-            return json.dumps(["Binary search runs in O(log n).", "Requires sorted input."])
-        if "Compress the following" in text:
-            return "Binary search divides the search space in half."
-        return "## Binary Search\nBinary search is an efficient algorithm on sorted arrays."
+        if "CURRENT LECTURE EVENTS" in text:
+            # The one call per batch: the notes, then the delimiter, then
+            # the three lists of the structured block.
+            if self.leaky_notes and not self.bare_math:
+                # The shapes the live model actually leaked into the
+                # notes (the reasoning of the second batch), kept as a
+                # standing regression against the scrub.
+                notes = (
+                    "## Binary Search\n"
+                    "    Binary search is an efficient algorithm on sorted arrays.\n"
+                    "\n"
+                    "    *   `definitions`: [] (none new)\n"
+                    "    *   `action_items`: [\"Complete homework 3 by Friday.\"]\n"
+                    "\n"
+                    "*Self-Correction on LaTeX:* The prompt gives `$64.8\\%$` as an example.\n"
+                    "\n"
+                    "    Wait, looking at the transcript again: \"NETURE\" This looks like noise.\n"
+                    "\n"
+                    "*One more check on the Figure marker:*\n"
+                    "    The prompt says: \"The marker must appear once.\"\n"
+                    "\n"
+                    "*JSON check:*\n"
+                    "    `{\"definitions\": [], \"action_items\": [\"Do the thing\"]}`\n"
+                    "\n"
+                    "*Wait, is there math in the text?* No.\n"
+                    "\n"
+                    "    Let's double check the slide 2 transcript.\n"
+                    "    \"BEGIN TAPE Back to the spoken part.\"\n"
+                    "    Translation/Interpretation: \"Back to the spoken part.\"\n"
+                    "\n"
+                    "    Final check on formatting:\n"
+                    "    1. Markdown (##, bullets, paragraphs) - Yes.\n"
+                    "    2. ===NOTES_END=== - Yes.\n"
+                    "\n"
+                    "*Double check figure ID:* `fig_7e7af948fb072de6`. Correct.\n"
+                    "\n"
+                    "*Finalizing content:*\n"
+                    "## Binary Search\n"
+                    "    Binary search divides the search space in half."
+                )
+            else:
+                notes = (
+                    "## Hashing\nThe load factor is O(1) per lookup."
+                    if self.bare_math
+                    else "## Binary Search\nBinary search is an efficient algorithm on sorted arrays."
+                )
+            structured = (
+                {"definitions": [{"term": self.definition_term, "definition": "A search algorithm that runs in logarithmic time."}],
+                 "action_items": [],
+                 "key_points": []}
+                if self.bare_math else {
+                    "definitions": [{"term": self.definition_term, "definition": "A search algorithm that runs in logarithmic time."}],
+                    "action_items": ["Complete homework 3 by Friday."],
+                    "key_points": ["Binary search runs in O(log n).", "Requires sorted input."],
+                }
+            )
+            if self.break_json:
+                return f"{notes}\n{STRUCTURED_DELIMITER}\nnot json at all [<<<broken"
+            return f"{notes}\n\n{STRUCTURED_DELIMITER}\n\n{json.dumps(structured)}"
+        if "supposed to follow them came out broken" in text:
+            # The repair call: only the structured block is asked for.
+            return json.dumps({
+                "definitions": [{"term": self.definition_term, "definition": "A search algorithm that runs in logarithmic time."}],
+                "action_items": ["Complete homework 3 by Friday."],
+                "key_points": ["Binary search runs in O(log n)."]
+            })
+        if "Reply with the rewritten markdown only" in text:
+            # The latex pass: only the mathematics changes.
+            return "## Hashing\nThe load factor is $O(1)$ per lookup."
+        raise AssertionError(f"an unexpected call reached the router: {text[:90]!r}")
 
     def summary_prompts(self) -> list[str]:
         matching: list[str] = []
@@ -129,13 +202,13 @@ class TestStructuringBasics(StructuringTestBase):
         agent = self.make_agent()
         agent.max_batch_retries = 1
 
-        original_invoke = agent.graph.ainvoke
+        original_synthesis = agent.synthesis
 
-        async def empty_invoke(state: Any) -> dict:
-            result = await original_invoke(state)
+        async def empty_synthesis(entries: Any, overlap_entries: Any, context: str) -> dict:
+            result = await original_synthesis(entries, overlap_entries, context)
             return {**result, "summary": ""}
 
-        agent.graph.ainvoke = empty_invoke  # type: ignore[assignment]
+        agent.synthesis = empty_synthesis  # type: ignore[method-assign]
 
         # First attempt: the batch is retried, nothing is published and the
         # byte offset is not advanced.
@@ -166,13 +239,13 @@ class TestStructuringBasics(StructuringTestBase):
         agent = self.make_agent()
         agent.max_batch_retries = 1
 
-        original_invoke = agent.graph.ainvoke
+        original_synthesis = agent.synthesis
 
-        async def empty_invoke(state: Any) -> dict:
-            result = await original_invoke(state)
+        async def empty_synthesis(entries: Any, overlap_entries: Any, context: str) -> dict:
+            result = await original_synthesis(entries, overlap_entries, context)
             return {**result, "summary": ""}
 
-        agent.graph.ainvoke = empty_invoke  # type: ignore[assignment]
+        agent.synthesis = empty_synthesis  # type: ignore[method-assign]
 
         with self.assertRaises(StructuringBatchError):
             await agent.process_batch()
@@ -191,10 +264,10 @@ class TestStructuringBasics(StructuringTestBase):
             timeline_line(301.0, "transcript", "The definition of a binary search tree", ["definition"]),
         ])
 
-        async def failing_invoke(state: Any) -> dict:
+        async def failing_synthesis(entries: Any, overlap_entries: Any, context: str) -> dict:
             raise RuntimeError("llm is down")
 
-        agent.graph.ainvoke = failing_invoke  # type: ignore[assignment]
+        agent.synthesis = failing_synthesis  # type: ignore[method-assign]
 
         class FakeDrift:
             def __init__(self) -> None:
@@ -239,10 +312,10 @@ class TestStructuringBasics(StructuringTestBase):
         agent = self.make_agent()
         agent.max_batch_retries = 1
 
-        async def failing_invoke(state: Any) -> dict:
+        async def failing_synthesis(entries: Any, overlap_entries: Any, context: str) -> dict:
             raise RuntimeError("llm is down")
 
-        agent.graph.ainvoke = failing_invoke  # type: ignore[assignment]
+        agent.synthesis = failing_synthesis  # type: ignore[method-assign]
 
         with self.assertRaises(StructuringBatchError):
             await agent.process_batch()
@@ -271,10 +344,13 @@ class TestStructuringBasics(StructuringTestBase):
         agent = self.make_agent()
         await agent.process_batch()
         state = agent.load_state()
-        self.assertEqual(state["running_context"], "Binary search divides the search space in half.")
+        # The context is built by counting lines of the notes; the model
+        # is not asked for it any more.
+        self.assertTrue(state["running_context"].startswith("Topics so far:"))
+        self.assertIn("Binary Search", state["running_context"])
         self.write_lines([timeline_line(200.0, "transcript", "Next we discuss hashing.")])
         await agent.process_batch()
-        self.assertIn("Binary search divides the search space in half.", self.router.summary_prompts()[1])
+        self.assertIn("Binary Search", self.router.summary_prompts()[1])
 
     async def test_offset_advances_and_second_pass_is_a_no_op(self) -> None:
         agent = self.make_agent()
@@ -352,6 +428,139 @@ class TestStructuringLifecycle(StructuringTestBase):
         set_flag(self.session_dir, FINALIZE_FLAG_NAME)
         await asyncio.wait_for(agent.run(), timeout=20)
         self.assertIn("Binary Search", self.notes_text())
+
+
+class TestOneCallPerBatch(StructuringTestBase):
+    """The shape of Phase 1: one request per batch, two at the very most."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.write_lines([
+            timeline_line(100.0, "transcript", "Today we cover binary search.", [], "c1"),
+            timeline_line(101.0, "slide", "Binary Search: O(log n)", [], "c1", metadata={"slide_number": 1})
+        ])
+
+    async def test_one_call_carries_the_notes_and_the_lists(self) -> None:
+        agent = self.make_agent()
+        await agent.process_batch()
+        # One request for the whole batch: no definitions call, no action
+        # items call, no key points call, no compression call.
+        self.assertEqual(len(self.router.prompts), 1)
+        notes = self.notes_text()
+        self.assertIn("Binary Search", notes)
+        self.assertIn("**Action Items**", notes)
+        stream_name, segment = self.bus.published[0]
+        self.assertEqual(segment.definitions[0]["term"], "Binary Search")
+        self.assertEqual(segment.key_points, ["Binary search runs in O(log n).", "Requires sorted input."])
+
+    async def test_a_broken_structured_block_costs_one_repair(self) -> None:
+        self.router.break_json = True
+        agent = self.make_agent()
+        await agent.process_batch()
+        # The notes call, then exactly one repair for the lost block.
+        self.assertEqual(len(self.router.prompts), 2)
+        self.assertIn("Binary Search", self.notes_text())
+        _, segment = self.bus.published[0]
+        self.assertEqual(segment.definitions[0]["term"], "Binary Search")
+        # The action items come out of the repaired block and land in the
+        # section of the notes.
+        self.assertIn("Complete homework 3", segment.content)
+
+    async def test_an_empty_batch_costs_no_call_at_all(self) -> None:
+        other = self.temp_dir.name + "/empty_test"
+        settings = Settings()
+        settings.output_dir = Path(other)
+        session_dir = settings.create_session_directories("empty_struct")
+        with open(session_dir / "timeline.jsonl", "a", encoding="utf-8", newline="\n") as handle:
+            handle.write(timeline_line(1.0, "transcript", ""))
+            handle.write(timeline_line(2.0, "slide", "", [], metadata={"slide_number": 1}))
+        router = MockRouter()
+        agent = StructuringAgent(
+            settings=settings,
+            session_id="empty_struct",
+            llm_router=router,
+            redis_bus=MockRedisBus()
+        )
+        await agent.process_batch()
+        self.assertEqual(len(router.prompts), 0)
+        self.assertEqual(agent.load_state()["timeline_byte_offset"], (session_dir / "timeline.jsonl").stat().st_size)
+        self.assertEqual(agent.control.stats.get("empty_batches_skipped"), 1)
+        self.assertFalse((session_dir / "notes.md").exists())
+
+    async def test_the_latex_pass_runs_only_when_the_checks_fail(self) -> None:
+        agent = self.make_agent()
+        await agent.process_batch()
+        # The mathematics is already inside the dollar signs is not the case
+        # here: there is no mathematics at all, so no pass was staged.
+        self.assertEqual(len(self.router.prompts), 1)
+
+        self.router.bare_math = True
+        self.router.prompts.clear()
+        other = self.make_agent()
+        self.write_lines([timeline_line(150.0, "transcript", "Now we cover hashing.", [], "c2")])
+        await other.process_batch()
+        self.assertEqual(len(self.router.prompts), 2)
+        self.assertIn("$O(1)$", self.notes_text())
+
+    async def test_the_model_s_self_talk_never_reaches_the_notes(self) -> None:
+        self.router.leaky_notes = True
+        agent = self.make_agent()
+        await agent.process_batch()
+        self.assertEqual(len(self.router.prompts), 1)
+        notes = self.notes_text()
+        # The clean substance stays.
+        self.assertIn("## Binary Search", notes)
+        self.assertIn("divides the search space in half.", notes)
+        self.assertIn("**Action Items**", notes)
+        # Every shape of the reasoning that the live model leaked is gone.
+        self.assertNotIn("Self-Correction", notes)
+        self.assertNotIn("`definitions`:", notes)
+        self.assertNotIn("`action_items`:[", notes.replace(" ", ""))
+        self.assertNotIn("Wait,", notes)
+        self.assertNotIn("One more check", notes)
+        self.assertNotIn("The prompt says", notes)
+        self.assertNotIn("JSON check", notes)
+        self.assertNotIn("double check", notes)
+        self.assertNotIn("Translation/Interpretation", notes)
+        self.assertNotIn("Final check on formatting", notes)
+        self.assertNotIn("- Yes.", notes)
+        self.assertNotIn("Double check figure ID", notes)
+        self.assertNotIn("Finalizing content", notes)
+        self.assertNotIn("NOTES_END", notes)
+        # The lists behind the delimiter were read as usual.
+        _, segment = self.bus.published[0]
+        self.assertEqual(segment.definitions[0]["term"], "Binary Search")
+
+    async def test_the_prompt_text_is_trimmed_by_counting(self) -> None:
+        self.router.prompts.clear()
+        self.router.break_json = False
+        self.write_lines([
+            # The same sentence handed over twice under two groups.
+            timeline_line(300.0, "transcript", "We begin with caching today.", [], "c1"),
+            timeline_line(301.0, "transcript", "We begin with caching today.", [], "c2"),
+            # Filler plus overlapping chunks of speech.
+            timeline_line(303.0, "transcript", "umm umm let me explain the idea again.", [], "c3"),
+            timeline_line(304.0, "transcript", "the idea again in a table.", [], "c4"),
+            # A revisited slide repeats the slide it belongs to.
+            timeline_line(305.0, "slide", "Caching in memory", [], "c5",
+                          metadata={"slide_number": 3, "revisited_slide_number": 3}),
+            timeline_line(306.0, "slide", "Caching in memory", [], "c6", metadata={"slide_number": 3})
+        ])
+        agent = StructuringAgent(
+            settings=self.settings,
+            session_id=self.session_id,
+            llm_router=MockRouter(),
+            redis_bus=self.bus
+        )
+        await agent.process_batch()
+        # All of the lines share one batch, so exactly one ask carried
+        # the trimmed text.
+        self.assertEqual(len(agent.llm_router.prompts), 1)
+        prompt = agent.llm_router.prompts[0]
+        self.assertEqual(prompt.count("We begin with caching today."), 1)
+        self.assertNotIn("umm", prompt)
+        self.assertEqual(prompt.count("Caching in memory"), 1)
+        self.assertIn("the idea again in a table.", prompt)
 
 
 class TestBatchHelpers(unittest.TestCase):
@@ -464,19 +673,16 @@ class TestBatchHelpers(unittest.TestCase):
             seen_sizes: list[int] = []
             accepted_sizes: list[int] = []
 
-            async def fake_graph_ainvoke(state: Any) -> dict:
-                seen_sizes.append(len(state["timeline_slice"]))
-                if len(state["timeline_slice"]) > 2:
+            async def fake_synthesis(slice_entries: Any, overlap_entries: Any, context: str) -> dict:
+                seen_sizes.append(len(slice_entries))
+                if len(slice_entries) > 2:
                     raise RuntimeError(
                         "Error code: 400 - This provider limits the length of a single message."
                     )
-                accepted_sizes.append(len(state["timeline_slice"]))
-                result = dict(state)
-                result["summary"] = "a summary of the batch"
-                return result
+                accepted_sizes.append(len(slice_entries))
+                return {"summary": "a summary of the batch"}
 
-            agent.graph = mock.MagicMock()
-            agent.graph.ainvoke = fake_graph_ainvoke
+            agent.synthesis = fake_synthesis
 
             entries = [
                 {
@@ -497,6 +703,163 @@ class TestBatchHelpers(unittest.TestCase):
             self.assertEqual(len(accepted_sizes), 4)
             # Every entry of the batch was done, none was dropped.
             self.assertEqual(sum(accepted_sizes), 8)
+
+
+class TestTheOneCallContract(unittest.TestCase):
+    """The parsing and the deterministic helpers of the one call."""
+
+    def test_the_notes_and_the_block_are_split_at_the_delimiter(self) -> None:
+        raw = (
+            "## Topic\nSome notes about the topic.\n\n"
+            + STRUCTURED_DELIMITER
+            + '\n\n{"definitions": [{"term": "Cache", "definition": "a fast store"}],'
+            + ' "action_items": [], "key_points": ["one"]}'
+        )
+        notes, structured = split_notes_and_structured(raw)
+        self.assertEqual(notes, "## Topic\nSome notes about the topic.")
+        self.assertEqual(structured["definitions"][0]["term"], "Cache")
+        self.assertEqual(structured["key_points"], ["one"])
+        # The tags of the concepts come from the terms without asking.
+        self.assertEqual(structured["concept_tags"], ["Cache"])
+
+    def test_a_lost_delimiter_still_leaves_the_notes_whole(self) -> None:
+        raw = (
+            "## Topic\nThe example {\"definitions\": [1, 2]} sits inside the notes.\n\n"
+            '{"definitions": [{"term": "Real", "definition": "the real one"}],'
+            + ' "action_items": ["do"], "key_points": []}'
+        )
+        notes, structured = split_notes_and_structured(raw)
+        self.assertIn("The example", notes)
+        self.assertNotIn('"Real"', notes)
+        self.assertEqual(structured["definitions"][0]["term"], "Real")
+
+    def test_a_block_that_is_not_the_lists_is_not_guesswork(self) -> None:
+        notes, structured = split_notes_and_structured('{"a": 1, "b": 2}')
+        self.assertEqual(notes, '{"a": 1, "b": 2}')
+        self.assertIsNone(structured)
+
+    def test_the_running_context_counts_lines_not_requests(self) -> None:
+        first = build_running_context(
+            "", "## Torque\nbody of the section",
+            [{"term": "Torque", "definition": "a turning force"}],
+            ["a point"]
+        )
+        self.assertTrue(first.startswith("Topics so far: Torque"))
+        second = build_running_context(
+            first, "## Angular Momentum\nmore",
+            [{"term": "L", "definition": "angular momentum"}],
+            ["another point"]
+        )
+        self.assertIn("Topics so far: Torque; Angular Momentum", second)
+        self.assertIn("L = angular momentum", second)
+        self.assertNotIn("Torque = ", second)
+
+    def test_the_running_context_stays_short(self) -> None:
+        summary = "".join(f"## Heading number {index}\ntext\n" for index in range(60))
+        context = build_running_context("", summary, [], [])
+        self.assertLessEqual(len(context), 1203)
+
+    def test_the_prompt_loses_only_what_repeats(self) -> None:
+        groups = [
+            {"correlation_id": "a", "items": [
+                {"source_type": "transcript", "content": "Okay umm so the hash is open.", "importance_flags": [], "metadata": {}},
+                {"source_type": "transcript", "content": "Okay umm so the hash is open.", "importance_flags": [], "metadata": {}}
+            ]},
+            {"correlation_id": "b", "items": [
+                {"source_type": "slide", "content": "Open Hashing", "importance_flags": [], "metadata": {"slide_number": 2}},
+                {"source_type": "slide", "content": "Open Hashing", "importance_flags": [], "metadata": {"slide_number": 2, "revisited_slide_number": 2}}
+            ]}
+        ]
+        trimmed = trim_prompt_groups(groups)
+        texts = [
+            str(item.get("content", ""))
+            for group in trimmed for item in group["items"]
+        ]
+        self.assertEqual(texts.count("Okay so the hash is open."), 1)
+        self.assertEqual(texts.count("Open Hashing"), 1)
+
+    def test_the_model_s_reasoning_is_scrubbed_out(self) -> None:
+        # The exact shapes the live model leaked into the notes of the
+        # second batch of the p1_slides session.
+        leaky = (
+            "## The Popularity and Versatility of Redis\n"
+            "\n"
+            "    Redis is characterized as much more than a simple store.\n"
+            "\n"
+            "    *   `definitions`: [] (none new)\n"
+            "    *   `action_items`: [\"Remember that Redis works with Python, Go, .NET\"]\n"
+            "    *   `key_points`: [\"most loved\"]\n"
+            "\n"
+            "*Self-Correction on LaTeX:* The prompt gives `$64.8\\%$` as an example.\n"
+            "\n"
+            "    Wait, looking at the transcript again: \"NETURE DESCRIPTION\" This looks like noise.\n"
+            "\n"
+            "*One more check on the Figure marker:*\n"
+            "    The prompt says: \"The marker must appear once.\"\n"
+            "    Slide 2 is the \"Most Loved Database\" slide.\n"
+            "\n"
+            "*JSON check:*\n"
+            "    `{\"definitions\": [], \"action_items\": [\"Note the language compatibility\"]}`\n"
+            "\n"
+            "*Wait, is there math in the text?* No.\n"
+            "\n"
+            "    Let's double check the slide 2 transcript.\n"
+            "    \"BEGIN TAPE Back to the spoken part.\"\n"
+            "    Translation/Interpretation: \"Back to the spoken part.\"\n"
+            "\n"
+            "    Final check on formatting:\n"
+            "    1. Markdown (##, bullets, paragraphs) - Yes.\n"
+            "    2. Figure marker on own line - Yes.\n"
+            "    3. ===NOTES_END=== - Yes.\n"
+            "    4. JSON - Yes.\n"
+            "\n"
+            "*Double check figure ID:* `fig_7e7af948fb072de6`. Correct.\n"
+            "\n"
+            "*Finalizing content:*\n"
+            "## Clean Section\n"
+            "    Real notes stay here."
+        )
+        cleaned = scrub_reasoning_chatter(leaky)
+        for piece in (
+            "## The Popularity and Versatility of Redis",
+            "Redis is characterized as much more than a simple store.",
+            "## Clean Section",
+            "Real notes stay here.",
+        ):
+            self.assertIn(piece, cleaned)
+        for gone in (
+            "`definitions`:",
+            "`action_items`:",
+            "`key_points`:",
+            "Self-Correction",
+            "Wait, looking at the transcript",
+            "One more check",
+            "The prompt says",
+            "Slide 2 is the",
+            "JSON check",
+            '"definitions"',
+            "is there math in the text",
+            "slide 2 transcript",
+            "BEGIN TAPE",
+            "Translation/Interpretation",
+            "Final check on formatting",
+            "Markdown (##, bullets, paragraphs) - Yes.",
+            "NOTES_END",
+            "Double check figure ID",
+            "Finalizing content",
+        ):
+            self.assertNotIn(gone, cleaned)
+
+    def test_bare_mathematics_is_found_outside_the_dollars(self) -> None:
+        from lecturelens.agents.structuring_agent import math_left_unformatted
+
+        self.assertTrue(math_left_unformatted("The cost is O(n log n) per query."))
+        self.assertTrue(math_left_unformatted("Raise it to 2^n."))
+        self.assertFalse(math_left_unformatted("The cost is $O(\\log n)$ per query."))
+        self.assertFalse(math_left_unformatted("We compare the sizes of 10 and 10."))
+        # A number with a caret inside a dollar span is not bare math.
+        self.assertFalse(math_left_unformatted("$n \\cdot 2^k$ items"))
+        self.assertFalse(math_left_unformatted("a ```python\ndef f(x):\n    pass\n``` block"))
 
 
 if __name__ == "__main__":

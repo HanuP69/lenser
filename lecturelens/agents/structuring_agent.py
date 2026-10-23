@@ -9,8 +9,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 from langchain_core.messages import HumanMessage
-from langgraph.graph import END, START, StateGraph
-from typing_extensions import TypedDict
 
 from lecturelens.config.settings import Settings
 from lecturelens.router.usage import stage as usage_stage
@@ -78,19 +76,6 @@ class StructuringBatchError(RuntimeError):
     The batch is retried; the byte offset is not advanced until the batch
     either succeeds or falls back to the raw timeline content.
     """
-
-
-class StructuringState(TypedDict):
-    timeline_slice: list[dict[str, Any]]
-    running_context: str
-    correlated_groups: list[dict[str, Any]]
-    summary: str
-    definitions: list[dict[str, str]]
-    action_items: list[str]
-    key_points: list[str]
-    concept_tags: list[str]
-    importance_flags: list[str]
-    overlap_entries: list[dict[str, Any]]
 
 
 def extract_overlap_entries(
@@ -451,230 +436,457 @@ def latex_result_is_usable(original: str, rewritten: str) -> bool:
     return True
 
 
-def create_structuring_graph(llm_router: Any, enforce_latex: bool = True) -> Any:
-    async def call_llm(prompt: str, stage_name: str = "") -> str:
-        # The stage name travels with the call into the usage account, so
-        # the report can say which piece of the work spent the tokens.
-        with usage_stage(stage_name):
-            response = await llm_router.ainvoke([HumanMessage(content=prompt)])
-            return response_to_text(response)
+# The line between the notes and the structured block in the answer of
+# the one call per batch. It is chosen to look like nothing that a
+# lecturer would say and nothing that lands in the notes itself.
+STRUCTURED_DELIMITER = "===NOTES_END==="
 
-    async def group_correlated_events_node(state: StructuringState) -> dict[str, Any]:
-        slice_entries = state.get("timeline_slice", [])
-        overlap_entries = state.get("overlap_entries", [])
-        combined = list(overlap_entries) + list(slice_entries)
+# The lists that ride behind the delimiter, extracted into the segment.
+STRUCTURED_KEYS = ("definitions", "action_items", "key_points")
 
-        by_correlation: dict[str, list[dict[str, Any]]] = {}
-        ordered_keys: list[str] = []
-        unassigned_index = 0
+# The running context handed to the next batch is built by counting
+# lines, not by asking a model: the headings used so far, the terms
+# that were defined, and the key points of the last batch, clipped to
+# about this size.
+RUNNING_CONTEXT_TARGET = 1200
 
-        for entry in combined:
-            correlation_id = entry.get("correlation_id")
-            if correlation_id is not None and len(str(correlation_id).strip()) > 0:
-                key = str(correlation_id).strip()
+# Chunks of speech repeat the umm and uhh of the speaker, and the whole
+# text of a revisited slide repeats the text of the slide. The model
+# pays input tokens for all of it, so the text of the prompt is
+# trimmed, while the entries behind it stay whole. The words dropped
+# here are the ones that carry no meaning in any lecture.
+FILLER_WORDS = re.compile(r"\b(?:um+|uh+|hm+|hmm+|err+)\b[,:;.!?]*\s*", re.IGNORECASE)
+
+# A word said three times or more in a row is the stammer of the
+# transcription (often a cut between two chunks). It collapses to the
+# word once.
+STAMMERED_WORD = re.compile(r"\b(\w+)((?:[,\s]+)\1\b){2,}", re.IGNORECASE)
+
+# The text of a heading, for the list of topics in the running context.
+HEADING_TEXT_PATTERN = re.compile(r"^#{1,6}\s+(.+?)\s*$", re.MULTILINE)
+
+
+def normalize_for_match(text: str) -> str:
+    """The words of a text, lowered and stripped, so two chunks of speech
+    that only differ in punctuation can be told apart from two topics."""
+    lowered = re.sub(r"[^a-z0-9 ]+", " ", text.lower())
+    return re.sub(r"\s+", " ", lowered).strip()
+
+
+def tail_head_overlap(first: str, second: str, maximum: int = 96, minimum: int = 20) -> int:
+    """How many characters the two chunks of speech share at the seam.
+
+    The transcriber cuts the audio into chunks that carry the last few
+    seconds of the chunk before them again. The longest shared stretch
+    costs a walk over at most a hundred characters, so it is cheaper
+    than asking a model to ignore it.
+    """
+    scan = min(maximum, len(first), len(second))
+    lowered_first = first.lower()
+    lowered_second = second.lower()
+    for size in range(scan, minimum - 1, -1):
+        if lowered_first[-size:] == lowered_second[:size]:
+            return size
+    return 0
+
+
+def correlate_events(
+    slice_entries: list[dict[str, Any]],
+    overlap_entries: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """The events that belong to one moment of the lecture, together.
+
+    The entries carry a correlation id handed out by the sync agent: the
+    speech of a sentence and the slide that was on the screen during it
+    share one id. The events without an id each stand alone. The overlap
+    comes first, so the reading order of the prompt stays the order of
+    the lecture.
+    """
+    combined = list(overlap_entries) + list(slice_entries)
+
+    by_correlation: dict[str, list[dict[str, Any]]] = {}
+    ordered_keys: list[str] = []
+    unassigned_index = 0
+
+    for entry in combined:
+        correlation_id = entry.get("correlation_id")
+        if correlation_id is not None and len(str(correlation_id).strip()) > 0:
+            key = str(correlation_id).strip()
+        else:
+            key = f"unassigned_{unassigned_index}"
+            unassigned_index += 1
+        if key not in by_correlation:
+            by_correlation[key] = []
+            ordered_keys.append(key)
+        by_correlation[key].append(entry)
+
+    groups: list[dict[str, Any]] = []
+    for key in ordered_keys:
+        groups.append({
+            "correlation_id": key,
+            "items": by_correlation[key]
+        })
+    return groups
+
+
+def trim_prompt_groups(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The text of the prompt, made cheaper by counting, not by asking.
+
+    Chunks of speech repeat the seconds before them, the revisited slide
+    repeats the slide it belongs to, filler words fill the pauses. Every
+    copy of that is input tokens for nothing. The entries themselves are
+    not touched: their offsets, flags and figures stay exactly as they
+    were written down.
+    """
+    # First walk: the full text of every slide of the batch, so a revisit
+    # that repeats one of them word for word can be found later.
+    full_slide_texts: set[str] = set()
+    for group in groups:
+        for item in group.get("items", []):
+            metadata = item.get("metadata", {}) or {}
+            if str(item.get("source_type", "")) != "slide":
+                continue
+            if int(metadata.get("revisited_slide_number", 0) or 0) > 0:
+                continue
+            normal = normalize_for_match(str(item.get("content", "")))
+            if normal:
+                full_slide_texts.add(normal)
+
+    seen_transcripts: set[str] = set()
+    trimmed: list[dict[str, Any]] = []
+    for group in groups:
+        items: list[dict[str, Any]] = []
+        for item in group.get("items", []):
+            content = str(item.get("content", "")).strip()
+            if not content:
+                # An entry without words only costs its own tokens.
+                continue
+            source_type = str(item.get("source_type", ""))
+            normal = normalize_for_match(content)
+            if source_type == "transcript":
+                cleaned = FILLER_WORDS.sub(" ", content)
+                cleaned = STAMMERED_WORD.sub(r"\1", cleaned)
+                cleaned = re.sub(r"\s+", " ", cleaned).strip()
+                if not cleaned:
+                    continue
+                normal = normalize_for_match(cleaned)
+                if normal in seen_transcripts:
+                    # The same words were handed over before.
+                    continue
+                last = items[-1] if items else None
+                if last is not None and str(last.get("source_type", "")) == "transcript":
+                    shared = tail_head_overlap(str(last.get("content", "")), cleaned)
+                    if shared:
+                        # The seam of two chunks holds the same seconds
+                        # twice; the copy is cut out and the chunk is
+                        # glued onto the text before it.
+                        merged = f"{str(last.get('content', ''))} {cleaned[shared:]}".strip()
+                        last["content"] = merged
+                        seen_transcripts.add(normalize_for_match(merged))
+                        continue
+                seen_transcripts.add(normal)
+                items.append({**item, "content": cleaned})
+            elif source_type == "slide":
+                revisited = int((item.get("metadata", {}) or {}).get("revisited_slide_number", 0) or 0)
+                if revisited > 0 and normal and normal in full_slide_texts:
+                    # The revisit repeats the slide that is already in
+                    # the prompt, truncation or not.
+                    continue
+                items.append({**item, "content": content})
             else:
-                key = f"unassigned_{unassigned_index}"
-                unassigned_index += 1
-            if key not in by_correlation:
-                by_correlation[key] = []
-                ordered_keys.append(key)
-            by_correlation[key].append(entry)
+                items.append({**item, "content": content})
+        if items:
+            trimmed.append({"correlation_id": group.get("correlation_id"), "items": items})
+    return trimmed
 
-        groups: list[dict[str, Any]] = []
-        for key in ordered_keys:
-            groups.append({
-                "correlation_id": key,
-                "items": by_correlation[key]
-            })
-        return {"correlated_groups": groups}
 
-    async def summarize_slice_node(state: StructuringState) -> dict[str, Any]:
-        groups = state.get("correlated_groups", [])
-        formatted_slice = format_timeline_slice(groups)
-        previous_context = state.get("running_context", "")
-        prompt = f"""
+SYNTHESIS_PROMPT = """
 You are an expert academic note taker synthesizing live lecture streams.
-Format the following lecture events into structured, textbook-quality lecture notes.
+Turn the lecture events below into textbook-quality notes.
 
-GUIDELINES:
-- Synthesize spoken explanations with corresponding slide content.
-- Prioritize technical depth, mathematical accuracy, and clarity.
-- Structure using markdown headers, bullet points, and code/math blocks ($...$ for inline, $$...$$ for display).
-- Do not repeat or invent facts not grounded in the source text.
+Write the answer only. Never write your reasoning, your self-checks, or
+any commentary on these instructions; the reader sees nothing except
+the notes and the structured block.
 
-FIGURE PLACEMENT RULES:
-- Some [SLIDE] events carry a marker like [FIGURE fig_12: caption]. That marker is
-  a picture of a diagram. The picture belongs IN the notes, and the token is the
-  only way for it to get there.
-- For every [FIGURE id] marker you see in the events, write the token [FIGURE id]
-  on its own line exactly where the notes discuss that slide: right after the
-  bullet or paragraph about it. Never omit one, never repeat one.
-- Never place several [FIGURE id] tokens together in one pile. Each token sits
-  next to the text that talks about that picture.
+HOW THE ANSWER MUST LOOK (a program reads it, so follow it exactly):
+1. The notes first, in markdown: headings (##), short paragraphs, bullets.
+   Synthesize the spoken explanation with the text of the slides. Keep
+   technical depth, and never invent facts that are not in the events.
+2. Every marker such as [FIGURE fig_12: caption] names a picture of a
+   diagram. The marker must appear once, on its own line, right after
+   the paragraph or bullet that talks about that slide. Never omit one,
+   never repeat one, never pile several together.
+3. Every mathematical expression is written in LaTeX: inline between
+   single dollar signs ($O(1)$, $H(x)$, $n \\log n$, $64.8\\%$), and
+   display math on its own lines between double dollar signs:
+   $$
+   \\text{Index} = H(\\text{Key}) \\mod M
+   $$
+   A bare O(1), H(x) or 2^n left as plain text is wrong. Words that are
+   not mathematics stay outside the dollar signs.
+4. After the notes, one line that holds only this:
+   ===NOTES_END===
+5. After that line, one JSON object and nothing else:
+   {"definitions": [{"term": "Term Name", "definition": "clear definition"}],
+    "action_items": ["an action item, exam tip or reminder"],
+    "key_points": ["a key point of this part of the lecture"]}
+   Any of the three lists may be empty when the section has none.
 
 PREVIOUS CONTEXT:
-{previous_context}
+%%PREVIOUS_CONTEXT%%
 
 CURRENT LECTURE EVENTS:
-{formatted_slice}
+%%SLICE_TEXT%%
 """
-        summary_text = await call_llm(prompt, "summarize")
-        return {"summary": summary_text}
 
-    async def enforce_latex_node(state: StructuringState) -> dict[str, Any]:
-        """Write every formula of the section in LaTeX.
+REPAIR_PROMPT = """
+The lecture notes below are good, but the structured block that was
+supposed to follow them came out broken or is missing. Read the notes
+and answer with one JSON object and nothing else - no commentary, no
+code fence, no markdown:
 
-        The model is asked for LaTeX, but it does not always do it. A
-        formula such as O(1) or H(x) is then left as plain text, and a
-        viewer that draws formulas shows nothing at that place. The
-        section is handed to the model once more, and only the
-        mathematics is changed.
-        """
-        summary_text = str(state.get("summary", "")).strip()
-        if len(summary_text) == 0:
-            return {}
-        if not text_has_mathematics(summary_text):
-            # There is no mathematics in the section. The pass would only
-            # cost a request.
-            return {}
+{"definitions": [{"term": "Term Name", "definition": "clear definition"}],
+ "action_items": ["an action item"],
+ "key_points": ["a key point"]}
+
+An empty list counts when the notes hold none.
+
+NOTES:
+%%NOTES%%
+"""
+
+
+def structured_from_payload(payload: Any) -> Optional[dict[str, Any]]:
+    """The three lists, in the shape the notes are built from.
+
+    Whatever shape the answer came in, the lists come out whole. Terms
+    keep their own spelling: the lookups elsewhere are case insensitive,
+    so "TCP" stays "TCP". An answer that carries none of the three keys
+    is None, not an empty block, because an empty block would lie about
+    having been understood.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if not any(key in payload for key in STRUCTURED_KEYS):
+        return None
+    definitions: list[dict[str, str]] = []
+    for item in payload.get("definitions") or []:
+        if isinstance(item, dict) and "term" in item and "definition" in item:
+            definitions.append({
+                "term": str(item["term"]).strip(),
+                "definition": str(item["definition"]).strip()
+            })
+    action_items = [str(item).strip() for item in payload.get("action_items") or [] if str(item).strip()]
+    key_points = [str(item).strip() for item in payload.get("key_points") or [] if str(item).strip()]
+    return {
+        "definitions": definitions,
+        "action_items": action_items,
+        "key_points": key_points,
+        "concept_tags": [item["term"] for item in definitions],
+    }
+
+
+def extract_structured_dict(raw_output: str) -> Optional[dict[str, Any]]:
+    """Read the structured block out of an answer."""
+    cleaned = raw_output.strip()
+    if "```json" in cleaned:
+        cleaned = cleaned.split("```json")[1].split("```")[0].strip()
+    elif "```" in cleaned:
+        cleaned = cleaned.split("```")[1].split("```")[0].strip()
+    return structured_from_payload(extract_json_payload(cleaned, expect_list=False))
+
+
+def split_notes_and_structured(raw_output: str) -> tuple[str, Optional[dict[str, Any]]]:
+    """The notes and the lists, taken apart.
+
+    The delimiter is the cheap path. When the model lost the delimiter
+    it usually still put the object somewhere in the answer, so the
+    objects are searched from the right: the last one that names one of
+    the three lists is taken, and everything before it stays the notes.
+    A JSON example inside the notes then does not cut the notes in half.
+    """
+    text = raw_output.strip()
+    marker = re.search(rf"^\s*{re.escape(STRUCTURED_DELIMITER)}\s*$", text, re.MULTILINE)
+    if marker:
+        return text[:marker.start()].strip(), extract_structured_dict(text[marker.end():])
+
+    decoder = json.JSONDecoder()
+    for match in reversed(list(re.finditer(r"\{", text))):
         try:
-            # The prompt holds LaTeX with braces in it, so it is not put
-            # together with str.format, which would read {Index} as a
-            # field and fail.
-            rewritten = await call_llm(
-                LATEX_ENFORCEMENT_PROMPT.replace("%%SUMMARY%%", summary_text),
-                "latex"
+            candidate, _ = decoder.raw_decode(text[match.start():])
+        except ValueError:
+            continue
+        structured = structured_from_payload(candidate)
+        if structured is not None:
+            notes_before = re.sub(
+                rf"\s*{re.escape(STRUCTURED_DELIMITER)}\s*$", "", text[:match.start()]
             )
-        except Exception as error:
-            logger.warning("the latex pass failed, the notes are kept as they are: %s", error)
-            return {}
-        cleaned = rewritten.strip()
-        # The model sometimes wraps the whole answer in a code fence.
-        if cleaned.startswith("```"):
-            cleaned = re.sub(r"^```[a-zA-Z]*\n", "", cleaned)
-            if cleaned.endswith("```"):
-                cleaned = cleaned[:-3].rstrip()
-        if not latex_result_is_usable(summary_text, cleaned):
-            logger.warning(
-                "the latex pass did not keep the notes, they are kept as they are"
-            )
-            return {}
-        return {"summary": cleaned}
+            return notes_before.strip(), structured
+    return text, None
 
-    async def extract_definitions_node(state: StructuringState) -> dict[str, Any]:
-        summary_text = state.get("summary", "")
-        prompt = f"""
-Extract all technical terms and concepts defined or introduced in this lecture section.
-Respond strictly in valid JSON format as a list of objects with 'term' and 'definition'.
 
-LECTURE SUMMARY:
-{summary_text}
+def build_running_context(
+    previous: str,
+    summary: str,
+    definitions: list[dict[str, str]],
+    key_points: list[str]
+) -> str:
+    """The context of the next batch, built by counting, not by asking.
 
-[
-  {{"term": "Term Name", "definition": "Clear concise academic definition."}}
-]
-"""
-        raw_output = await call_llm(prompt, "definitions")
-        parsed = extract_json_payload(raw_output)
-        definitions: list[dict[str, str]] = []
-        if isinstance(parsed, list):
-            for item in parsed:
-                if isinstance(item, dict) and "term" in item and "definition" in item:
-                    # The term used to be lowercased, which wrecked acronyms
-                    # and proper nouns such as "TCP" or "Binary Search Tree".
-                    # The term is matched case insensitively where it is
-                    # looked up, so the original spelling is kept here.
-                    definitions.append({
-                        "term": str(item["term"]).strip(),
-                        "definition": str(item["definition"]).strip()
-                    })
-        return {"definitions": definitions}
+    The old chain spent a request per batch on compressing the notes;
+    the thread of a lecture does not need a model for that. The
+    headings used so far carry the thread, the defined terms carry the
+    vocabulary, and the key points of the last batch carry the detail
+    of what was just said, all clipped to a small budget of characters.
+    """
+    topics: list[str] = []
+    seen_topics: set[str] = set()
+    for line in (previous or "").splitlines():
+        if not line.startswith("Topics so far:"):
+            continue
+        for topic in line[len("Topics so far:"):].split(";"):
+            topic = topic.strip()
+            normal = normalize_for_match(topic)
+            if topic and normal and normal not in seen_topics:
+                topics.append(topic)
+                seen_topics.add(normal)
+    for heading in HEADING_TEXT_PATTERN.findall(summary or ""):
+        heading = heading.strip()
+        normal = normalize_for_match(heading)
+        if heading and normal and normal not in seen_topics:
+            topics.append(heading)
+            seen_topics.add(normal)
+    topics = topics[-12:]
 
-    async def extract_action_items_node(state: StructuringState) -> dict[str, Any]:
-        summary_text = state.get("summary", "")
-        prompt = f"""
-Identify all action items, exam tips, homework reminders, or reading assignments from this section.
-Respond strictly in valid JSON format as a list of strings. If none exist, return an empty array [].
+    lines: list[str] = []
+    if topics:
+        lines.append("Topics so far: " + "; ".join(topics))
+    terms: list[str] = []
+    for item in (definitions or [])[:6]:
+        term = str(item.get("term", "")).strip()
+        if not term:
+            continue
+        definition = truncate_text(str(item.get("definition", "")), 70)
+        terms.append(f"{term} = {definition}" if definition else term)
+    if terms:
+        lines.append("Terms: " + "; ".join(terms))
+    points = [truncate_text(str(point), 110) for point in (key_points or [])[:4]]
+    points = [point for point in points if point]
+    if points:
+        lines.append("Recent key points:")
+        for point in points:
+            lines.append(f"- {point}")
+    if not lines:
+        # Nothing new was named. Keeping the old context trimmed beats
+        # replacing it with empty, because the next section still talks
+        # about the lecture before it.
+        return truncate_text(previous or "", RUNNING_CONTEXT_TARGET)
+    text = "\n".join(lines)
+    if len(text) > RUNNING_CONTEXT_TARGET:
+        text = text[:RUNNING_CONTEXT_TARGET - 3].rstrip() + "..."
+    return text
 
-LECTURE SUMMARY:
-{summary_text}
 
-["Action item 1", "Action item 2"]
-"""
-        raw_output = await call_llm(prompt, "action_items")
-        parsed = extract_json_payload(raw_output)
-        action_items: list[str] = []
-        if isinstance(parsed, list):
-            for item in parsed:
-                action_items.append(str(item))
-        return {"action_items": action_items}
+def math_left_unformatted(text: str) -> bool:
+    """Whether mathematics is still standing outside the dollar signs.
 
-    async def extract_key_points_node(state: StructuringState) -> dict[str, Any]:
-        summary_text = state.get("summary", "")
-        definitions = state.get("definitions", [])
-        concept_tags = [d["term"] for d in definitions if "term" in d]
+    The rules moved into the main prompt, so most sections come back
+    already written in LaTeX. The rewrite is only worth a request when
+    something that is clearly mathematics is still plain text after the
+    fenced code and the dollar signs are taken out: a function call
+    such as O(n) or H(x), a caret such as 2^n, or the words of the
+    notation.
+    """
+    sliced = re.sub(r"```.*?```", " ", text, flags=re.S)
+    sliced = re.sub(r"\$\$.*?\$\$", " ", sliced, flags=re.S)
+    sliced = re.sub(r"\$[^$\n]*\$", " ", sliced)
+    sliced = re.sub(r"\[FIGURE[^\]]*\]", " ", sliced, flags=re.IGNORECASE)
+    if FUNCTION_MARKER.search(sliced):
+        return True
+    if re.search(r"[A-Za-z0-9]\^\(?[0-9A-Za-z(]", sliced):
+        return True
+    return bool(MATHEMATICS_WORDS.search(sliced))
 
-        prompt = f"""
-Extract 3-5 core key points from this lecture section.
-Respond strictly in valid JSON format as a list of strings:
-["Key point 1", "Key point 2"]
 
-LECTURE SUMMARY:
-{summary_text}
-"""
-        raw_output = await call_llm(prompt, "key_points")
-        parsed = extract_json_payload(raw_output)
-        key_points: list[str] = []
-        if isinstance(parsed, list):
-            for item in parsed:
-                key_points.append(str(item).strip())
-        return {"key_points": key_points, "concept_tags": concept_tags}
+# A line of the notes that starts with one of the self-talk openers. The
+# small models answer the contract by thinking out loud: they correct
+# their own LaTeX, check the JSON they are about to write, quote the
+# prompt back, or walk the contract checklist line by line. A student
+# reading the notes must never see any of it.
+SELF_TALK_STARTERS = re.compile(
+    r"^\s*\*?\s*(?:"
+    r"wait\b|hm+\b|let'?s\b|let me\b|note to self\b|"
+    r"self-correction\b|double check\b|one more check\b|"
+    r"final check\b|finali[sz]\b|json check\b|the prompt says\b"
+    r")",
+    re.IGNORECASE,
+)
 
-    async def update_running_context_node(state: StructuringState) -> dict[str, Any]:
-        previous_context = state.get("running_context", "")
-        summary_text = state.get("summary", "")
-        if len(summary_text) == 0:
-            return {"running_context": previous_context}
+# A line that is only a label wrapped in stars: *JSON check:*, *Note to
+# self:*. The section builders add italic lines of their own (the
+# captions of the pictures), so the scrub runs before they are added.
+ITALIC_LABEL_LINE = re.compile(r"^\s*\*[^*\n]{0,90}:?\*\s*$")
 
-        prompt = f"""
-Compress the following lecture notes into a dense running context of at most 300 words.
-Keep key topics, definitions, and the current thread of the lecture.
+# The structured lists restated inside the notes text. The lists are
+# carried behind the delimiter and read into the segment; a copy of
+# them inside the prose is chatter about the work, not content.
+RESTATED_STRUCTURED_LIST = re.compile(
+    r"^\s*\*?\s*`?(?:definitions|action_items|key_points)`?\s*[:=]", re.IGNORECASE
+)
 
-EARLIER CONTEXT:
-{previous_context}
+# A JSON dump of the three lists sitting anywhere in a line, such as
+# `{"definitions": [], "action_items": [...]}` pasted as a self-check.
+STRUCTURED_LIST_DUMP = re.compile(
+    r'\{"(?:definitions|action_items|key_points)"\s*:', re.IGNORECASE
+)
 
-NEW NOTES:
-{summary_text}
-"""
-        compressed = await call_llm(prompt, "compress")
-        return {"running_context": compressed}
+# The contract checklist ticked off item by item: "1. Markdown (...) -
+# Yes.". Real notes never end a line with "- Yes.".
+CHECKLIST_TICK = re.compile(r"^\s*\d+\.\s+.{0,140}-\s*Yes\b")
 
-    graph_builder = StateGraph(StructuringState)
-    graph_builder.add_node("group_correlated_events", group_correlated_events_node)
-    graph_builder.add_node("summarize_slice", summarize_slice_node)
-    graph_builder.add_node("extract_definitions", extract_definitions_node)
-    graph_builder.add_node("extract_action_items", extract_action_items_node)
-    graph_builder.add_node("extract_key_points", extract_key_points_node)
-    graph_builder.add_node("update_running_context", update_running_context_node)
 
-    graph_builder.add_edge(START, "group_correlated_events")
-    graph_builder.add_edge("group_correlated_events", "summarize_slice")
+def is_self_talk_line(line: str) -> bool:
+    """Whether one line of the notes is the model talking to itself."""
+    return (
+        SELF_TALK_STARTERS.match(line) is not None
+        or ITALIC_LABEL_LINE.match(line) is not None
+        or RESTATED_STRUCTURED_LIST.match(line) is not None
+        or CHECKLIST_TICK.match(line) is not None
+        or STRUCTURED_LIST_DUMP.search(line) is not None
+        or STRUCTURED_DELIMITER in line
+    )
 
-    if enforce_latex:
-        # The pass that writes the mathematics in LaTeX sits between the
-        # summary and everything that reads it, so the definitions and the
-        # key points are taken from the text with the formulas in it.
-        graph_builder.add_node("enforce_latex", enforce_latex_node)
-        graph_builder.add_edge("summarize_slice", "enforce_latex")
-        graph_builder.add_edge("enforce_latex", "extract_definitions")
-    else:
-        graph_builder.add_edge("summarize_slice", "extract_definitions")
 
-    graph_builder.add_edge("extract_definitions", "extract_action_items")
-    graph_builder.add_edge("extract_action_items", "extract_key_points")
-    graph_builder.add_edge("extract_key_points", "update_running_context")
-    graph_builder.add_edge("update_running_context", END)
-    return graph_builder.compile()
+def scrub_reasoning_chatter(notes: str) -> str:
+    """The reasoning of the model, taken out of the notes.
+
+    The chatter is found by counting, never by asking a model. The
+    lines that continue a chatter line are dropped with it, so a quote
+    of the transcript and its translation die with their header — but a
+    markdown heading or a picture marker after the chatter is always
+    kept, because the live model once wrote *Finalizing content:* right
+    above the heading of the real notes.
+    """
+    kept: list[str] = []
+    skipping_body = False
+    for line in notes.splitlines():
+        if skipping_body:
+            stripped = line.strip()
+            if stripped == "":
+                skipping_body = False
+                kept.append(line)
+            elif stripped.startswith("#") or stripped.startswith("[FIGURE"):
+                # The real notes resumed straight after the chatter.
+                skipping_body = False
+                kept.append(line)
+            continue
+        if is_self_talk_line(line):
+            skipping_body = True
+            continue
+        kept.append(line)
+    cleaned = "\n".join(kept)
+    # The dropped lines leave behind stacked empty lines.
+    return re.sub(r"\n{3,}", "\n\n", cleaned)
 
 
 class StructuringAgent:
@@ -722,9 +934,12 @@ class StructuringAgent:
         self.quarantine_path: Path = session_dir / "timeline_quarantine.jsonl"
         self.control: AgentControl = AgentControl(session_dir, "structuring_agent", FINALIZE_FLAG_NAME)
 
-        self.graph: Any = create_structuring_graph(
-            llm_router, enforce_latex=settings.structuring_latex_pass
-        )
+        # There is no graph any more: the steps of the synthesis are plain
+        # functions, and one call to the model writes the notes and the
+        # structured lists together. The method itself is kept on the
+        # instance, so a test can stand in for the whole synthesis.
+        self.latex_pass_enabled: bool = bool(getattr(settings, "structuring_latex_pass", True))
+        self.synthesis = self.run_synthesis
         self.consecutive_failures: int = 0
         self.max_batch_retries: int = MAX_BATCH_RETRIES
         self.max_consecutive_failures: int = MAX_CONSECUTIVE_PASS_FAILURES
@@ -1092,6 +1307,127 @@ class StructuringAgent:
             section_lines.append("")
         return "\n".join(section_lines) + "\n"
 
+    async def _call_llm(self, prompt: str, stage_name: str) -> str:
+        """One ask through the router, named for the usage account."""
+        with usage_stage(stage_name):
+            response = await self.llm_router.ainvoke([HumanMessage(content=prompt)])
+            return response_to_text(response)
+
+    async def run_synthesis(
+        self,
+        slice_entries: list[dict[str, Any]],
+        overlap_entries: list[dict[str, Any]],
+        running_context: str
+    ) -> dict[str, Any]:
+        """The work of the old graph, asked for in one call.
+
+        The chain used to ask the model six times per batch: summarize,
+        the LaTeX pass, the definitions, the action items, the key
+        points, the compression. One call now writes the notes and
+        carries the three lists behind a delimiter, so escaped backslashes
+        of LaTeX cannot corrupt the markdown or the JSON around them.
+        The lists are read back with two cheap delimiters of their own:
+        if the block is missing or broken, one small repair call reads
+        them out of the finished notes.
+        """
+        groups = correlate_events(slice_entries, overlap_entries)
+        slice_text = format_timeline_slice(trim_prompt_groups(groups))
+        if len(slice_text.strip()) == 0:
+            # A batch whose every word was filler or a repeat has nothing
+            # for a model to work on. Returning without a request also
+            # tells the caller that the batch is not a failed synthesis.
+            logger.info(
+                "the batch holds nothing with content after trimming; no model is asked"
+            )
+            return {
+                "summary": "",
+                "definitions": [],
+                "action_items": [],
+                "key_points": [],
+                "concept_tags": [],
+                "running_context": running_context,
+                "empty_slice": True,
+            }
+
+        prompt = (
+            SYNTHESIS_PROMPT
+            .replace("%%PREVIOUS_CONTEXT%%", running_context or "(the lecture just started)")
+            .replace("%%SLICE_TEXT%%", slice_text)
+        )
+        notes_raw = await self._call_llm(prompt, "notes")
+        notes_text, structured = split_notes_and_structured(notes_raw)
+        # The model sometimes thinks out loud in the notes: the reasoning
+        # is dropped by counting before anything else reads the text.
+        notes_text = scrub_reasoning_chatter(notes_text)
+        if structured is None and len(notes_text.strip()) > 0:
+            # One repair at most. The notes themselves are complete
+            # already; only the lists were lost, and they are read out of
+            # the finished notes, so the repair does not see the events.
+            try:
+                repair_raw = await self._call_llm(
+                    REPAIR_PROMPT.replace("%%NOTES%%", notes_text), "repair"
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning("the structure could not be repaired, the notes are kept: %s", error)
+                repair_raw = ""
+            structured = extract_structured_dict(repair_raw)
+        if structured is None:
+            structured = {
+                "definitions": [],
+                "action_items": [],
+                "key_points": [],
+                "concept_tags": [],
+            }
+        notes_text = await self._rewrite_latex_if_needed(notes_text)
+        new_context = build_running_context(
+            running_context, notes_text, structured["definitions"], structured["key_points"]
+        )
+        return {
+            "summary": notes_text,
+            "definitions": structured["definitions"],
+            "action_items": structured["action_items"],
+            "key_points": structured["key_points"],
+            "concept_tags": structured["concept_tags"],
+            "running_context": new_context,
+        }
+
+    async def _rewrite_latex_if_needed(self, notes_text: str) -> str:
+        """Ask for a LaTeX pass only when the local checks say it is needed.
+
+        The rules live in the main prompt now. A section whose
+        mathematics is already inside the dollar signs costs no extra
+        request at all: the check below runs before any model is asked.
+        """
+        if not self.latex_pass_enabled:
+            return notes_text
+        if len(notes_text.strip()) == 0:
+            return notes_text
+        if not text_has_mathematics(notes_text):
+            return notes_text
+        if not math_left_unformatted(notes_text):
+            return notes_text
+        try:
+            rewritten = await self._call_llm(
+                LATEX_ENFORCEMENT_PROMPT.replace("%%SUMMARY%%", notes_text), "latex"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning("the latex pass failed, the notes are kept as they are: %s", error)
+            return notes_text
+        cleaned = rewritten.strip()
+        # The model sometimes wraps the whole answer in a code fence.
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```[a-zA-Z]*\n", "", cleaned)
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3].rstrip()
+        if not latex_result_is_usable(notes_text, cleaned):
+            logger.warning("the latex pass did not keep the notes, they are kept as they are")
+            return notes_text
+        return cleaned
+
     @staticmethod
     def _quarantine_key(entry: dict[str, Any]) -> str:
         """A stable key for a quarantined entry.
@@ -1311,27 +1647,41 @@ class StructuringAgent:
             end_offset=batch.end_offset,
             start_offset=batch.start_offset
         )
-        initial_state: StructuringState = {
-            "timeline_slice": entries,
-            "running_context": running_context,
-            "correlated_groups": [],
+
+        synthesis_error: Optional[BaseException] = None
+        result_state: dict[str, Any] = {
             "summary": "",
             "definitions": [],
             "action_items": [],
             "key_points": [],
             "concept_tags": [],
-            "importance_flags": [],
-            "overlap_entries": self.current_overlap
+            "running_context": running_context
         }
-
-        synthesis_error: Optional[BaseException] = None
-        result_state: dict[str, Any] = dict(initial_state)
         try:
-            result_state = await self.graph.ainvoke(initial_state)
+            result_state = await self.synthesis(entries, self.current_overlap, running_context)
         except asyncio.CancelledError:
             raise
         except Exception as error:
             synthesis_error = error
+
+        if synthesis_error is None and result_state.get("empty_slice"):
+            # The trimming found nothing with content. A model was not
+            # asked and none will be asked on a retry either, because the
+            # answer would be the same always. The offset moves ahead, so
+            # the batch is never read again, and the material that was
+            # there is still on the transcript.
+            logger.info(
+                "batch ending at offset %d holds nothing to synthesize; skipping it",
+                batch.end_offset
+            )
+            self.control.increment_stat("empty_batches_skipped")
+            self.control.set_stat("empty_batches_offset", batch.end_offset)
+            await self.persist_quarantined_entries()
+            self.save_notes_marker(batch.end_offset)
+            next_overlap = extract_overlap_entries(entries, OVERLAP_WINDOW_SECONDS)
+            self.current_overlap = next_overlap
+            self.save_state(result_state.get("running_context", running_context), batch.end_offset, next_overlap)
+            return str(result_state.get("running_context", running_context))
 
         if synthesis_error is not None and is_message_too_long_error(synthesis_error):
             # The provider cannot take a message this long. The batch is

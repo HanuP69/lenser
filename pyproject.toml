@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lecturelens"
-version = "0.5.0"
+version = "0.6.0"
 description = "Real-time multimodal multi-agent lecture note-taking system"
 requires-python = ">=3.10"
 dependencies = [
@@ -20,8 +20,8 @@ dependencies = [
     "websockets>=12.0",
     "psycopg[binary]>=3.1.0",
     # Required by the default `lecturelens start` flow: the structuring agent
-    # imports langchain-core and langgraph, the router imports langchain-core
-    # and langchain-ollama, and the screen agent imports Pillow. Without these
+    # and the router import langchain-core, the router imports
+    # langchain-ollama, and the screen agent imports Pillow. Without these
     # the base install could not run a lecture at all.
     #
     # The versions of the langchain packages have to agree with each other.
@@ -30,7 +30,6 @@ dependencies = [
     # reason was only in the log of that agent.
     "langchain-core>=1.4.7,<2.0",
     "langchain-ollama>=1.0,<2.0",
-    "langgraph>=1.0,<2.0",
     "Pillow>=10.0",
     # The notes are turned into a page that draws the formulas, so they
     # can be read in a browser without any other program.
@@ -53,7 +52,6 @@ full = [
     "langchain-ollama>=1.0,<2.0",
     "langchain-openai>=1.0,<2.0",
     "langchain-google-genai>=3.0,<5.0",
-    "langgraph>=1.0,<2.0",
     "chromadb>=0.5",
     "websockets>=12.0",
     "onnxruntime>=1.15.0",
