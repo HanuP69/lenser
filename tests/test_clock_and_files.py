@@ -8,6 +8,7 @@ from lecturelens.core.clock import SessionClock
 from lecturelens.core.fileio import append_text_durably, atomic_write_text, next_file_index
 from lecturelens.core.session_meta import begin_run, finish_run, get_previous_duration_seconds
 from lecturelens.core.validation import is_valid_session_id, sanitize_file_stem
+from lecturelens.utils.hashing import sha256_of_file
 
 
 class TestSessionClock(unittest.TestCase):
@@ -98,6 +99,15 @@ class TestFileHelpers(unittest.TestCase):
             append_text_durably(path, '{"a": 1}\n')
             append_text_durably(path, '{"b": 2}\n')
             self.assertEqual(path.read_text(encoding="utf-8"), '{"a": 1}\n{"b": 2}\n')
+
+    def test_sha256_of_file(self) -> None:
+        import hashlib
+        with tempfile.TemporaryDirectory() as temp_dir:
+            file_path = Path(temp_dir) / "test.bin"
+            content = b"hello lecturelens utils hashing test content"
+            file_path.write_bytes(content)
+            expected = hashlib.sha256(content).hexdigest()
+            self.assertEqual(sha256_of_file(file_path), expected)
 
 
 class TestValidationAndMeta(unittest.TestCase):

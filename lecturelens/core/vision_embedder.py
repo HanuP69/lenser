@@ -8,6 +8,7 @@ import uuid
 import numpy as np
 
 from lecturelens.core.logging_setup import get_logger
+from lecturelens.utils.hashing import sha256_of_file
 
 logger = get_logger("lecturelens.vision_embedder")
 
@@ -24,13 +25,6 @@ def expected_model_sha256() -> str:
     override = os.environ.get("LECTURELENS_VISION_MODEL_SHA256", "").strip().lower()
     return override or EXPECTED_MODEL_SHA256
 
-
-def sha256_of_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 _SHARED_VISION_EMBEDDER: Optional["VisionEmbedder"] = None
 _EMBEDDER_LOCK: threading.Lock = threading.Lock()

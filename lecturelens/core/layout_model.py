@@ -22,6 +22,7 @@ from typing import Any, Optional
 import numpy as np
 
 from lecturelens.core.logging_setup import get_logger
+from lecturelens.utils.hashing import sha256_of_file
 
 logger = get_logger("lecturelens.layout_model")
 
@@ -113,13 +114,6 @@ def expected_model_digest(name: str) -> str:
         return override
     return EXPECTED_MODEL_DIGESTS.get(name, "")
 
-
-def sha256_of_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as file_handle:
-        for chunk in iter(lambda: file_handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 class LayoutModel:

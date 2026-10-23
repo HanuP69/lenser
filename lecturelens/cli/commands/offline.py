@@ -1,7 +1,6 @@
 """The command that turns a recorded lecture file into notes."""
 
 import asyncio
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 

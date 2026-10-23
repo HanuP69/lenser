@@ -15,8 +15,9 @@ dependencies = [
     "typer>=0.12",
     "rich>=13.0",
     "httpx>=0.25",
-    "typing-extensions>=4.5",
     "numpy>=1.24",
+    "packaging>=23.0",
+    "python-dotenv>=1.0",
     # Video mode decodes a recorded lecture file with PyAV, so the audio
     # track and the frames come without any external capture.
     "av>=12",
