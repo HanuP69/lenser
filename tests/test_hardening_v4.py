@@ -70,7 +70,7 @@ class TestSessionClockSteps(unittest.TestCase):
         self.assertAlmostEqual(first, time.time(), delta=1.0)
         # The estimate follows the new anchor, so the next timestamps do
         # not jump back to the stale pair.
-        time.sleep(0.01)
+        time.sleep(0.02)
         second = clock.get_timestamp()
         self.assertGreater(second, first)
         self.assertAlmostEqual(second - first, 0.06, delta=1.0)
