@@ -15,6 +15,7 @@ from lecturelens.cli.app import (
 )
 from lecturelens.config.settings import Settings
 from lecturelens.core.agent_runtime import create_postgres_storage, create_redis_bus
+from lecturelens.core.event_loop import run_async
 from lecturelens.core.validation import sanitize_file_stem
 
 
@@ -110,7 +111,7 @@ def ask(
             await bus.close()
 
     try:
-        answer, references = asyncio.run(run())
+        answer, references = run_async(run())
     except Exception as error:
         fail(f"Could not answer: {error}")
     console.print(safe_for_console(answer))
@@ -157,7 +158,7 @@ def review(
                 await storage.close()
 
         try:
-            concepts = asyncio.run(fetch())
+            concepts = run_async(fetch())
             if concepts:
                 console.print(f"[bold]Concepts ({len(concepts)})[/bold]")
                 for c in concepts:

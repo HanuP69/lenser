@@ -121,8 +121,12 @@ class PostgresStorage:
 
     async def get_connection(self) -> psycopg.AsyncConnection[dict_row]:
         if self._connection is None or self._connection.closed:
+            conn_url = self.connection_url
+            if "connect_timeout=" not in conn_url:
+                separator = "&" if "?" in conn_url else "?"
+                conn_url = f"{conn_url}{separator}connect_timeout=2"
             self._connection = await psycopg.AsyncConnection.connect(
-                self.connection_url,
+                conn_url,
                 row_factory=dict_row,
                 autocommit=True
             )
