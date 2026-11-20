@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from lecturelens.agents.base_agent import BaseAgent
 from lecturelens.config.defaults import SYNC_CONSUMER_GROUP, SYNC_CONSUMER_PREFIX
 from lecturelens.config.settings import Settings
 from lecturelens.core.agent_runtime import (
@@ -57,7 +58,7 @@ class AnchorRecord:
     source_type: str
 
 
-class SyncAgent:
+class SyncAgent(BaseAgent):
     def __init__(
         self,
         settings: Settings,
@@ -65,17 +66,12 @@ class SyncAgent:
         session_clock: SessionClock,
         session_id: str
     ) -> None:
-        self.settings: Settings = settings
-        self.redis_bus: RedisBus = redis_bus
-        self.session_clock: SessionClock = session_clock
-        self.session_id: str = session_id
-        self.is_running: bool = False
+        super().__init__(settings, redis_bus, session_clock, session_id, "sync_agent")
+        self.control = AgentControl(self.session_dir, "sync_agent", SYNC_STOP_FLAG_NAME)
         self.drain_requested: bool = False
 
-        session_dir = settings.create_session_directories(session_id)
-        self.timeline_path: Path = session_dir / "timeline.jsonl"
-        self.flush_state_path: Path = session_dir / "timeline_flush_state.json"
-        self.control: AgentControl = AgentControl(session_dir, "sync_agent", SYNC_STOP_FLAG_NAME)
+        self.timeline_path: Path = self.session_dir / "timeline.jsonl"
+        self.flush_state_path: Path = self.session_dir / "timeline_flush_state.json"
         self.pending_buffer: list[BufferedEntry] = []
         self.pending_message_ids: set[tuple[str, str]] = set()
         self.written_fingerprints: set[str] = set()

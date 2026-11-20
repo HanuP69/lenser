@@ -845,6 +845,35 @@ class GatewayServer:
             self.server = None
 
 
+def create_fastapi_gateway(gateway_instance: Optional[GatewayServer] = None) -> Any:
+    """Create a FastAPI application exposing native WebSocket and health endpoints."""
+    from fastapi import FastAPI, WebSocket, Query, status
+    from fastapi.middleware.cors import CORSMiddleware
+
+    app = FastAPI(title="LectureLens Gateway", version="2.0.0")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.get("/health")
+    async def health_check() -> dict[str, str]:
+        return {"status": "ok", "service": "lecturelens-gateway"}
+
+    @app.websocket("/ws/{session_id}")
+    async def websocket_endpoint(websocket: WebSocket, session_id: str, api_key: Optional[str] = Query(None)) -> None:
+        await websocket.accept()
+        if gateway_instance is None:
+            await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+            return
+        await gateway_instance.handle_connection(websocket)
+
+    return app
+
+
 async def main() -> None:
     settings = Settings()
     configure_pools(settings.thread_pool_max_workers, settings.process_pool_max_workers)
