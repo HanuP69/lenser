@@ -13,6 +13,7 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 
+from lecturelens.agents.base_agent import BaseAgent
 from lecturelens.config.settings import Settings
 from lecturelens.core.agent_runtime import (
     AgentControl,
@@ -686,7 +687,7 @@ def build_block_source(settings: Settings) -> Any:
     return MicBlockSource(sample_rate, block_seconds)
 
 
-class AudioAgent:
+class AudioAgent(BaseAgent):
     def __init__(
         self,
         settings: Settings,
@@ -695,17 +696,10 @@ class AudioAgent:
         session_id: str,
         block_source: Any = None
     ) -> None:
-        self.settings: Settings = settings
-        self.redis_bus: RedisBus = redis_bus
-        self.session_clock: SessionClock = session_clock
-        self.session_id: str = session_id
+        super().__init__(settings, redis_bus, session_clock, session_id, "audio_agent")
         self.block_source: Any = block_source
-        self.is_running: bool = False
-
-        session_dir = settings.create_session_directories(session_id)
-        self.raw_audio_dir: Path = session_dir / "raw" / "audio"
+        self.raw_audio_dir: Path = self.session_dir / "raw" / "audio"
         self.stream_name: str = f"lecturelens:{session_id}:stream:transcript"
-        self.control: AgentControl = AgentControl(session_dir, "audio_agent")
         self.chunk_counter: int = next_file_index(self.raw_audio_dir, "chunk_", ".wav") - 1
         self.locked_language: Optional[str] = settings.whisper_language
         self.transcription_queue: asyncio.Queue = asyncio.Queue(maxsize=settings.audio_queue_capacity)

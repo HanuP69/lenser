@@ -10,6 +10,7 @@ from typing import Any, Optional
 import numpy as np
 from PIL import Image
 
+from lecturelens.agents.base_agent import BaseAgent
 from lecturelens.config.settings import Settings
 from lecturelens.core.agent_runtime import AgentControl, RuntimeContext, execute_agent_main, run_standard_agent
 from lecturelens.core.clock import SessionClock
@@ -199,7 +200,7 @@ def save_slide_image(image_bytes: bytes, output_dir: str, slide_number: int) -> 
     return str(file_path)
 
 
-class ScreenAgent:
+class ScreenAgent(BaseAgent):
     def __init__(
         self,
         settings: Settings,
@@ -208,20 +209,11 @@ class ScreenAgent:
         session_id: str,
         llm_router: Any = None
     ) -> None:
-        self.settings: Settings = settings
-        self.redis_bus: RedisBus = redis_bus
-        self.session_clock: SessionClock = session_clock
-        self.session_id: str = session_id
+        super().__init__(settings, redis_bus, session_clock, session_id, "screen_agent")
         self.llm_router: Any = llm_router
-        self.is_running: bool = False
-
-        session_dir = settings.create_session_directories(session_id)
-        self.session_dir: Path = session_dir
-        self.slides_dir: Path = session_dir / "raw" / "slides"
-        # The pictures of the diagrams, which go into the notes.
-        self.figures_dir: Path = session_dir / "assets"
+        self.slides_dir: Path = self.session_dir / "raw" / "slides"
+        self.figures_dir: Path = self.session_dir / "assets"
         self.stream_name: str = f"lecturelens:{session_id}:stream:slide"
-        self.control: AgentControl = AgentControl(session_dir, "screen_agent")
         self.slide_counter: int = next_file_index(self.slides_dir, "slide_", ".png") - 1
         self.vision_embedder = get_shared_vision_embedder()
         self.gate: SlideChangeGate = SlideChangeGate(
