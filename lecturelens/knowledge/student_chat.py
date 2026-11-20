@@ -11,64 +11,45 @@ from lecturelens.router.messages import HumanMessage, response_to_text
 logger = logging.getLogger(__name__)
 
 TIMESTAMP_PATTERN = re.compile(r"\[\d\d:\d\d(?::\d\d)?\]")
-# The annotation holds a JSON object, which may itself contain braces (for
-# example a correction that mentions a set literal). A non greedy \{.*?\}
-# stopped at the first closing brace, so the tag was never matched: the
-# misconception was not recorded and the raw annotation leaked into the
-# answer shown to the student.
 MISCONCEPTION_TAG_START = re.compile(r"\[MISCONCEPTION:\s*", re.IGNORECASE)
 
 
 def extract_misconception_payload(text: str) -> tuple[Optional[str], str]:
-    """Split a misconception annotation off the answer.
-
-    Returns the JSON payload and the answer with the annotation removed.
-    """
+    """Split a misconception annotation off the answer, supporting nested braces."""
     match = MISCONCEPTION_TAG_START.search(text)
-    if match is None:
+    if not match:
+        return None, text.strip()
+    idx = text.find("{", match.end())
+    if idx < 0:
         return None, text.strip()
 
-    brace_index = text.find("{", match.end())
-    if brace_index < 0:
-        return None, text.strip()
-
-    depth = 0
-    in_string = False
-    escaped = False
-    closing_index = -1
-    for index in range(brace_index, len(text)):
-        character = text[index]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == '"':
-                in_string = False
+    depth, in_str, escaped, closing = 0, False, False, -1
+    for i in range(idx, len(text)):
+        ch = text[i]
+        if in_str:
+            if escaped: escaped = False
+            elif ch == "\\": escaped = True
+            elif ch == '"': in_str = False
             continue
-        if character == '"':
-            in_string = True
-        elif character == "{":
-            depth += 1
-        elif character == "}":
+        if ch == '"': in_str = True
+        elif ch == "{": depth += 1
+        elif ch == "}":
             depth -= 1
             if depth == 0:
-                closing_index = index
+                closing = i
                 break
-    if closing_index < 0:
+
+    if closing < 0:
         return None, text.strip()
 
-    payload = text[brace_index:closing_index + 1]
-    # The annotation ends with a closing bracket right after the payload. Only
-    # whitespace may separate them, otherwise a later bracket (for example a
-    # timestamp citation) would be swallowed.
-    head = text[:match.start()]
-    tail = text[closing_index + 1:]
-    stripped_tail = tail.lstrip()
-    if stripped_tail.startswith("]"):
-        tail = tail[len(tail) - len(stripped_tail) + 1:]
-    remainder = (head.rstrip() + " " + tail.lstrip()).strip() if head.strip() and tail.strip() else (head + tail).strip()
-    return payload, remainder
+    payload = text[idx:closing + 1]
+    head = text[:match.start()].rstrip()
+    tail = text[closing + 1:].lstrip()
+    if tail.startswith("]"):
+        tail = tail[1:].lstrip()
+    clean = f"{head} {tail}".strip() if head and tail else f"{head}{tail}".strip()
+    return payload, clean
+
 
 STUDENT_CHAT_SYSTEM_PROMPT = """
 You are an intelligent, empathetic academic tutor helping a student understand their lecture.
@@ -97,92 +78,43 @@ class StudentChatAgent:
         self.ollama_url = ollama_url.rstrip("/") if ollama_url else None
         self.model_name = model_name
 
-    def format_context_excerpts(
-        self,
-        timeline_events: list[dict[str, Any]],
-        notes_segments: list[dict[str, Any]],
-        max_events: int = 40
-    ) -> str:
+    def format_context_excerpts(self, timeline_events: list[dict[str, Any]], notes_segments: list[dict[str, Any]], max_events: int = 40) -> str:
         lines: list[str] = []
         if notes_segments:
             lines.append("LECTURE NOTES SECTIONS:")
             for note in notes_segments[-5:]:
-                start_str = note.get("start_time") or "00:00"
-                lines.append(f"[{start_str}] {note.get('heading', '')}: {note.get('content', '')}")
-
+                lines.append(f"[{note.get('start_time') or '00:00'}] {note.get('heading', '')}: {note.get('content', '')}")
         if timeline_events:
             lines.append("\nLECTURE TIMELINE MOMENTS:")
-            first_epoch = float(timeline_events[0].get("timestamp_epoch", 0.0)) if timeline_events else 0.0
-            for event in timeline_events[-max_events:]:
-                raw_elapsed = event.get("elapsed_seconds")
-                try:
-                    num_elapsed = float(raw_elapsed) if raw_elapsed is not None else 0.0
-                except (ValueError, TypeError):
-                    num_elapsed = 0.0
-
-                if num_elapsed <= 0.0 and isinstance(event.get("metadata"), dict):
-                    meta_start = event["metadata"].get("start_seconds")
-                    if meta_start is not None:
-                        try:
-                            meta_val = float(meta_start)
-                            if meta_val > 0.0:
-                                num_elapsed = meta_val
-                        except (ValueError, TypeError):
-                            pass
-
-                if num_elapsed <= 0.0:
-                    cur_epoch = float(event.get("timestamp_epoch", 0.0))
-                    if cur_epoch >= first_epoch > 0.0:
-                        diff = cur_epoch - first_epoch
-                        if diff > 0.0:
-                            num_elapsed = diff
-
-                mins = int(num_elapsed // 60)
-                secs = int(num_elapsed % 60)
-                stamp = f"[{mins:02d}:{secs:02d}]"
-                source = event.get("source_type", "")
-                content = event.get("content", "")
-                lines.append(f"{stamp} ({source}) {content}")
-
+            first = float(timeline_events[0].get("timestamp_epoch", 0.0))
+            for ev in timeline_events[-max_events:]:
+                sec = float(ev.get("elapsed_seconds") or 0.0)
+                if sec <= 0.0 and isinstance(ev.get("metadata"), dict) and "start_seconds" in ev["metadata"]:
+                    sec = float(ev["metadata"]["start_seconds"])
+                if sec <= 0.0 and float(ev.get("timestamp_epoch", 0.0)) >= first > 0.0:
+                    sec = float(ev.get("timestamp_epoch", 0.0)) - first
+                lines.append(f"[{int(sec // 60):02d}:{int(sec % 60):02d}] ({ev.get('source_type', '')}) {ev.get('content', '')}")
         return "\n".join(lines)
 
-    async def ask(
-        self,
-        question: str,
-        timeline_events: Optional[list[dict[str, Any]]] = None,
-        notes_segments: Optional[list[dict[str, Any]]] = None
-    ) -> tuple[str, list[str]]:
-        events = timeline_events or []
-        notes = notes_segments or []
-        context_str = self.format_context_excerpts(events, notes)
-
-        misconception_str = ""
-        if self.student_graph is not None:
+    async def ask(self, question: str, timeline_events: Optional[list[dict[str, Any]]] = None, notes_segments: Optional[list[dict[str, Any]]] = None) -> tuple[str, list[str]]:
+        context_str = self.format_context_excerpts(timeline_events or [], notes_segments or [])
+        misc_str = ""
+        if self.student_graph:
             known = self.student_graph.get_known_misconceptions()
             if known:
-                misconception_items = [f"- {m['concept_name']}: {m['error_pattern']}" for m in known[:5]]
-                misconception_str = "\nKNOWN STUDENT MISCONCEPTIONS:\n" + "\n".join(misconception_items)
+                misc_str = "\nKNOWN STUDENT MISCONCEPTIONS:\n" + "\n".join(f"- {m['concept_name']}: {m['error_pattern']}" for m in known[:5])
 
-        prompt = (
-            f"{STUDENT_CHAT_SYSTEM_PROMPT}\n\n"
-            f"{misconception_str}\n\n"
-            f"LECTURE CONTEXT:\n{context_str}\n\n"
-            f"STUDENT QUESTION:\n{question}\n\n"
-            f"TUTOR RESPONSE:"
-        )
+        prompt = f"{STUDENT_CHAT_SYSTEM_PROMPT}\n\n{misc_str}\n\nLECTURE CONTEXT:\n{context_str}\n\nSTUDENT QUESTION:\n{question}\n\nTUTOR RESPONSE:"
 
         if self.llm_router is not None:
-            response = await self.llm_router.ainvoke([HumanMessage(content=prompt)])
-            raw_answer = response_to_text(response)
+            resp = await self.llm_router.ainvoke([HumanMessage(content=prompt)])
+            raw_answer = response_to_text(resp)
         elif self.ollama_url:
             import httpx
             async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.post(
-                    f"{self.ollama_url}/api/generate",
-                    json={"model": self.model_name or DEFAULT_LOCAL_MODEL, "prompt": prompt, "stream": False}
-                )
-                resp.raise_for_status()
-                raw_answer = str(resp.json().get("response", "")).strip()
+                res = await client.post(f"{self.ollama_url}/api/generate", json={"model": self.model_name or DEFAULT_LOCAL_MODEL, "prompt": prompt, "stream": False})
+                res.raise_for_status()
+                raw_answer = str(res.json().get("response", "")).strip()
         else:
             raw_answer = "No LLM router or Ollama endpoint configured for student chat."
 
@@ -191,26 +123,12 @@ class StudentChatAgent:
             try:
                 data = json.loads(tag_payload)
                 concept = str(data.get("concept", "")).strip()
-                error = str(data.get("error", ""))
-                correction = str(data.get("correction", ""))
                 if concept:
-                    self.student_graph.record_misconception(concept, error, correction)
-                    self.student_graph.record_evidence(
-                        concept_name=concept,
-                        lecture_id="live_session",
-                        timestamp_epoch=time.time(),
-                        evidence_type="student_chat_misconception",
-                        excerpt=f"Q: {question} | Error: {error}"
-                    )
+                    self.student_graph.record_misconception(concept, str(data.get("error", "")), str(data.get("correction", "")))
+                    self.student_graph.record_evidence(concept, "live_session", time.time(), "student_chat_misconception", f"Q: {question} | Error: {data.get('error', '')}")
                 else:
-                    # The model annotated a misconception but left the
-                    # name of the concept out, so nothing can be
-                    # recorded. The answer keeps it, but the case used to
-                    # fall into a branch that was unreachable, because its
-                    # condition was identical to the one before it.
-                    logger.warning("misconception annotation without a concept name was ignored")
-            except Exception as parse_error:
-                logger.warning("could not parse misconception tag: %s", parse_error)
+                    logger.warning("misconception annotation without concept name ignored")
+            except Exception as e:
+                logger.warning("could not parse misconception: %s", e)
 
-        citations = TIMESTAMP_PATTERN.findall(clean_answer)
-        return clean_answer, citations
+        return clean_answer, TIMESTAMP_PATTERN.findall(clean_answer)
