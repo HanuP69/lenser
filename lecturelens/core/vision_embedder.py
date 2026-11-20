@@ -1,0 +1,189 @@
+import hashlib
+import os
+from pathlib import Path
+import threading
+from typing import Any, Optional
+import urllib.request
+import uuid
+import numpy as np
+
+from lecturelens.core.logging_setup import get_logger
+from lecturelens.utils.hashing import sha256_of_file
+
+logger = get_logger("lecturelens.vision_embedder")
+
+DEFAULT_MODEL_URL = "https://github.com/onnx/models/raw/main/validated/vision/classification/squeezenet/model/squeezenet1.1-7.onnx"
+MIN_MODEL_BYTES = 4_000_000
+# Pinned digest of the model referenced by DEFAULT_MODEL_URL. The file is
+# executed by onnxruntime in-process, so an unverified download would be a
+# supply-chain hole.
+EXPECTED_MODEL_SHA256 = "1eeff551a67ae8d565ca33b572fc4b66e3ef357b0eb2863bb9ff47a918cc4088"
+
+
+def expected_model_sha256() -> str:
+    """The pinned digest, overridable for users who mirror the model."""
+    override = os.environ.get("LECTURELENS_VISION_MODEL_SHA256", "").strip().lower()
+    return override or EXPECTED_MODEL_SHA256
+
+
+_SHARED_VISION_EMBEDDER: Optional["VisionEmbedder"] = None
+_EMBEDDER_LOCK: threading.Lock = threading.Lock()
+
+
+def get_shared_vision_embedder() -> "VisionEmbedder":
+    global _SHARED_VISION_EMBEDDER
+    if _SHARED_VISION_EMBEDDER is None:
+        with _EMBEDDER_LOCK:
+            if _SHARED_VISION_EMBEDDER is None:
+                _SHARED_VISION_EMBEDDER = VisionEmbedder()
+    return _SHARED_VISION_EMBEDDER
+
+
+class VisionEmbedder:
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        auto_download: bool = True
+    ) -> None:
+        self.session: Optional[Any] = None
+        self.input_name: Optional[str] = None
+        self.auto_download: bool = auto_download
+
+        if model_path is None:
+            cache_dir = Path.home() / ".cache" / "lecturelens" / "models"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            self.model_path = cache_dir / "squeezenet1.1.onnx"
+        else:
+            self.model_path = Path(model_path)
+
+        self._initialize_session()
+
+    def _ensure_model_file(self) -> bool:
+        if self.model_path.exists():
+            try:
+                if self.model_path.stat().st_size >= MIN_MODEL_BYTES:
+                    if self._verify_checksum(self.model_path):
+                        return True
+                    logger.warning(
+                        "cached vision model %s failed the checksum check; re-downloading",
+                        self.model_path
+                    )
+                self.model_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if not self.auto_download:
+            return False
+        try:
+            self.model_path.parent.mkdir(parents=True, exist_ok=True)
+            unique_id = uuid.uuid4().hex[:8]
+            temp_path = self.model_path.with_name(f"{self.model_path.stem}_{unique_id}.tmp")
+            req = urllib.request.Request(
+                DEFAULT_MODEL_URL,
+                headers={"User-Agent": "LectureLens/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=60.0) as resp:
+                with open(temp_path, "wb") as out_file:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        out_file.write(chunk)
+            if temp_path.stat().st_size < MIN_MODEL_BYTES:
+                temp_path.unlink(missing_ok=True)
+                logger.warning("Downloaded model file is too small or truncated")
+                return False
+            if not self._verify_checksum(temp_path):
+                temp_path.unlink(missing_ok=True)
+                logger.error("Downloaded model file failed the checksum check and was discarded")
+                return False
+            temp_path.replace(self.model_path)
+            return True
+        except Exception as error:
+            logger.warning("Failed to download vision embedder model: %s", error)
+            return False
+
+    def _verify_checksum(self, path: Path) -> bool:
+        expected = expected_model_sha256()
+        try:
+            actual = sha256_of_file(path)
+        except OSError as error:
+            logger.warning("could not read %s for verification: %s", path, error)
+            return False
+        if actual != expected:
+            return False
+        return True
+
+    def _initialize_session(self) -> None:
+        try:
+            import onnxruntime as ort
+        except ImportError:
+            logger.warning("onnxruntime not installed, vision embedder disabled")
+            return
+
+        if not self._ensure_model_file():
+            return
+
+        try:
+            options = ort.SessionOptions()
+            options.intra_op_num_threads = 1
+            options.inter_op_num_threads = 1
+            self.session = ort.InferenceSession(
+                str(self.model_path),
+                options,
+                providers=["CPUExecutionProvider"]
+            )
+            self.input_name = self.session.get_inputs()[0].name
+        except Exception as error:
+            logger.warning("Failed to initialize vision embedder session: %s", error)
+            self.session = None
+
+    def is_available(self) -> bool:
+        return self.session is not None
+
+    def preprocess(self, image_array: np.ndarray) -> np.ndarray:
+        try:
+            from PIL import Image
+            if image_array.ndim == 2:
+                pil_img = Image.fromarray(image_array).convert("RGB")
+            elif image_array.shape[2] == 4:
+                pil_img = Image.fromarray(image_array).convert("RGB")
+            else:
+                pil_img = Image.fromarray(image_array)
+            resized = pil_img.resize((224, 224))
+            arr = np.array(resized, dtype=np.float32) / 255.0
+        except Exception:
+            h, w = image_array.shape[:2]
+            r_idx = np.linspace(0, h - 1, 224).astype(int)
+            c_idx = np.linspace(0, w - 1, 224).astype(int)
+            if image_array.ndim == 2:
+                sampled = image_array[np.ix_(r_idx, c_idx)]
+                arr = np.repeat(sampled[:, :, np.newaxis], 3, axis=2).astype(np.float32) / 255.0
+            else:
+                sampled = image_array[np.ix_(r_idx, c_idx, np.arange(min(3, image_array.shape[2])))]
+                arr = sampled.astype(np.float32) / 255.0
+
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        normalized = (arr - mean) / std
+        transposed = np.transpose(normalized, (2, 0, 1))
+        return np.expand_dims(transposed, axis=0).astype(np.float32)
+
+    def embed(self, image_array: np.ndarray) -> Optional[np.ndarray]:
+        if self.session is None or self.input_name is None:
+            return None
+        try:
+            tensor = self.preprocess(image_array)
+            raw_output = self.session.run(None, {self.input_name: tensor})[0].flatten()
+            norm = np.linalg.norm(raw_output)
+            if norm <= 1e-9:
+                return raw_output
+            return raw_output / norm
+        except Exception as error:
+            logger.warning("Vision embedding extraction failed: %s", error)
+            return None
+
+    def similarity(self, first_vec: np.ndarray, second_vec: np.ndarray) -> float:
+        if first_vec.shape != second_vec.shape:
+            return 0.0
+        dot_product = float(np.dot(first_vec, second_vec))
+        return max(-1.0, min(1.0, dot_product))

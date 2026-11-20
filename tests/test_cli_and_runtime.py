@@ -1,0 +1,549 @@
+import asyncio
+import json
+import os
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from typing import Any
+from unittest import mock
+
+import typer
+
+from lecturelens.cli import helpers
+from lecturelens.config.settings import Settings
+from lecturelens.core import agent_runtime
+from lecturelens.core.agent_runtime import AgentControl, read_heartbeats
+from tests.support import index_by
+
+from lecturelens.cli.app import (
+    build_agent_environment,
+    module_for_agent,
+    plan_agents,
+)
+from lecturelens.cli.commands.knowledge import (
+    ask,
+    review,
+)
+from lecturelens.cli.commands.remote import (
+    client,
+    replay,
+    student,
+)
+from lecturelens.cli.commands.session import (
+    export,
+    pause,
+    reprocess,
+    resume,
+    start,
+    stop,
+)
+from lecturelens.cli.commands import session as session_cli
+
+
+class TestHelpers(unittest.TestCase):
+    def test_option_validation(self) -> None:
+        helpers.validate_start_options("mic", "local", "local")
+        with self.assertRaises(ValueError):
+            helpers.validate_start_options("micc", "local", "local")
+        with self.assertRaises(ValueError):
+            helpers.validate_start_options("mic", "everywhere", "local")
+        with self.assertRaises(ValueError):
+            helpers.validate_start_options("mic", "local", "cluster")
+        with self.assertRaises(ValueError):
+            helpers.validate_export_format("docx")
+        with self.assertRaises(ValueError):
+            helpers.validate_export_format("pdf")
+        self.assertEqual(helpers.validate_export_format("md"), "md")
+
+    def test_format_elapsed(self) -> None:
+        self.assertEqual(helpers.format_elapsed(3725.9), "01:02:05")
+        self.assertEqual(helpers.format_elapsed(-5), "00:00:00")
+
+    def test_heartbeat_classification(self) -> None:
+        now = time.time()
+        self.assertEqual(helpers.classify_heartbeat(None, now), "NO DATA")
+        self.assertEqual(helpers.classify_heartbeat({"state": "live", "time": now}, now), "LIVE")
+        self.assertEqual(helpers.classify_heartbeat({"state": "paused", "time": now}, now), "PAUSED")
+        self.assertEqual(helpers.classify_heartbeat({"state": "live", "time": now - 60}, now), "ERROR")
+        self.assertEqual(helpers.classify_heartbeat({"state": "stopped", "time": now - 60}, now), "STOPPED")
+
+    def test_agent_rows_combine_process_and_heartbeat(self) -> None:
+        now = time.time()
+        rows = helpers.build_agent_rows(
+            {"audio_agent": "RUNNING", "screen_agent": "FAILED_EXIT_1"},
+            {"audio_agent": {"state": "live", "time": now, "stats": {"transcripts_published": 4}},
+             "screen_agent": {"state": "live", "time": now, "stats": {}}},
+            now
+        )
+        by_name = index_by(rows, "agent")
+        self.assertEqual(by_name["audio_agent"]["status"], "LIVE")
+        self.assertIn("transcripts_published=4", by_name["audio_agent"]["stats"])
+        self.assertEqual(by_name["screen_agent"]["status"], "ERROR")
+
+    def test_tail_and_snippet_and_line_counter(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "timeline.jsonl"
+            self.assertIsNone(helpers.tail_last_line(path))
+            self.assertEqual(helpers.last_transcript_snippet(path), "")
+            counter = helpers.LineCounter(path)
+            self.assertEqual(counter.refresh(), 0)
+            lines = [
+                {"source_type": "transcript", "content": "first words"},
+                {"source_type": "slide", "content": "slide text"},
+                {"source_type": "transcript", "content": "x" * 300}
+            ]
+            encoded_lines: list[str] = []
+            for line in lines:
+                encoded_lines.append(json.dumps(line))
+            path.write_text("\n".join(encoded_lines) + "\n", encoding="utf-8")
+            self.assertEqual(counter.refresh(), 3)
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"source_type": "board", "content": "b"}) + "\n")
+            self.assertEqual(counter.refresh(), 4)
+            self.assertTrue(helpers.last_transcript_snippet(path).endswith("..."))
+            self.assertIn("board", helpers.tail_last_line(path))
+            path.write_text("", encoding="utf-8")
+            self.assertEqual(counter.refresh(), 0)
+
+    def test_low_disk_warning(self) -> None:
+        self.assertIsNone(helpers.format_low_disk_warning(10 * 1024 ** 3))
+        message = helpers.format_low_disk_warning(1024 ** 3)
+        self.assertIn("1.0 GB", message)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.assertGreater(helpers.get_free_disk_bytes(Path(temp_dir) / "not" / "yet" / "created"), 0)
+
+    def test_find_latest_session_ignores_internal_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir)
+            (output / "_courses").mkdir()
+            (output / "old").mkdir()
+            (output / "old" / "session_meta.json").write_text("{}")
+            time.sleep(0.02)
+            (output / "new").mkdir()
+            (output / "new" / "session_meta.json").write_text("{}")
+            (output / "no_meta").mkdir()
+            self.assertEqual(helpers.find_latest_session(output), "new")
+            self.assertIsNone(helpers.find_latest_session(output / "missing"))
+
+    def test_format_file_size(self) -> None:
+        self.assertEqual(helpers.format_file_size(500), "500 B")
+        self.assertEqual(helpers.format_file_size(2048), "2.0 KB")
+        self.assertEqual(helpers.format_file_size(5 * 1024 * 1024), "5.0 MB")
+
+    def test_count_file_lines_and_images(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            file_path = Path(temp_dir) / "test.txt"
+            file_path.write_text("line1\nline2\nline3\n", encoding="utf-8")
+            self.assertEqual(helpers.count_file_lines(file_path), 3)
+            self.assertEqual(helpers.count_file_lines(Path(temp_dir) / "missing.txt"), 0)
+
+            img_dir = Path(temp_dir) / "raw" / "screen"
+            img_dir.mkdir(parents=True)
+            (img_dir / "frame_001.jpg").write_bytes(b"dummy_image_bytes")
+            count, size = helpers.count_images_in_directory(img_dir)
+            self.assertEqual(count, 1)
+            self.assertGreater(size, 0)
+
+    def test_build_session_output_table_and_display(self) -> None:
+        from rich.console import Console
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_dir = Path(temp_dir) / "test_sess"
+            session_dir.mkdir(parents=True)
+            (session_dir / "notes.md").write_text("# Notes\n- item 1\n", encoding="utf-8")
+            (session_dir / "timeline.jsonl").write_text('{"event": 1}\n{"event": 2}\n', encoding="utf-8")
+            (session_dir / "session_meta.json").write_text('{"runs": []}', encoding="utf-8")
+
+            table = helpers.build_session_output_table(session_dir)
+            self.assertIsNotNone(table)
+
+            console = Console(record=True)
+            helpers.display_session_output_summary(session_dir, console)
+            output = console.export_text()
+            self.assertIn("notes.md", output)
+            self.assertIn("timeline.jsonl", output)
+            self.assertIn("test_sess", output)
+
+
+class TestRuntimeControl(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.session_dir = Path(self.temp_dir.name)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_flags_and_pause_state(self) -> None:
+        control = AgentControl(self.session_dir, "audio_agent")
+        self.assertFalse(control.stop_requested())
+        self.assertFalse(control.is_paused())
+        agent_runtime.set_flag(self.session_dir, "stop.flag")
+        agent_runtime.set_flag(self.session_dir, agent_runtime.PAUSE_FLAG_NAME)
+        self.assertTrue(control.stop_requested())
+        self.assertTrue(control.is_paused())
+        agent_runtime.clear_all_flags(self.session_dir)
+        self.assertFalse(control.stop_requested())
+
+    def test_each_agent_uses_its_own_stop_flag(self) -> None:
+        sync_control = AgentControl(self.session_dir, "sync_agent", agent_runtime.SYNC_STOP_FLAG_NAME)
+        agent_runtime.set_flag(self.session_dir, "stop.flag")
+        self.assertFalse(sync_control.stop_requested())
+        agent_runtime.set_flag(self.session_dir, agent_runtime.SYNC_STOP_FLAG_NAME)
+        self.assertTrue(sync_control.stop_requested())
+
+    def test_heartbeat_round_trip(self) -> None:
+        (self.session_dir / "heartbeats").mkdir()
+        control = AgentControl(self.session_dir, "audio_agent")
+        control.increment_stat("transcripts_published", 2)
+        control.write_heartbeat("live")
+        beats = read_heartbeats(self.session_dir)
+        self.assertEqual(beats["audio_agent"]["state"], "live")
+        self.assertEqual(beats["audio_agent"]["stats"]["transcripts_published"], 2)
+        self.assertEqual(beats["audio_agent"]["pid"], os.getpid())
+
+    def test_corrupt_heartbeat_is_ignored(self) -> None:
+        (self.session_dir / "heartbeats").mkdir()
+        (self.session_dir / "heartbeats" / "bad.json").write_text("{oops")
+        self.assertEqual(read_heartbeats(self.session_dir), {})
+
+    def test_runtime_context_uses_session_argument_and_validates(self) -> None:
+        with mock.patch.dict(os.environ, {"LECTURELENS_OUTPUT_DIR": self.temp_dir.name}):
+            namespace = agent_runtime.parse_runtime_arguments(["--session", "lecture1", "--audio-source", "both", "--unknown", "x"])
+            self.assertEqual(namespace.session, "lecture1")
+            context = agent_runtime.build_runtime_context(namespace)
+            self.assertEqual(context.session_id, "lecture1")
+            self.assertEqual(context.settings.audio_source, "both")
+            self.assertTrue((Path(self.temp_dir.name) / "lecture1" / "clock.json").exists())
+            bad = agent_runtime.parse_runtime_arguments(["--session", "../escape"])
+            with self.assertRaises(ValueError):
+                agent_runtime.build_runtime_context(bad)
+
+
+class TestCliCommands(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.output = Path(self.temp_dir.name)
+        self.environment = mock.patch.dict(os.environ, {"LECTURELENS_OUTPUT_DIR": self.temp_dir.name})
+        self.environment.start()
+        self.session_dir = self.output / "lec1"
+        for sub in ("control", "heartbeats", "logs"):
+            (self.session_dir / sub).mkdir(parents=True)
+        (self.session_dir / "session_meta.json").write_text(json.dumps({"runs": []}))
+        (self.session_dir / "notes.md").write_text("### 10:00:00\n\nBinary search is **fast**.\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self.environment.stop()
+        self.temp_dir.cleanup()
+
+    def test_plan_agents(self) -> None:
+        full = plan_agents("local", False, False)
+        self.assertEqual(sorted(full), ["audio_agent", "screen_agent", "structuring_agent", "sync_agent"])
+        self.assertNotIn("screen_agent", plan_agents("local", False, True))
+        self.assertEqual(
+            sorted(plan_agents("local", True, False)),
+            ["audio_agent", "structuring_agent", "sync_agent"]
+        )
+        self.assertIn("gateway", plan_agents("server", True, False))
+        self.assertNotIn("persister", plan_agents("server", True, False))
+        self.assertIn("persister", plan_agents("server", True, False, enable_persister=True))
+        self.assertIn("persister", plan_agents("local", False, False, enable_persister=True))
+
+    def test_environment_passes_absolute_paths_and_course(self) -> None:
+        settings = Settings()
+        environment = build_agent_environment(settings, "lec1", "system", 2, "hybrid", "algorithms")
+        self.assertTrue(Path(environment["LECTURELENS_OUTPUT_DIR"]).is_absolute())
+        self.assertTrue(Path(environment["LECTURELENS_ROUTER_CONFIG_PATH"]).is_absolute())
+        self.assertEqual(environment["LECTURELENS_AUDIO_SOURCE"], "system")
+        self.assertEqual(environment["LECTURELENS_LLM_MODE"], "hybrid")
+        self.assertEqual(environment["LECTURELENS_COURSE_NAME"], "algorithms")
+        self.assertEqual(environment["LECTURELENS_MONITOR_INDEX"], "2")
+
+    def test_environment_passes_unorouter_api_key(self) -> None:
+        # The settings are set explicitly, so the test does not depend on
+        # whatever is in the .env file of the machine it runs on.
+        settings = Settings()
+        settings.unorouter_api_key = "test_uno_key"
+        settings.unorouter_api_keys = "k1,k2"
+        with mock.patch.dict(os.environ, {
+            "UNOROUTER_API_KEY": "test_uno_key",
+            "GOOGLE_API_KEYS": "k1,k2",
+            "OPENROUTER_API_KEYS": "ok1,ok2"
+        }):
+            environment = build_agent_environment(settings, "lec1", "system", 1, "hybrid", None)
+            self.assertEqual(environment["LECTURELENS_UNOROUTER_API_KEY"], "test_uno_key")
+            self.assertEqual(environment["LECTURELENS_UNOROUTER_API_KEYS"], "k1,k2")
+            self.assertEqual(environment["LECTURELENS_GOOGLE_API_KEYS"], "k1,k2")
+            self.assertEqual(environment["LECTURELENS_OPENROUTER_API_KEYS"], "ok1,ok2")
+            self.assertIn("LECTURELENS_REDIS_URL", environment)
+            self.assertIn("LECTURELENS_OLLAMA_URL", environment)
+            self.assertIn("LECTURELENS_DRIFT_THRESHOLD", environment)
+
+    def test_settings_syncs_drift_threshold(self) -> None:
+        with mock.patch.dict(os.environ, {"LECTURELENS_DRIFT_THRESHOLD": "0.65"}):
+            s = Settings()
+            self.assertEqual(s.drift_similarity_threshold, 0.65)
+
+    def test_module_names(self) -> None:
+        self.assertEqual(module_for_agent("gateway"), "lecturelens.gateway.server")
+        self.assertEqual(module_for_agent("audio_agent"), "lecturelens.agents.audio_agent")
+
+    def test_pause_and_resume_toggle_flag(self) -> None:
+        pause(session="lec1")
+        self.assertTrue(agent_runtime.flag_exists(self.session_dir, agent_runtime.PAUSE_FLAG_NAME))
+        resume(session="lec1")
+        self.assertFalse(agent_runtime.flag_exists(self.session_dir, agent_runtime.PAUSE_FLAG_NAME))
+
+    def test_stop_sets_shutdown_request_without_waiting(self) -> None:
+        stop(session="lec1", wait=False, timeout_seconds=1.0)
+        self.assertTrue(agent_runtime.flag_exists(self.session_dir, agent_runtime.SHUTDOWN_REQUEST_FLAG_NAME))
+
+    def test_stop_waits_for_finished_flag(self) -> None:
+        agent_runtime.set_flag(self.session_dir, agent_runtime.SESSION_FINISHED_FLAG_NAME)
+        with mock.patch.object(agent_runtime, "clear_flag"):
+            with mock.patch.object(session_cli, "clear_flag"):
+                stop(session="lec1", wait=True, timeout_seconds=3.0)
+
+    def test_stop_times_out_when_session_never_finishes(self) -> None:
+        with self.assertRaises(typer.Exit):
+            stop(session="lec1", wait=True, timeout_seconds=0.3)
+
+    def test_cli_options_fall_back_to_the_configured_settings(self) -> None:
+        """The option defaults were exported unconditionally, so the values
+        configured in .env were always overridden."""
+        import inspect
+
+        for command_name, command in (
+            ("client", client),
+            ("ask", ask),
+            ("reprocess", reprocess),
+            ("start", start),
+        ):
+            signature = inspect.signature(command)
+            for parameter_name, parameter in signature.parameters.items():
+                if parameter_name not in ("audio_source", "monitor_index", "llm_mode"):
+                    continue
+                default = parameter.default
+                option_default = getattr(default, "default", None)
+                self.assertIsNone(
+                    option_default,
+                    f"{command_name} --{parameter_name} must default to None so the "
+                    "configured settings are used"
+                )
+
+    def test_stop_rejects_non_positive_timeout(self) -> None:
+        """A non-positive timeout used to disable the deadline and hang forever."""
+        with self.assertRaises(typer.Exit):
+            stop(session="lec1", wait=True, timeout_seconds=0)
+        with self.assertRaises(typer.Exit):
+            stop(session="lec1", wait=True, timeout_seconds=-1.0)
+
+    def test_session_id_with_trailing_newline_is_rejected(self) -> None:
+        """`$` matched before a trailing newline, so "lec1\n" passed validation."""
+        with self.assertRaises(typer.Exit):
+            pause(session="lec1\n")
+        with self.assertRaises(typer.Exit):
+            pause(session="lec1\n../../etc")
+
+    def test_reprocess_does_not_probe_redis_inside_the_event_loop(self) -> None:
+        """reprocess used to call check_redis() (which runs its own asyncio.run)
+        from inside the coroutine driven by asyncio.run, which always raised
+        RuntimeError and made the command a no-op."""
+        timeline = self.session_dir / "timeline.jsonl"
+        timeline.write_text(
+            json.dumps({
+                "session_id": "lec1",
+                "timestamp_epoch": 100.0,
+                "source_type": "transcript",
+                "content": "binary search halves the search space",
+            }) + "\n",
+            encoding="utf-8",
+        )
+
+        def fake_check_redis(settings: Any) -> bool:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return False
+            raise AssertionError("check_redis() must not be called from inside a running event loop")
+
+        processed: list[int] = []
+
+        class FakeStructuringAgent:
+            def __init__(self, **kwargs: Any) -> None:
+                self.reset_called = False
+
+            def reset_outputs(self) -> None:
+                self.reset_called = True
+
+            async def process_all_pending(self) -> int:
+                processed.append(1)
+                return 3
+
+        with mock.patch.object(session_cli, "check_redis", side_effect=fake_check_redis):
+            with mock.patch("lecturelens.agents.structuring_agent.StructuringAgent", FakeStructuringAgent):
+                with mock.patch("lecturelens.router.llm_router.build_router_for_task", return_value=None):
+                    with mock.patch("lecturelens.router.llm_router.load_router_config", return_value={}):
+                        reprocess(session="lec1")
+
+        self.assertEqual(processed, [1])
+
+    def test_unknown_or_invalid_sessions_exit_with_error(self) -> None:
+        with self.assertRaises(typer.Exit):
+            pause(session="does_not_exist")
+        with self.assertRaises(typer.Exit):
+            pause(session="../etc")
+
+    def test_session_defaults_to_latest_instead_of_default_session(self) -> None:
+        pause(session=None)
+        self.assertTrue(agent_runtime.flag_exists(self.session_dir, agent_runtime.PAUSE_FLAG_NAME))
+
+    def test_export_md_and_rejects_unknown_format(self) -> None:
+        destination = self.output / "out"
+        export(export_format="md", session="lec1", output=destination)
+        self.assertTrue((destination / "lec1_notes.md").exists())
+        with self.assertRaises(typer.Exit):
+            export(export_format="docx", session="lec1", output=destination)
+
+    def test_export_copies_the_pictures_of_the_diagrams(self) -> None:
+        """The notes point at the pictures by a path that is relative to
+        them, so the pictures have to travel with the notes."""
+        assets = self.session_dir / "assets"
+        assets.mkdir(parents=True, exist_ok=True)
+        (assets / "figure_0001.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        notes = self.session_dir / "notes.md"
+        notes.write_text(
+            "### 00:01:00\n\n![A neuron](assets/figure_0001.png)\n",
+            encoding="utf-8"
+        )
+        destination = self.output / "out"
+        export(export_format="md", session="lec1", output=destination)
+        self.assertTrue((destination / "assets" / "figure_0001.png").exists())
+
+    def test_export_html_has_the_pictures_inside_it(self) -> None:
+        assets = self.session_dir / "assets"
+        assets.mkdir(parents=True, exist_ok=True)
+        (assets / "figure_0001.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        notes = self.session_dir / "notes.md"
+        notes.write_text(
+            "### 00:01:00\n\n![A neuron](assets/figure_0001.png)\n",
+            encoding="utf-8"
+        )
+        destination = self.output / "out"
+        export(export_format="html", session="lec1", output=destination)
+        page = (destination / "lec1_notes.html").read_text(encoding="utf-8")
+        self.assertIn("data:image/png;base64,", page)
+
+    def test_review_command_executes(self) -> None:
+        review(course="algorithms", session=None)
+        review(course=None, session="lec1")
+
+    def test_ask_command_accepts_student_id_argument(self) -> None:
+        import inspect
+        sig = inspect.signature(ask)
+        self.assertIn("student_id", sig.parameters)
+
+    def test_start_refuses_existing_session_without_resume(self) -> None:
+        with self.assertRaises(typer.Exit):
+            start(
+                mode="local", audio_source="mic", no_screen=False, audio_only=False,
+                session="lec1", course=None, monitor_index=1, llm_mode="local", resume=False
+            )
+
+    def test_start_rejects_bad_options_before_touching_anything(self) -> None:
+        with self.assertRaises(typer.Exit):
+            start(
+                mode="local", audio_source="loudspeaker", no_screen=False, audio_only=False,
+                session="fresh", course=None, monitor_index=1, llm_mode="local", resume=False
+            )
+        with self.assertRaises(typer.Exit):
+            start(
+                mode="local", audio_source="mic", no_screen=False, audio_only=False,
+                session="../x", course=None, monitor_index=1, llm_mode="local", resume=False
+            )
+        self.assertFalse((self.output / "fresh").exists())
+
+    def test_start_requires_redis(self) -> None:
+        with mock.patch.object(session_cli, "check_redis", return_value=False):
+            with self.assertRaises(typer.Exit):
+                start(
+                    mode="local", audio_source="mic", no_screen=False, audio_only=False,
+                    session="fresh2", course=None, monitor_index=1, llm_mode="local", resume=False
+                )
+        self.assertFalse((self.output / "fresh2").exists())
+
+    def test_client_rejects_system_audio_without_loopback(self) -> None:
+        with mock.patch("lecturelens.agents.audio_agent.find_loopback_microphone", return_value=(None, "No loopback device")):
+            with self.assertRaises(typer.Exit):
+                client(
+                    session="fresh3",
+                    server=None,
+                    api_key=None,
+                    audio_source="system",
+                    no_screen=False,
+                    audio_only=False,
+                    monitor_index=1
+                )
+
+    def test_ask_command_passes_configured_qa_embed_batch_size(self) -> None:
+        captured_kwargs = {}
+
+        class DummyQAEngine:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                captured_kwargs.update(kwargs)
+
+            async def ask_with_sources(self, question: str) -> tuple[str, list]:
+                return "Answer", ["Source 1"]
+
+        with mock.patch("lecturelens.cli.app.check_redis", return_value=False), \
+             mock.patch("lecturelens.knowledge.qa_engine.QAEngine", DummyQAEngine):
+            session_dir = self.output / "test_qa_sess"
+            session_dir.mkdir(parents=True, exist_ok=True)
+            ask(question="What is dynamic programming?", session="test_qa_sess", student_id=None)
+            self.assertEqual(captured_kwargs.get("embed_batch_size"), 32)
+
+    def test_student_output_dir_uses_sanitized_id(self) -> None:
+        with mock.patch("lecturelens.client.student_client.StudentClient") as MockClient:
+            mock_instance = mock.MagicMock()
+            mock_instance.run = mock.AsyncMock()
+            MockClient.return_value = mock_instance
+            student(
+                server="ws://localhost:8765",
+                session="test_sess",
+                student_id="../../escaped_student",
+                language="English",
+                detail="comprehensive",
+                api_key=None
+            )
+            _, kwargs = MockClient.call_args
+            out_dir = kwargs.get("output_dir")
+            self.assertIsNotNone(out_dir)
+            self.assertEqual(out_dir.name, "escaped_student")
+            self.assertTrue(out_dir.resolve().is_relative_to(Settings().output_dir.resolve()))
+
+    def test_event_loop_helper(self) -> None:
+        from lecturelens.core.event_loop import ensure_event_loop_policy, run_async
+        ensure_event_loop_policy()
+
+        async def sample_coro() -> int:
+            return 42
+
+        self.assertEqual(run_async(sample_coro()), 42)
+
+    def test_replay_cli_invokes_engine_and_reports_counts(self) -> None:
+        (self.session_dir / "timeline.jsonl").write_text('{"event_id": "1"}\n', encoding="utf-8")
+        with mock.patch("lecturelens.cli.commands.remote.create_redis_bus") as mock_bus_factory, \
+             mock.patch("lecturelens.core.replay.ReplayEngine.replay", new_callable=mock.AsyncMock) as mock_replay:
+            mock_bus = mock.AsyncMock()
+            mock_bus_factory.return_value = mock_bus
+            mock_replay.return_value = 1
+
+            replay(session="lec1", speed=2.0, target_session="target_lec")
+            mock_bus_factory.assert_called_once()
+            _, kwargs = mock_bus_factory.call_args
+            self.assertEqual(kwargs.get("component_name"), "replay_lec1")
+            self.assertEqual(kwargs.get("outbox_path"), self.session_dir / "redis_outbox_replay.db")
+            mock_replay.assert_awaited_once_with(target_session_id="target_lec")
+
+
+if __name__ == "__main__":
+    unittest.main()

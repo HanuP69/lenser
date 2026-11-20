@@ -1,0 +1,187 @@
+{
+  "name": "lecturelens-capture-eval",
+  "version": 1,
+  "description": "The videos the capture is measured on. Every one of them answers a different question about the capture, and every one of them was checked to see whether the text on the screen can be read at all.",
+  "data_root": "D:/Temp/opencode/eval",
+  "rules": {
+    "height": 1080,
+    "why_height": "The size of the text in the picture decides how well it can be read. A video at 360p and one at 1080p differ more than the systems do.",
+    "why_one_second": "The capture looks at the screen once a second, so the ground truth is built on the same clock."
+  },
+  "videos": [
+    {
+      "id": "A_mit_6_0001_spring2018_lecture1",
+      "archetype": "A_slides",
+      "file": "videos/A_mit_6_0001_spring2018_lecture1.mp4",
+      "url": "https://www.youtube.com/watch?v=xAcTmDO6NTI",
+      "credit": "MIT 6.0001 Introduction to CS and Programming Using Python, Spring 2018, Ana Bell and Eric Grimson",
+      "license": "CC BY-NC-SA 4.0, MIT OpenCourseWare",
+      "height": 1080,
+      "use_seconds": null,
+      "text_is_printed": true,
+      "ocr_probe": {"score": 0.99, "lines": 14, "ms": 9093},
+      "ground_truth": {
+        "kind": "slide_notes_pdf",
+        "auto": true,
+        "sources": ["sources/mit_6_0001_fall_2016/e921a690079369751bcce3e34da6c6ee_MIT6_0001F16_Lec1.pdf"],
+        "note": "The notes are of the same lecture in the term before, and the deck is the same one. The picture of a slide and the page of the notes were matched and the match was between 73 and 88 out of a hundred on the slides that had text on them."
+      },
+      "why": "The pair of the set. Printed slides that fill the frame and a public text of them, so the reading of the screen is measured against the real thing and not against a reading of it."
+    },
+    {
+      "id": "B_statquest_gradient_descent",
+      "archetype": "A_slides",
+      "file": "videos/B_statquest_gradient_descent.mp4",
+      "url": "https://www.youtube.com/watch?v=sDv4f4s2SB8",
+      "credit": "StatQuest with Josh Starmer",
+      "license": "Used for internal measurement only.",
+      "height": 1080,
+      "use_seconds": null,
+      "text_is_printed": true,
+      "ocr_probe": {"score": 0.99, "lines": 6, "ms": 2172},
+      "ground_truth": {
+        "kind": "manual_key_facts",
+        "auto": false,
+        "note": "The slides are a picture of a picture, so the text is read from the picture and checked by hand."
+      },
+      "why": "Printed slides that fill the frame. The text is read almost without a mistake, so any loss is the fault of the capture and not of the reading."
+    },
+    {
+      "id": "A_cs231n_lecture1",
+      "archetype": "A_slides",
+      "file": "videos/A_cs231n_lecture1.mp4",
+      "url": "https://www.youtube.com/watch?v=2fq9wYslV0A",
+      "credit": "Stanford CS231N, Spring 2025",
+      "license": "Used for internal measurement only.",
+      "height": 1080,
+      "use_seconds": 1500,
+      "text_is_printed": true,
+      "ocr_probe": {"score": 0.99, "lines": 9, "ms": 1781},
+      "ground_truth": {
+        "kind": "slide_deck_pdf",
+        "auto": false,
+        "note": "The slides are on a drive of the course. They are the text of the screen once they are fetched."
+      },
+      "why": "Dense slides with a picture next to them, and a diagram that appears later in the lecture. It is the hard part of the slide case."
+    },
+    {
+      "id": "G_nptel_ml_overview",
+      "archetype": "G_hinglish",
+      "file": "videos/G_nptel_ml_overview.mp4",
+      "url": "https://www.youtube.com/watch?v=SThBzCPRmYg",
+      "credit": "NPTEL, IISc",
+      "license": "NPTEL lectures are open for educational use.",
+      "height": 1080,
+      "use_seconds": null,
+      "text_is_printed": true,
+      "ocr_probe": {"score": 0.98, "lines": 88, "ms": 3047},
+      "ground_truth": {
+        "kind": "manual_key_facts",
+        "auto": false,
+        "note": "The lecture is in Hindi and English together, which is the case the notes have to work in."
+      },
+      "why": "The lectures the user actually records. The language is mixed, so the text and the speech have to be put together."
+    },
+    {
+      "id": "C_corey_schafer_lists",
+      "archetype": "C_code",
+      "file": "videos/C_corey_schafer_lists.mp4",
+      "url": "https://www.youtube.com/watch?v=W8KRzm-HUcc",
+      "credit": "Corey Schafer",
+      "license": "Used for internal measurement only.",
+      "height": 1080,
+      "use_seconds": null,
+      "text_is_printed": true,
+      "ocr_probe": {"score": 0.99, "lines": 11, "ms": 2109},
+      "ground_truth": {
+        "kind": "code_repository",
+        "auto": true,
+        "note": "The code is in a repository that is public, so the text on the screen can be found in it."
+      },
+      "why": "An editor with a picture in it, and the code that is being typed. The text changes line by line, not slide by slide."
+    },
+    {
+      "id": "B_karpathy_micrograd",
+      "archetype": "F_messy",
+      "file": "videos/B_karpathy_micrograd.mp4",
+      "url": "https://www.youtube.com/watch?v=VMj-3S1tku0",
+      "credit": "Andrej Karpathy",
+      "license": "Used for internal measurement only.",
+      "height": 1080,
+      "use_seconds": 1500,
+      "text_is_printed": true,
+      "ocr_probe": {"score": 0.94, "lines": 153, "ms": 3891},
+      "ground_truth": {
+        "kind": "manual_key_facts",
+        "auto": false,
+        "note": "A browser with the menu bar and the tabs in it. Most of the hundred and fifty lines are not the lecture."
+      },
+      "why": "The hardest case for the trigger. The window is full of things that are not the lecture, and the reading of the whole frame gives a hundred and fifty lines of which a handful matter."
+    },
+    {
+      "id": "D_papers_we_love_cacm",
+      "archetype": "D_document",
+      "file": "videos/D_papers_we_love_cacm.mp4",
+      "url": "https://www.youtube.com/watch?v=WQQ6RMDqV74",
+      "credit": "Papers We Love, Matt Adereth on the January 1965 issue of the CACM",
+      "license": "Used for internal measurement only.",
+      "height": 1080,
+      "use_seconds": null,
+      "text_is_printed": true,
+      "ocr_probe": {"score": 0.95, "lines": 13, "ms": 1984},
+      "ground_truth": {
+        "kind": "paper_pdf",
+        "auto": true,
+        "note": "The paper is public, so the text on the screen is known."
+      },
+      "why": "A paper in two columns with figures. The text is small and it is in the middle of the screen."
+    },
+    {
+      "id": "E_veritasium_magnets",
+      "archetype": "E_talking_head",
+      "file": "videos/E_veritasium_magnets.mp4",
+      "url": "https://www.youtube.com/watch?v=XKSjCOKDtpk",
+      "credit": "Veritasium",
+      "license": "Used for internal measurement only.",
+      "height": 1080,
+      "use_seconds": null,
+      "text_is_printed": false,
+      "ocr_probe": {"score": 0.0, "lines": 0, "ms": 1140},
+      "ground_truth": {
+        "kind": "expect_nothing",
+        "auto": true,
+        "note": "Nothing should be captured. The speech carries the whole lecture."
+      },
+      "why": "The case the user named. A lecture with no slides must not make the capture work hard, and it must not put the frames of the talking head into the notes."
+    },
+    {
+      "id": "A_mit_6_006_spring2020_lecture1",
+      "archetype": "H_handwriting",
+      "file": "videos/A_mit_6_006_spring2020_lecture1.mp4",
+      "url": "https://www.youtube.com/watch?v=ZA-tUyM_y7s",
+      "credit": "MIT 6.006 Introduction to Algorithms, Spring 2020",
+      "license": "CC BY-NC-SA 4.0, MIT OpenCourseWare",
+      "height": 1080,
+      "use_seconds": null,
+      "text_is_printed": false,
+      "ocr_probe": {"score": 0.64, "lines": 4, "ms": 1265},
+      "ground_truth": {
+        "kind": "lecture_notes_pdf",
+        "auto": true,
+        "sources": ["sources/mit_6_006_spring_2020/477c78e0af2df61fa205bcc6cb613ceb_MIT6_006S20_lec1.pdf"],
+        "note": "The notes of the course are the text of what was said. The screen has handwriting on a board, so the notes are the speech and not the picture."
+      },
+      "why": "A board that is written on by hand. The reading of printed text cannot read it, so this one is a case of its own."
+    }
+  ],
+  "not_used": [
+    {
+      "name": "MIT 6.006 Fall 2011",
+      "why": "The copy on the channel is at 360p and the board is written on by hand. The text cannot be read at that size."
+    },
+    {
+      "name": "Stanford CS231N slides",
+      "why": "The slides of the recent years are on a drive of the course, not on the site. The pictures have to be read by hand."
+    }
+  ]
+}

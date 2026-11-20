@@ -1,0 +1,422 @@
+import asyncio
+import os
+import unittest
+from typing import Any, Optional
+from unittest import mock
+
+import redis.asyncio as redis_module
+
+from lecturelens.config.settings import Settings
+
+from lecturelens.core.circuit_breaker import RedisCircuitBreaker, RedisRateLimiter
+from lecturelens.router import llm_router
+from lecturelens.router.llm_router import (
+    ProviderUnavailableError,
+    build_router_for_task,
+    get_router_status,
+    is_provider_failure,
+    is_rate_limit_error,
+    wrap_model_with_circuit_breaker
+)
+from lecturelens.router.messages import (
+    build_image_message,
+    extract_provider_name,
+    parse_confidence_footer,
+    response_to_text
+)
+from langchain_core.messages import AIMessage, HumanMessage
+from tests.support import index_by
+
+
+class StatusError(Exception):
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"status {status_code}")
+        self.status_code = status_code
+
+
+class FakeModel:
+    def __init__(self, name: str, error: Optional[BaseException] = None, delay: float = 0.0) -> None:
+        self.name = name
+        self.error = error
+        self.delay = delay
+        self.calls = 0
+
+    async def ainvoke(self, messages: Any) -> Any:
+        self.calls += 1
+        if self.delay > 0:
+            await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
+        return AIMessage(content=f"answer from {self.name}")
+
+
+CONFIG = {
+    "providers": {
+        "local": {"type": "ollama", "model": "m", "circuit_breaker": {"failure_threshold": 2, "cooldown_seconds": 30}},
+        "cloud_a": {"type": "openai_compatible", "model": "x", "api_key_env": "TEST_KEY_A"},
+        "cloud_b": {"type": "google_genai", "model": "y", "api_key_env": "TEST_KEY_B"}
+    },
+    "task_routing": {"structuring": ["local", "cloud_a", "cloud_b"]}
+}
+
+
+class RouterTestBase(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.client = redis_module.from_url(Settings().redis_url, decode_responses=True)
+        try:
+            await self.client.ping()
+            self.redis_available = True
+        except Exception:
+            self.redis_available = False
+        if self.redis_available:
+            await self.clear_keys()
+
+    async def clear_keys(self) -> None:
+        for provider in ("local", "cloud_a", "cloud_b", "t_provider"):
+            for key in await self.client.keys(f"lecturelens:*{provider}*"):
+                await self.client.delete(key)
+
+    async def asyncTearDown(self) -> None:
+        if self.redis_available:
+            await self.clear_keys()
+            await self.client.aclose()
+
+    def install_models(self, models: dict[str, FakeModel]) -> Any:
+        def fake_create(provider_name: str, provider_config: dict, ollama_url: str = "") -> Any:
+            return models.get(provider_name)
+
+        return mock.patch.object(llm_router, "create_base_chat_model", side_effect=fake_create)
+
+
+class TestFailureClassification(unittest.TestCase):
+    def test_classification(self) -> None:
+        self.assertTrue(is_provider_failure(ConnectionError("x")))
+        self.assertTrue(is_provider_failure(asyncio.TimeoutError()))
+        self.assertTrue(is_provider_failure(StatusError(503)))
+        self.assertTrue(is_provider_failure(StatusError(429)))
+        self.assertTrue(is_provider_failure(StatusError(401)))
+        self.assertFalse(is_provider_failure(StatusError(400)))
+        self.assertFalse(is_provider_failure(ValueError("bad prompt")))
+        self.assertFalse(is_provider_failure(KeyError("k")))
+
+    def test_a_rate_limit_is_not_an_outage(self) -> None:
+        """A used up budget must not take the provider away.
+
+        The rate limiter is the tool for the budget. The circuit breaker
+        would disable the best model for the whole cooldown after a single
+        answer that the limit was reached.
+        """
+        self.assertTrue(is_rate_limit_error(StatusError(429)))
+        self.assertTrue(is_rate_limit_error(Exception("Rate limit exceeded for model")))
+        self.assertTrue(is_rate_limit_error(Exception("quota exceeded")))
+        self.assertTrue(is_rate_limit_error(Exception("Too Many Requests")))
+        self.assertFalse(is_rate_limit_error(StatusError(500)))
+        self.assertFalse(is_rate_limit_error(ConnectionError("down")))
+        self.assertFalse(is_rate_limit_error(ValueError("bad prompt")))
+
+
+class TestRouter(RouterTestBase):
+    async def test_local_mode_never_builds_cloud_providers(self) -> None:
+        if not self.redis_available:
+            self.skipTest("Redis not available")
+        models = {"local": FakeModel("local"), "cloud_a": FakeModel("cloud_a"), "cloud_b": FakeModel("cloud_b")}
+        with self.install_models(models):
+            router = build_router_for_task("structuring", self.client, CONFIG, llm_mode="local")
+            models["local"].error = ConnectionError("ollama down")
+            with self.assertRaises(ProviderUnavailableError):
+                await router.ainvoke([HumanMessage(content="hi")])
+        self.assertEqual(models["cloud_a"].calls, 0)
+        self.assertEqual(models["cloud_b"].calls, 0)
+
+    async def test_hybrid_falls_back_to_cloud_and_tags_provider(self) -> None:
+        if not self.redis_available:
+            self.skipTest("Redis not available")
+        models = {
+            "local": FakeModel("local", error=ConnectionError("down")),
+            "cloud_a": FakeModel("cloud_a"),
+            "cloud_b": FakeModel("cloud_b")
+        }
+        with self.install_models(models):
+            router = build_router_for_task("structuring", self.client, CONFIG, llm_mode="hybrid")
+            response = await router.ainvoke([HumanMessage(content="hi")])
+        self.assertEqual(response_to_text(response), "answer from cloud_a")
+        self.assertEqual(extract_provider_name(response), "cloud_a")
+
+    async def test_prompt_errors_do_not_consume_cloud_quota(self) -> None:
+        if not self.redis_available:
+            self.skipTest("Redis not available")
+        models = {
+            "local": FakeModel("local", error=ValueError("bad prompt")),
+            "cloud_a": FakeModel("cloud_a"),
+            "cloud_b": FakeModel("cloud_b")
+        }
+        with self.install_models(models):
+            router = build_router_for_task("structuring", self.client, CONFIG, llm_mode="hybrid")
+            with self.assertRaises(ValueError):
+                await router.ainvoke([HumanMessage(content="hi")])
+        self.assertEqual(models["cloud_a"].calls, 0)
+
+    async def test_breaker_trips_and_skips_failed_provider(self) -> None:
+        if not self.redis_available:
+            self.skipTest("Redis not available")
+        models = {
+            "local": FakeModel("local", error=ConnectionError("down")),
+            "cloud_a": FakeModel("cloud_a"),
+            "cloud_b": FakeModel("cloud_b")
+        }
+        with self.install_models(models):
+            router = build_router_for_task("structuring", self.client, CONFIG, llm_mode="hybrid")
+            for _ in range(4):
+                await router.ainvoke([HumanMessage(content="hi")])
+        self.assertEqual(models["local"].calls, 2)
+        self.assertEqual(models["cloud_a"].calls, 4)
+
+    async def test_a_misconfigured_model_falls_through_without_tripping_the_breaker(self) -> None:
+        """A wrong model name is a configuration problem: the chain has to
+        move on to the next provider, but the circuit breaker must not be
+        tripped because the provider is not unhealthy."""
+        if not self.redis_available:
+            self.skipTest("Redis not available")
+
+        class NotFoundError(Exception):
+            def __init__(self) -> None:
+                super().__init__("model 'does-not-exist' not found")
+                self.status_code = 404
+
+        models = {
+            "local": FakeModel("local", error=NotFoundError()),
+            "cloud_a": FakeModel("cloud_a")
+        }
+        with self.install_models(models):
+            router = build_router_for_task("structuring", self.client, CONFIG, llm_mode="hybrid")
+            await router.ainvoke([HumanMessage(content="hi")])
+
+        # The chain fell through to the next provider.
+        self.assertEqual(models["cloud_a"].calls, 1)
+
+        # The breaker was not tripped by the configuration error.
+        breaker = RedisCircuitBreaker(self.client, "structuring:local", 1, 60)
+        self.assertFalse(await breaker.is_open())
+
+    async def test_rate_limit_denial_does_not_count_as_failure(self) -> None:
+        if not self.redis_available:
+            self.skipTest("Redis not available")
+        model = FakeModel("t_provider")
+        limiter = RedisRateLimiter(self.client, "t_provider", 1, 60)
+        breaker = RedisCircuitBreaker(self.client, "t_provider", 2, 60)
+        wrapped = wrap_model_with_circuit_breaker(model, "t_provider", limiter, breaker)
+        await wrapped.ainvoke([HumanMessage(content="a")])
+        for _ in range(3):
+            with self.assertRaises(ProviderUnavailableError):
+                await wrapped.ainvoke([HumanMessage(content="b")])
+        self.assertFalse(await breaker.is_open())
+        self.assertEqual(model.calls, 1)
+
+    async def test_timeout_counts_as_provider_failure(self) -> None:
+        if not self.redis_available:
+            self.skipTest("Redis not available")
+        model = FakeModel("t_provider", delay=1.0)
+        limiter = RedisRateLimiter(self.client, "t_provider", 10, 60)
+        breaker = RedisCircuitBreaker(self.client, "t_provider", 1, 60)
+        wrapped = wrap_model_with_circuit_breaker(model, "t_provider", limiter, breaker, timeout_seconds=0.05)
+        with self.assertRaises(ProviderUnavailableError):
+            await wrapped.ainvoke([HumanMessage(content="a")])
+        self.assertTrue(await breaker.is_open())
+
+    async def test_a_rate_limit_from_the_provider_keeps_the_breaker_closed(self) -> None:
+        """The budget being used up is not an outage of the provider.
+
+        The breaker used to open after the first rate limit, which took the
+        best model away for the whole cooldown and left the session with
+        nothing to write the notes with.
+        """
+        if not self.redis_available:
+            self.skipTest("Redis not available")
+        model = FakeModel("t_provider", error=StatusError(429))
+        limiter = RedisRateLimiter(self.client, "t_provider", 10, 60)
+        breaker = RedisCircuitBreaker(self.client, "t_provider", 1, 60)
+        wrapped = wrap_model_with_circuit_breaker(model, "t_provider", limiter, breaker)
+        with self.assertRaises(ProviderUnavailableError):
+            await wrapped.ainvoke([HumanMessage(content="a")])
+        self.assertFalse(await breaker.is_open())
+
+    async def test_a_real_failure_still_trips_the_breaker(self) -> None:
+        if not self.redis_available:
+            self.skipTest("Redis not available")
+        model = FakeModel("t_provider", error=StatusError(500))
+        limiter = RedisRateLimiter(self.client, "t_provider", 10, 60)
+        breaker = RedisCircuitBreaker(self.client, "t_provider", 1, 60)
+        wrapped = wrap_model_with_circuit_breaker(model, "t_provider", limiter, breaker)
+        with self.assertRaises(ProviderUnavailableError):
+            await wrapped.ainvoke([HumanMessage(content="a")])
+        self.assertTrue(await breaker.is_open())
+
+    async def test_providers_without_api_keys_are_skipped(self) -> None:
+        if not self.redis_available:
+            self.skipTest("Redis not available")
+        with mock.patch.dict("os.environ", {}, clear=False):
+            for name in ("TEST_KEY_A", "TEST_KEY_B"):
+                os.environ.pop(name, None)
+            config = {
+                "providers": {"cloud_a": CONFIG["providers"]["cloud_a"]},
+                "task_routing": {"structuring": ["cloud_a"]}
+            }
+            with self.assertRaises(ValueError):
+                build_router_for_task("structuring", self.client, config, llm_mode="hybrid")
+
+    async def test_router_status_reports_state(self) -> None:
+        if not self.redis_available:
+            self.skipTest("Redis not available")
+        # The breaker is scoped per task and provider, so a vision failure
+        # does not disable the structuring route.
+        breaker = RedisCircuitBreaker(self.client, "structuring:local", 1, 30)
+        await breaker.record_failure()
+        rows = await get_router_status(self.client, CONFIG, "structuring", "local")
+        by_name = index_by(rows, "provider")
+        self.assertEqual(by_name["local"]["state"], "breaker tripped")
+        self.assertEqual(by_name["cloud_a"]["state"], "disabled")
+
+    async def test_breaker_is_scoped_per_task(self) -> None:
+        if not self.redis_available:
+            self.skipTest("Redis not available")
+        config = {
+            "providers": {"local": CONFIG["providers"]["local"]},
+            "task_routing": {"structuring": ["local"], "screen_ocr": ["local"]}
+        }
+        breaker = RedisCircuitBreaker(self.client, "screen_ocr:local", 1, 30)
+        await breaker.record_failure()
+        structuring_rows = await get_router_status(self.client, config, "structuring", "local")
+        by_name = index_by(structuring_rows, "provider")
+        self.assertEqual(by_name["local"]["state"], "OK")
+        screen_rows = await get_router_status(self.client, config, "screen_ocr", "local")
+        by_screen = index_by(screen_rows, "provider")
+        self.assertEqual(by_screen["local"]["state"], "breaker tripped")
+
+    async def test_guard_store_outage_fails_open(self) -> None:
+        model = FakeModel("t_provider")
+
+        class BrokenLimiter:
+            async def is_allowed(self) -> bool:
+                raise redis_module.ConnectionError("down")
+
+        class BrokenBreaker:
+            async def is_open(self) -> bool:
+                raise redis_module.ConnectionError("down")
+
+            async def record_success(self) -> None:
+                raise redis_module.ConnectionError("down")
+
+            async def record_failure(self) -> None:
+                raise redis_module.ConnectionError("down")
+
+        wrapped = wrap_model_with_circuit_breaker(model, "t_provider", BrokenLimiter(), BrokenBreaker())
+        response = await wrapped.ainvoke([HumanMessage(content="a")])
+        self.assertEqual(response_to_text(response), "answer from t_provider")
+
+
+class TestMessages(unittest.TestCase):
+    def test_image_message_uses_dict_image_url(self) -> None:
+        message = build_image_message("read this", b"\x89PNG", "image/png")
+        blocks = message.content
+        self.assertEqual(blocks[0]["type"], "text")
+        self.assertEqual(blocks[1]["type"], "image_url")
+        self.assertIsInstance(blocks[1]["image_url"], dict)
+        self.assertTrue(blocks[1]["image_url"]["url"].startswith("data:image/png;base64,"))
+
+    def test_confidence_footer(self) -> None:
+        text, confidence = parse_confidence_footer("x = 2\nCONFIDENCE: 0.8")
+        self.assertEqual(text, "x = 2")
+        self.assertAlmostEqual(confidence, 0.8)
+        text, confidence = parse_confidence_footer("no footer here")
+        self.assertEqual(text, "no footer here")
+        self.assertEqual(confidence, 0.5)
+        _, percent = parse_confidence_footer("a\nCONFIDENCE: 85")
+        self.assertAlmostEqual(percent, 0.85)
+
+    def test_response_to_text_handles_blocks_and_strings(self) -> None:
+        self.assertEqual(response_to_text("plain"), "plain")
+        message = AIMessage(content=[{"type": "text", "text": "one"}, {"type": "text", "text": "two"}])
+        self.assertEqual(response_to_text(message), "one\ntwo")
+
+
+    def test_router_yaml_loads_screen_ocr_task(self) -> None:
+        from pathlib import Path
+        import yaml
+        config_path = Path("router.yaml")
+        if config_path.exists():
+            with open(config_path, "r", encoding="utf-8") as file_handle:
+                data = yaml.safe_load(file_handle)
+            self.assertIn("screen_ocr", data.get("task_routing", {}))
+            self.assertNotIn("board_ocr", data.get("task_routing", {}))
+
+    def test_extract_provider_api_keys_formats(self) -> None:
+        from lecturelens.router.llm_router import extract_provider_api_keys
+
+        with mock.patch.dict(os.environ, {"UNOROUTER_API_KEY": "single_key"}, clear=True):
+            keys = extract_provider_api_keys("unorouter", {"api_key_env": "UNOROUTER_API_KEY"})
+            self.assertEqual(keys, ["single_key"])
+
+        with mock.patch.dict(os.environ, {"UNOROUTER_API_KEY": "k1, k2, k3"}, clear=True):
+            keys = extract_provider_api_keys("unorouter", {"api_key_env": "UNOROUTER_API_KEY"})
+            self.assertEqual(keys, ["k1", "k2", "k3"])
+
+        with mock.patch.dict(os.environ, {"UNOROUTER_API_KEYS": "key_a,key_b;key_c"}, clear=True):
+            keys = extract_provider_api_keys("unorouter", {"api_key_env": "UNOROUTER_API_KEY"})
+            self.assertEqual(keys, ["key_a", "key_b", "key_c"])
+
+    def test_rotating_chat_openai_round_robin_and_failover(self) -> None:
+        from lecturelens.router.llm_router import RotatingChatOpenAI
+
+        class DummyCallModel:
+            def __init__(self, tag: str, fail_429: bool = False) -> None:
+                self.tag = tag
+                self.fail_429 = fail_429
+                self.call_count = 0
+
+            async def ainvoke(self, messages: Any, **kwargs: Any) -> Any:
+                self.call_count += 1
+                if self.fail_429:
+                    err = Exception("429 Too Many Requests: rate limit exceeded")
+                    setattr(err, "status_code", 429)
+                    raise err
+                return AIMessage(content=f"from_{self.tag}")
+
+            def invoke(self, messages: Any, **kwargs: Any) -> Any:
+                self.call_count += 1
+                if self.fail_429:
+                    err = Exception("429 Too Many Requests: rate limit exceeded")
+                    setattr(err, "status_code", 429)
+                    raise err
+                return AIMessage(content=f"from_{self.tag}")
+
+        m1 = DummyCallModel("m1")
+        m2 = DummyCallModel("m2")
+        rotating = RotatingChatOpenAI([m1, m2], ["k1", "k2"])
+
+        res1 = asyncio.run(rotating.ainvoke([HumanMessage(content="hi")]))
+        self.assertEqual(res1.content, "from_m1")
+
+        res2 = asyncio.run(rotating.ainvoke([HumanMessage(content="hi")]))
+        self.assertEqual(res2.content, "from_m2")
+
+        res3 = asyncio.run(rotating.ainvoke([HumanMessage(content="hi")]))
+        self.assertEqual(res3.content, "from_m1")
+
+        failing_m1 = DummyCallModel("failing_m1", fail_429=True)
+        fallback_m2 = DummyCallModel("fallback_m2")
+        rotating_failover = RotatingChatOpenAI([failing_m1, fallback_m2], ["k1", "k2"])
+
+        res_recovered = asyncio.run(rotating_failover.ainvoke([HumanMessage(content="hi")]))
+        self.assertEqual(res_recovered.content, "from_fallback_m2")
+        self.assertEqual(failing_m1.call_count, 1)
+        self.assertEqual(fallback_m2.call_count, 1)
+
+        failing_m1_sync = DummyCallModel("failing_m1_sync", fail_429=True)
+        fallback_m2_sync = DummyCallModel("fallback_m2_sync")
+        rotating_sync = RotatingChatOpenAI([failing_m1_sync, fallback_m2_sync], ["k1", "k2"])
+        res_sync = rotating_sync.invoke([HumanMessage(content="hi")])
+        self.assertEqual(res_sync.content, "from_fallback_m2_sync")
+
+
+if __name__ == "__main__":
+    unittest.main()

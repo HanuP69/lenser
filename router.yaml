@@ -1,0 +1,196 @@
+﻿providers:
+  # The UnoRouter free tier limits each model separately, so listing several
+  # models in one route multiplies the effective rate: a 429 is a provider
+  # failure, so the chain moves on to the next model, which has its own
+  # budget. The max_rpm of every entry is the limit that was measured for
+  # that model, not a guess.
+  #
+  # Only models that were verified to receive the image are in the
+  # screen_ocr route. A model that never gets the image either says so or
+  # invents slide text, and the invented text ends up in the notes.
+
+  # Vision, verified to receive the image.
+  unorouter_vl_qwen38:
+    type: openai_compatible
+    cloud: true
+    base_url: "https://api.unorouter.com/v1"
+    model: "qwen3.8-27b:free"
+    api_key_env: "UNOROUTER_API_KEY"
+    timeout_seconds: 90
+    rate_limit:
+      max_rpm: 1
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 2
+      cooldown_seconds: 60
+
+  unorouter_vl_sealion:
+    type: openai_compatible
+    cloud: true
+    base_url: "https://api.unorouter.com/v1"
+    model: "qwen-sea-lion-v4.5-27b-it:free"
+    api_key_env: "UNOROUTER_API_KEY"
+    timeout_seconds: 90
+    rate_limit:
+      max_rpm: 1
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 2
+      cooldown_seconds: 60
+
+  unorouter_vl_qwen25:
+    type: openai_compatible
+    cloud: true
+    base_url: "https://api.unorouter.com/v1"
+    model: "qwen2.5-vl-7b-instruct-awq:free"
+    api_key_env: "UNOROUTER_API_KEY"
+    timeout_seconds: 120
+    rate_limit:
+      max_rpm: 1
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 2
+      cooldown_seconds: 60
+
+  # Text. gemma-4-26b allows five requests per minute, five times the
+  # others, and it answers in about five seconds.
+  unorouter_gemma:
+    type: openai_compatible
+    cloud: true
+    base_url: "https://api.unorouter.com/v1"
+    model: "gemma-4-26b:free"
+    api_key_env: "UNOROUTER_API_KEY"
+    timeout_seconds: 90
+    rate_limit:
+      max_rpm: 5
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 2
+      cooldown_seconds: 60
+
+  unorouter_structuring:
+    type: openai_compatible
+    cloud: true
+    base_url: "https://api.unorouter.com/v1"
+    model: "qwen3.6-35b-a3b:free"
+    api_key_env: "UNOROUTER_API_KEY"
+    timeout_seconds: 120
+    rate_limit:
+      max_rpm: 1
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 2
+      cooldown_seconds: 60
+
+  unorouter:
+    type: openai_compatible
+    cloud: true
+    base_url: "https://api.unorouter.com/v1"
+    model: "gemini-3.6-flash:free"
+    api_key_env: "UNOROUTER_API_KEY"
+    timeout_seconds: 120
+    rate_limit:
+      max_rpm: 1
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 2
+      cooldown_seconds: 60
+
+  unorouter_qa:
+    type: openai_compatible
+    cloud: true
+    base_url: "https://api.unorouter.com/v1"
+    model: "gemini-3.5-flash-lite:free"
+    api_key_env: "UNOROUTER_API_KEY"
+    timeout_seconds: 90
+    rate_limit:
+      max_rpm: 1
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 2
+      cooldown_seconds: 60
+
+  unorouter_glm:
+    type: openai_compatible
+    cloud: true
+    base_url: "https://api.unorouter.com/v1"
+    model: "glm-4.5-flash:free"
+    api_key_env: "UNOROUTER_API_KEY"
+    timeout_seconds: 90
+    rate_limit:
+      max_rpm: 1
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 2
+      cooldown_seconds: 60
+
+  # The local Ollama model. It is skipped in cloud mode.
+  gemma:
+    type: ollama
+    cloud: false
+    model: "gemma3:4b"
+    num_ctx: 8192
+    temperature: 0.2
+    timeout_seconds: 180
+    rate_limit:
+      max_rpm: 120
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 3
+      cooldown_seconds: 30
+
+  openrouter:
+    type: openai_compatible
+    cloud: true
+    base_url: "https://openrouter.ai/api/v1"
+    model: "openrouter/free"
+    api_key_env: "OPENROUTER_API_KEY"
+    timeout_seconds: 90
+    rate_limit:
+      max_rpm: 20
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 5
+      cooldown_seconds: 60
+
+  gemini:
+    type: google_genai
+    cloud: true
+    model: "gemini-3.5-flash"
+    api_key_env: "GOOGLE_API_KEY"
+    timeout_seconds: 90
+    rate_limit:
+      max_rpm: 15
+      window_seconds: 60
+    circuit_breaker:
+      failure_threshold: 5
+      cooldown_seconds: 60
+
+task_routing:
+  # Cloud first, local fallback. The local Ollama model is last in every
+  # chain, so it is only asked when every cloud provider of the chain was
+  # refused. Cloud mode leaves it out entirely, and local mode asks for
+  # it alone.
+  screen_ocr:
+    - unorouter_vl_qwen38
+    - unorouter_vl_sealion
+    - unorouter_vl_qwen25
+    - openrouter
+    - gemini
+    - gemma
+  structuring:
+    - unorouter_gemma
+    - unorouter_structuring
+    - unorouter
+    - unorouter_glm
+    - openrouter
+    - gemini
+    - gemma
+  qa:
+    - unorouter_gemma
+    - unorouter_qa
+    - unorouter
+    - unorouter_glm
+    - openrouter
+    - gemini
+    - gemma

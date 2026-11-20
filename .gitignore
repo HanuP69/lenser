@@ -1,0 +1,26 @@
+﻿# Large test video files
+input_video/chem.mp4
+
+# Debug artifacts
+debug_check.png
+
+# Output session data
+output/
+
+# Environment secrets
+.env
+
+# Eval data (generated)
+eval/readings/
+
+# Export output (generated)
+export_output/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+lecturelens.egg-info/
+
+eval/audio_pack/*.wav
+input_video/*.mp4

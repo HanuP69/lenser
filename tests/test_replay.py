@@ -1,0 +1,170 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from lecturelens.core.replay import ReplayEngine
+from lecturelens.schemas.events import TimelineEntry
+
+
+class TestReplayEngine(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.timeline_path = Path(self.temp_dir.name) / "timeline.jsonl"
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def write_sample_timeline(self, count: int = 5) -> None:
+        lines: list[str] = []
+        for i in range(count):
+            entry = TimelineEntry(
+                session_id="source_sess",
+                event_id=f"evt_{i}",
+                timestamp_epoch=1700000000.0 + i * 2.0,
+                elapsed_seconds=float(i * 2),
+                source_type="transcript" if i % 2 == 0 else "slide",
+                content=f"Event content {i}"
+            )
+            lines.append(json.dumps(entry.model_dump()))
+        self.timeline_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    async def test_replay_loads_and_emits_to_callback_at_speed_zero(self) -> None:
+        self.write_sample_timeline(4)
+        engine = ReplayEngine(self.timeline_path, speed=0.0)
+        received: list[TimelineEntry] = []
+
+        def callback(entry: TimelineEntry) -> None:
+            received.append(entry)
+
+        count = await engine.replay(target_session_id="new_target", on_entry=callback, publish_to_timeline_stream=False)
+        self.assertEqual(count, 4)
+        self.assertEqual(len(received), 4)
+        self.assertEqual(received[0].session_id, "new_target")
+        self.assertNotEqual(received[0].event_id, "evt_0")
+        self.assertNotEqual(received[3].event_id, "evt_3")
+
+        same_session_received: list[TimelineEntry] = []
+        await engine.replay(target_session_id="source_sess", on_entry=same_session_received.append, publish_to_timeline_stream=False)
+        self.assertEqual(same_session_received[0].event_id, "evt_0")
+        self.assertEqual(same_session_received[3].event_id, "evt_3")
+
+    async def test_repeated_cross_session_replay_generates_stable_idempotent_event_ids(self) -> None:
+        self.write_sample_timeline(3)
+        engine = ReplayEngine(self.timeline_path, speed=0.0)
+
+        run1_received: list[TimelineEntry] = []
+        await engine.replay(target_session_id="target_idem", on_entry=run1_received.append, publish_to_timeline_stream=False)
+
+        run2_received: list[TimelineEntry] = []
+        await engine.replay(target_session_id="target_idem", on_entry=run2_received.append, publish_to_timeline_stream=False)
+
+        self.assertEqual(len(run1_received), 3)
+        self.assertEqual(len(run2_received), 3)
+        for i in range(3):
+            self.assertEqual(run1_received[i].event_id, run2_received[i].event_id)
+
+        other_target_received: list[TimelineEntry] = []
+        await engine.replay(target_session_id="other_target", on_entry=other_target_received.append, publish_to_timeline_stream=False)
+        self.assertNotEqual(run1_received[0].event_id, other_target_received[0].event_id)
+
+    async def test_replay_cross_session_source_streams_share_new_event_id(self) -> None:
+        self.write_sample_timeline(2)
+        mock_bus = mock.AsyncMock()
+        engine = ReplayEngine(self.timeline_path, redis_bus=mock_bus, speed=0.0)
+        await engine.replay(target_session_id="dest_sess", publish_to_timeline_stream=True, publish_to_source_streams=True)
+        self.assertGreaterEqual(mock_bus.publish_resilient.await_count, 4)
+        timeline_entry = mock_bus.publish_resilient.call_args_list[0][0][1]
+        source_chunk = mock_bus.publish_resilient.call_args_list[1][0][1]
+        self.assertEqual(timeline_entry.event_id, source_chunk.event_id)
+        self.assertNotEqual(timeline_entry.event_id, "evt_0")
+
+    async def test_replay_publishes_to_redis_stream(self) -> None:
+        self.write_sample_timeline(2)
+        mock_bus = mock.AsyncMock()
+        engine = ReplayEngine(self.timeline_path, redis_bus=mock_bus, speed=0.0)
+        count = await engine.replay(target_session_id="dest_sess", publish_to_timeline_stream=True)
+        self.assertEqual(count, 2)
+        self.assertEqual(mock_bus.publish_resilient.await_count, 2)
+        call_args = mock_bus.publish_resilient.call_args_list[0]
+        stream_name, entry = call_args[0]
+        self.assertEqual(stream_name, "lecturelens:dest_sess:stream:timeline")
+        self.assertEqual(entry.session_id, "dest_sess")
+        self.assertEqual(engine.published_count, 2)
+
+    async def test_replay_tracks_published_and_buffered_counts(self) -> None:
+        self.write_sample_timeline(3)
+        mock_bus = mock.AsyncMock()
+        mock_bus.publish_resilient.side_effect = ["1-0", None, "3-0"]
+        engine = ReplayEngine(self.timeline_path, redis_bus=mock_bus, speed=0.0)
+        count = await engine.replay(target_session_id="dest_sess", publish_to_timeline_stream=True)
+        self.assertEqual(count, 3)
+        self.assertEqual(engine.published_count, 2)
+        self.assertEqual(engine.buffered_count, 1)
+
+    async def test_empty_or_missing_file_returns_zero(self) -> None:
+        missing_path = Path(self.temp_dir.name) / "nonexistent.jsonl"
+        engine = ReplayEngine(missing_path, speed=0.0)
+        count = await engine.replay()
+        self.assertEqual(count, 0)
+
+    async def test_legacy_timeline_entry_without_event_id_generates_deterministic_id(self) -> None:
+        legacy_path = Path(self.temp_dir.name) / "legacy_timeline.jsonl"
+        legacy_data = {
+            "session_id": "legacy_sess",
+            "timestamp_epoch": 1700000000.0,
+            "source_type": "transcript",
+            "content": "legacy talk content",
+            "elapsed_seconds": 1.0
+        }
+        legacy_path.write_text(json.dumps(legacy_data) + "\n", encoding="utf-8")
+
+        engine1 = ReplayEngine(legacy_path, speed=0.0)
+        run1: list[TimelineEntry] = []
+        await engine1.replay(on_entry=run1.append, publish_to_timeline_stream=False)
+
+        engine2 = ReplayEngine(legacy_path, speed=0.0)
+        run2: list[TimelineEntry] = []
+        await engine2.replay(on_entry=run2.append, publish_to_timeline_stream=False)
+
+        self.assertEqual(len(run1), 1)
+        self.assertEqual(len(run2), 1)
+        self.assertTrue(run1[0].event_id.startswith("legacy_"))
+        self.assertEqual(run1[0].event_id, run2[0].event_id)
+
+        target_run1: list[TimelineEntry] = []
+        await engine1.replay(target_session_id="new_dest", on_entry=target_run1.append, publish_to_timeline_stream=False)
+
+        target_run2: list[TimelineEntry] = []
+        await engine2.replay(target_session_id="new_dest", on_entry=target_run2.append, publish_to_timeline_stream=False)
+
+        self.assertEqual(target_run1[0].event_id, target_run2[0].event_id)
+
+    async def test_repeated_legacy_records_with_identical_content_receive_distinct_ids(self) -> None:
+        duplicate_path = Path(self.temp_dir.name) / "duplicate_legacy.jsonl"
+        legacy_data = {
+            "session_id": "legacy_sess",
+            "timestamp_epoch": 1700000000.0,
+            "source_type": "transcript",
+            "content": "identical content"
+        }
+        duplicate_path.write_text(json.dumps(legacy_data) + "\n" + json.dumps(legacy_data) + "\n", encoding="utf-8")
+
+        engine1 = ReplayEngine(duplicate_path, speed=0.0)
+        run1: list[TimelineEntry] = []
+        await engine1.replay(on_entry=run1.append, publish_to_timeline_stream=False)
+
+        self.assertEqual(len(run1), 2)
+        self.assertNotEqual(run1[0].event_id, run1[1].event_id)
+
+        engine2 = ReplayEngine(duplicate_path, speed=0.0)
+        run2: list[TimelineEntry] = []
+        await engine2.replay(on_entry=run2.append, publish_to_timeline_stream=False)
+
+        self.assertEqual(run1[0].event_id, run2[0].event_id)
+        self.assertEqual(run1[1].event_id, run2[1].event_id)
+
+
+if __name__ == "__main__":
+    unittest.main()
