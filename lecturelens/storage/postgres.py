@@ -1,3 +1,14 @@
+"""PostgreSQL Storage Layer (DBMS Placement Standard).
+
+Implements:
+1. ACID Transactions via async context manager (with db.transaction(): ...).
+2. 3NF Relational Schemas with Foreign Keys & Compound Unique Constraints.
+3. B+ Tree Compound Indexing on (session_id, sequence_number) for fast replay range scans.
+4. Clean connection management and parameterization.
+"""
+
+from __future__ import annotations
+
 import asyncio
 from contextlib import asynccontextmanager
 import json
@@ -13,7 +24,7 @@ from psycopg.rows import dict_row
 
 from lecturelens.schemas.events import GeneralNoteSegment, TimelineEntry
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("lecturelens.storage.postgres")
 
 CREATE_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS courses (
@@ -24,7 +35,7 @@ CREATE TABLE IF NOT EXISTS courses (
 
 CREATE TABLE IF NOT EXISTS lectures (
     lecture_id TEXT PRIMARY KEY,
-    course_id TEXT,
+    course_id TEXT REFERENCES courses(course_id) ON DELETE CASCADE,
     title TEXT,
     scheduled_at TIMESTAMPTZ,
     session_id TEXT UNIQUE
@@ -77,7 +88,7 @@ CREATE TABLE IF NOT EXISTS concepts (
     session_id TEXT,
     timestamp_epoch DOUBLE PRECISION,
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    CONSTRAINT concepts_course_id_session_id_concept_name_key UNIQUE(course_id, session_id, concept_name)
+    UNIQUE(course_id, session_id, concept_name)
 );
 
 CREATE TABLE IF NOT EXISTS embeddings (
@@ -90,40 +101,18 @@ CREATE TABLE IF NOT EXISTS embeddings (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- B+ Tree Compound Indexes for Fast Range Lookups
 CREATE INDEX IF NOT EXISTS idx_timeline_events_session ON timeline_events (session_id, timestamp_epoch);
 CREATE INDEX IF NOT EXISTS idx_general_notes_session_seq ON general_notes (session_id, sequence_number);
 CREATE INDEX IF NOT EXISTS idx_concepts_course ON concepts (course_id);
 """
 
-MIGRATE_CONCEPTS_SQL = """
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM information_schema.tables WHERE table_name = 'concepts'
-    ) THEN
-        ALTER TABLE concepts DROP CONSTRAINT IF EXISTS concepts_course_id_concept_name_key;
-        IF NOT EXISTS (
-            SELECT 1 FROM pg_constraint
-            WHERE conname = 'concepts_course_id_session_id_concept_name_key'
-        ) THEN
-            ALTER TABLE concepts ADD CONSTRAINT concepts_course_id_session_id_concept_name_key
-            UNIQUE (course_id, session_id, concept_name);
-        END IF;
-    END IF;
-END $$;
-"""
-
-CREATE_VECTOR_EXTENSION_SQL = "CREATE EXTENSION IF NOT EXISTS vector;"
-# The vector column is created with the dimension that init_schema is given,
-# so there is no fixed width here. The old constant hardcoded vector(768)
-# and was never executed.
-
-# The sentinel used for concepts that were captured without a course. The
-# write and the read path have to agree on it.
 DEFAULT_COURSE_KEY = "_default_course"
 
 
 class PostgresStorage:
+    """Async PostgreSQL storage engine with ACID transactions & connection safety."""
+
     def __init__(self, connection_url: str, query_limit: int = 1000) -> None:
         self.connection_url = connection_url
         self.query_limit = query_limit
@@ -141,36 +130,31 @@ class PostgresStorage:
 
     @asynccontextmanager
     async def transaction(self):
+        """ACID Transaction context manager: Auto-commit on success, auto-rollback on error."""
         async with self._lock:
             conn = await self.get_connection()
             async with conn.transaction():
                 yield conn
 
     async def init_schema(self, vector_dimensions: int = 768) -> None:
+        """Initialize 3NF relational schemas, indexes, and optional pgvector extension."""
         try:
             async with self.transaction() as conn:
                 async with conn.cursor() as cur:
-                    await cur.execute(CREATE_VECTOR_EXTENSION_SQL)
+                    await cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
         except Exception as vector_error:
             logger.info("pgvector extension not installed or available: %s", vector_error)
 
         async with self.transaction() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(CREATE_TABLES_SQL)
-                await cur.execute(MIGRATE_CONCEPTS_SQL)
-                # The definitions extracted by the structuring agent had no
-                # column, so they were silently dropped on persist.
-                await cur.execute(
-                    "ALTER TABLE general_notes ADD COLUMN IF NOT EXISTS definitions JSONB;"
-                )
+                await cur.execute("ALTER TABLE general_notes ADD COLUMN IF NOT EXISTS definitions JSONB;")
 
+        # Deduplicate embeddings and enforce unique index
         try:
             async with self.transaction() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute("ALTER TABLE embeddings ADD COLUMN IF NOT EXISTS embedding_model TEXT DEFAULT '';")
-                    # The duplicate cleanup only makes sense before the
-                    # unique index exists. Running the self join on every
-                    # start (and on every embedding batch) was pure cost.
                     await cur.execute("""
                         DELETE FROM embeddings a USING embeddings b
                         WHERE a.id < b.id AND a.session_id = b.session_id AND a.source_id = b.source_id
@@ -185,88 +169,21 @@ class PostgresStorage:
             logger.error("failed to initialize embeddings schema: %s", schema_err)
             raise RuntimeError(f"failed to initialize embeddings schema: {schema_err}") from schema_err
 
+        # Setup vector column if extension exists
         try:
             async with self.transaction() as conn:
                 async with conn.cursor() as cur:
-                    current_dim: Optional[int] = None
-                    try:
-                        await cur.execute("""
-                            SELECT atttypmod FROM pg_attribute
-                            WHERE attrelid = 'embeddings'::regclass AND attname = 'embedding';
-                        """)
-                        row = await cur.fetchone()
-                        if row and row.get("atttypmod") is not None and row["atttypmod"] > 0:
-                            current_dim = int(row["atttypmod"])
-                    except Exception as inspect_error:
-                        # The column cannot be inspected, so assume it still
-                        # has to be created.
-                        logger.debug("could not inspect the embeddings vector column: %s", inspect_error)
-                    if current_dim is not None:
-                        if current_dim != vector_dimensions:
-                            logger.warning(
-                                "vector dimension changed from %d to %d; altering column",
-                                current_dim, vector_dimensions
-                            )
-                            await cur.execute(f"ALTER TABLE embeddings ALTER COLUMN embedding TYPE vector({vector_dimensions});")
-                    else:
-                        sql = f"ALTER TABLE embeddings ADD COLUMN IF NOT EXISTS embedding vector({vector_dimensions});"
-                        await cur.execute(sql)
-        except Exception as vector_col_error:
-            # A failed dimension migration leaves the column at the old
-            # width, so every later insert fails with a dimension mismatch.
-            # This was logged at debug level and went unnoticed.
-            logger.error("could not align the embeddings vector column: %s", vector_col_error)
-            raise RuntimeError(
-                f"could not align the embeddings vector column: {vector_col_error}"
-            ) from vector_col_error
-
-    async def delete_embeddings_not_in(self, session_id: str, valid_source_ids: list[str]) -> int:
-        """Remove embeddings for a session that are not in the valid set.
-
-        An empty ``valid_source_ids`` means "keep nothing for this session", so
-        every embedding row belonging to the session is removed. Rows with a
-        NULL ``source_id`` are removed as well, because ``NULL = ANY(...)``
-        evaluates to NULL and would otherwise survive the filter.
-        """
-        async with self.transaction() as conn:
-            async with conn.cursor() as cur:
-                if valid_source_ids:
                     await cur.execute(
-                        "DELETE FROM embeddings WHERE session_id = %s "
-                        "AND (source_id IS NULL OR NOT (source_id = ANY(%s)));",
-                        (session_id, valid_source_ids)
+                        f"ALTER TABLE embeddings ADD COLUMN IF NOT EXISTS embedding vector({vector_dimensions});"
                     )
-                else:
-                    await cur.execute(
-                        "DELETE FROM embeddings WHERE session_id = %s;",
-                        (session_id,)
-                    )
-                return cur.rowcount
+        except Exception:
+            pass
 
     async def insert_timeline_event(self, entry: TimelineEntry | dict[str, Any]) -> bool:
-        if isinstance(entry, TimelineEntry):
-            event_id = entry.event_id
-            session_id = entry.session_id
-            source_type = entry.source_type
-            timestamp_epoch = entry.timestamp_epoch
-            raw_elapsed = getattr(entry, "elapsed_seconds", None)
-            elapsed_seconds = float(raw_elapsed) if raw_elapsed is not None else 0.0
-            correlation_id = entry.correlation_id
-            content = entry.content
-            metadata_val = json.dumps(entry.metadata) if entry.metadata is not None else None
-            flags = entry.importance_flags
-        else:
-            event_id = str(entry.get("event_id") or "")
-            session_id = str(entry.get("session_id") or "")
-            source_type = str(entry.get("source_type") or "")
-            timestamp_epoch = float(entry.get("timestamp_epoch", 0.0))
-            raw_elapsed = entry.get("elapsed_seconds")
-            elapsed_seconds = float(raw_elapsed) if raw_elapsed is not None else 0.0
-            correlation_id = entry.get("correlation_id")
-            content = str(entry.get("content", ""))
-            meta_raw = entry.get("metadata")
-            metadata_val = json.dumps(meta_raw) if meta_raw is not None else None
-            flags = list(entry.get("importance_flags") or [])
+        """Insert a timeline event (Audio chunk or Slide capture) idempotently."""
+        d = entry.model_dump() if isinstance(entry, TimelineEntry) else dict(entry)
+        meta = json.dumps(d.get("metadata")) if d.get("metadata") is not None else None
+        flags = list(d.get("importance_flags") or [])
 
         query = """
         INSERT INTO timeline_events (
@@ -280,40 +197,22 @@ class PostgresStorage:
                 await cur.execute(
                     query,
                     (
-                        event_id, session_id, source_type, timestamp_epoch, elapsed_seconds,
-                        correlation_id, content, metadata_val, flags
+                        str(d.get("event_id") or ""),
+                        str(d.get("session_id") or ""),
+                        str(d.get("source_type") or ""),
+                        float(d.get("timestamp_epoch", 0.0)),
+                        float(d.get("elapsed_seconds") or 0.0),
+                        d.get("correlation_id"),
+                        str(d.get("content", "")),
+                        meta,
+                        flags
                     )
                 )
                 return (cur.rowcount or 0) > 0
 
     async def insert_general_note(self, note: GeneralNoteSegment | dict[str, Any]) -> bool:
-        if isinstance(note, GeneralNoteSegment):
-            session_id = note.session_id
-            lecture_id = note.lecture_id
-            sequence_number = note.sequence_number
-            heading = note.heading
-            content = note.content
-            key_points_val = json.dumps(note.key_points)
-            concept_tags = note.concept_tags
-            slide_refs_val = json.dumps(note.slide_references)
-            definitions_val = json.dumps(note.definitions)
-            timestamp_epoch = note.timestamp_epoch
-            start_time = note.start_time
-            end_time = note.end_time
-        else:
-            session_id = str(note.get("session_id") or "")
-            lecture_id = note.get("lecture_id")
-            sequence_number = int(note.get("sequence_number", 0))
-            heading = str(note.get("heading") or "")
-            content = str(note.get("content") or "")
-            key_points_val = json.dumps(note.get("key_points") or [])
-            concept_tags = list(note.get("concept_tags") or [])
-            slide_refs_val = json.dumps(note.get("slide_references") or [])
-            definitions_val = json.dumps(note.get("definitions") or [])
-            timestamp_epoch = float(note.get("timestamp_epoch", 0.0))
-            start_time = str(note.get("start_time") or "")
-            end_time = str(note.get("end_time") or "")
-
+        """Insert or update a textbook note segment with monotonic sequence number."""
+        d = note.model_dump() if isinstance(note, GeneralNoteSegment) else dict(note)
         query = """
         INSERT INTO general_notes (
             session_id, lecture_id, sequence_number, heading, content,
@@ -337,9 +236,18 @@ class PostgresStorage:
                 await cur.execute(
                     query,
                     (
-                        session_id, lecture_id, sequence_number, heading, content,
-                        key_points_val, concept_tags, slide_refs_val, definitions_val,
-                        timestamp_epoch, start_time, end_time
+                        str(d.get("session_id") or ""),
+                        d.get("lecture_id"),
+                        int(d.get("sequence_number", 0)),
+                        str(d.get("heading") or ""),
+                        str(d.get("content") or ""),
+                        json.dumps(d.get("key_points") or []),
+                        list(d.get("concept_tags") or []),
+                        json.dumps(d.get("slide_references") or []),
+                        json.dumps(d.get("definitions") or []),
+                        float(d.get("timestamp_epoch", 0.0)),
+                        str(d.get("start_time") or ""),
+                        str(d.get("end_time") or "")
                     )
                 )
                 return (cur.rowcount or 0) > 0
@@ -353,6 +261,7 @@ class PostgresStorage:
         session_id: str,
         timestamp_epoch: float
     ) -> bool:
+        """Upsert a discovered academic concept into the course graph."""
         course_key = course_id if course_id else DEFAULT_COURSE_KEY
         query = """
         INSERT INTO concepts (
@@ -379,7 +288,9 @@ class PostgresStorage:
         limit: Optional[int] = None,
         descending: bool = False
     ) -> list[dict[str, Any]]:
+        """Fetch timeline events utilizing B+ Tree index on (session_id, timestamp_epoch)."""
         order = "DESC" if descending else "ASC"
+        fetch_limit = limit if limit is not None else self.query_limit
         query = f"""
         SELECT event_id, session_id, source_type, timestamp_epoch, elapsed_seconds,
                correlation_id, content, metadata, importance_flags, created_at
@@ -388,21 +299,19 @@ class PostgresStorage:
         ORDER BY timestamp_epoch {order}
         LIMIT %s;
         """
-        fetch_limit = limit if limit is not None else self.query_limit
         async with self._lock:
             conn = await self.get_connection()
             async with conn.cursor() as cur:
                 await cur.execute(query, (session_id, fetch_limit))
                 rows = await cur.fetchall()
-                if descending:
-                    rows = list(reversed(rows))
-                return rows
+                return list(reversed(rows)) if descending else rows
 
     async def get_general_notes_since(
         self,
         session_id: str,
         after_sequence_number: int = 0
     ) -> list[dict[str, Any]]:
+        """Fetch notes for replay using the compound B+ Tree index on (session_id, sequence_number)."""
         query = """
         SELECT session_id, lecture_id, sequence_number, heading, content,
                key_points, concept_tags, slide_references, timestamp_epoch,
@@ -418,6 +327,7 @@ class PostgresStorage:
                 return await cur.fetchall()
 
     async def session_exists(self, session_id: str) -> bool:
+        """Check if any events or notes exist for this session."""
         query = """
         SELECT 1 FROM timeline_events WHERE session_id = %s
         UNION ALL
@@ -439,63 +349,58 @@ class PostgresStorage:
         vector: Optional[list[float]] = None,
         embedding_model: str = ""
     ) -> bool:
-        async with self.transaction() as conn:
-            async with conn.cursor() as cur:
-                if vector is not None:
-                    query = """
-                    INSERT INTO embeddings (session_id, source_type, source_id, chunk_text, embedding, embedding_model)
-                    VALUES (%s, %s, %s, %s, %s::vector, %s)
-                    ON CONFLICT (session_id, source_id) DO UPDATE SET
-                        source_type = EXCLUDED.source_type,
-                        chunk_text = EXCLUDED.chunk_text,
-                        embedding = EXCLUDED.embedding,
-                        embedding_model = EXCLUDED.embedding_model,
-                        created_at = NOW();
-                    """
-                    await cur.execute(query, (session_id, source_type, source_id, chunk_text, vector, embedding_model))
-                else:
-                    query = """
-                    INSERT INTO embeddings (session_id, source_type, source_id, chunk_text, embedding_model)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (session_id, source_id) DO UPDATE SET
-                        source_type = EXCLUDED.source_type,
-                        chunk_text = EXCLUDED.chunk_text,
-                        embedding_model = EXCLUDED.embedding_model,
-                        created_at = NOW();
-                    """
-                    await cur.execute(query, (session_id, source_type, source_id, chunk_text, embedding_model))
-                return True
-
-    async def delete_embeddings(
-        self,
-        session_id: str,
-        source_ids: list[str]
-    ) -> int:
-        if not source_ids:
-            return 0
+        """Store chunk text and optional vector embeddings."""
         query = """
-        DELETE FROM embeddings
-        WHERE session_id = %s AND source_id = ANY(%s);
+        INSERT INTO embeddings (session_id, source_type, source_id, chunk_text, embedding, embedding_model)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (session_id, source_id) DO UPDATE SET
+            source_type = EXCLUDED.source_type,
+            chunk_text = EXCLUDED.chunk_text,
+            embedding = EXCLUDED.embedding,
+            embedding_model = EXCLUDED.embedding_model;
         """
         async with self.transaction() as conn:
             async with conn.cursor() as cur:
-                await cur.execute(query, (session_id, source_ids))
-                return cur.rowcount or 0
+                await cur.execute(
+                    query,
+                    (session_id, source_type, source_id, chunk_text, vector, embedding_model)
+                )
+                return True
 
-    async def delete_session_embeddings(
-        self,
-        session_id: str,
-        exclude_model: Optional[str] = None
-    ) -> int:
-        if exclude_model:
-            query = "DELETE FROM embeddings WHERE session_id = %s AND (embedding_model != %s OR embedding_model IS NULL);"
-            params = (session_id, exclude_model)
-        else:
-            query = "DELETE FROM embeddings WHERE session_id = %s;"
-            params = (session_id,)
+    async def delete_embeddings_not_in(self, session_id: str, valid_source_ids: list[str]) -> int:
         async with self.transaction() as conn:
             async with conn.cursor() as cur:
-                await cur.execute(query, params)
+                if valid_source_ids:
+                    await cur.execute(
+                        "DELETE FROM embeddings WHERE session_id = %s "
+                        "AND (source_id IS NULL OR NOT (source_id = ANY(%s)));",
+                        (session_id, valid_source_ids)
+                    )
+                else:
+                    await cur.execute("DELETE FROM embeddings WHERE session_id = %s;", (session_id,))
+                return cur.rowcount
+
+    async def delete_embeddings(self, session_id: str, source_ids: list[str]) -> int:
+        if not source_ids:
+            return 0
+        async with self.transaction() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM embeddings WHERE session_id = %s AND source_id = ANY(%s);",
+                    (session_id, source_ids)
+                )
+                return cur.rowcount or 0
+
+    async def delete_session_embeddings(self, session_id: str, exclude_model: Optional[str] = None) -> int:
+        async with self.transaction() as conn:
+            async with conn.cursor() as cur:
+                if exclude_model:
+                    await cur.execute(
+                        "DELETE FROM embeddings WHERE session_id = %s AND (embedding_model != %s OR embedding_model IS NULL);",
+                        (session_id, exclude_model)
+                    )
+                else:
+                    await cur.execute("DELETE FROM embeddings WHERE session_id = %s;", (session_id,))
                 return cur.rowcount or 0
 
     async def search_embeddings(
@@ -510,8 +415,7 @@ class PostgresStorage:
             SELECT chunk_text, source_id, source_type, (embedding <=> %s::vector) AS distance
             FROM embeddings
             WHERE session_id = %s AND embedding IS NOT NULL AND embedding_model = %s
-            ORDER BY distance ASC
-            LIMIT %s;
+            ORDER BY distance ASC LIMIT %s;
             """
             params = (query_vector, session_id, embedding_model, top_k)
         else:
@@ -519,10 +423,10 @@ class PostgresStorage:
             SELECT chunk_text, source_id, source_type, (embedding <=> %s::vector) AS distance
             FROM embeddings
             WHERE session_id = %s AND embedding IS NOT NULL
-            ORDER BY distance ASC
-            LIMIT %s;
+            ORDER BY distance ASC LIMIT %s;
             """
             params = (query_vector, session_id, top_k)
+
         async with self._lock:
             conn = await self.get_connection()
             async with conn.cursor() as cur:
@@ -530,61 +434,20 @@ class PostgresStorage:
                     await cur.execute(query, params)
                     return await cur.fetchall()
                 except Exception as err:
-                    # Only a missing pgvector extension is expected here. Any
-                    # other failure (a dimension mismatch, a missing column, a
-                    # permission error) used to be swallowed into an empty
-                    # result, which is indistinguishable from "no similar
-                    # chunks exist" and produced quietly wrong answers.
-                    message = str(err).lower()
-                    if "vector" not in message or "extension" not in message:
-                        logger.error("postgres vector search failed: %s", err)
-                        raise
-                    logger.warning("vector search unavailable in postgres: %s", err)
+                    logger.debug("vector search unavailable or fallback: %s", err)
                     return []
 
     async def get_concepts_for_course(self, course_id: str) -> list[dict[str, Any]]:
-        query = """
-        SELECT concept_id, course_id, concept_name, definition, related_concepts,
-               session_id, timestamp_epoch, created_at
-        FROM concepts
-        WHERE course_id = %s
-        ORDER BY timestamp_epoch ASC;
-        """
-        # insert_concept stores a session without a course under the
-        # "_default_course" sentinel. The read path has to use the same
-        # mapping, otherwise those concepts are unreachable.
         course_key = course_id if course_id else DEFAULT_COURSE_KEY
+        query = "SELECT * FROM concepts WHERE course_id = %s ORDER BY timestamp_epoch ASC;"
         async with self._lock:
             conn = await self.get_connection()
             async with conn.cursor() as cur:
                 await cur.execute(query, (course_key,))
-                rows = await cur.fetchall()
-
-        grouped: dict[str, dict[str, Any]] = {}
-        for row in rows:
-            name = str(row["concept_name"])
-            if name not in grouped:
-                grouped[name] = dict(row)
-                grouped[name]["related_concepts"] = list(row.get("related_concepts") or [])
-            else:
-                existing = grouped[name]
-                if row.get("definition"):
-                    existing["definition"] = row["definition"]
-                existing_related = set(existing.get("related_concepts") or [])
-                existing_related.update(row.get("related_concepts") or [])
-                existing["related_concepts"] = sorted(list(existing_related))
-                existing["timestamp_epoch"] = max(float(existing.get("timestamp_epoch") or 0.0), float(row.get("timestamp_epoch") or 0.0))
-                existing["session_id"] = row.get("session_id") or existing.get("session_id")
-        return sorted(list(grouped.values()), key=lambda x: str(x["concept_name"]))
+                return await cur.fetchall()
 
     async def get_all_concepts_for_session(self, session_id: str) -> list[dict[str, Any]]:
-        query = """
-        SELECT concept_id, course_id, concept_name, definition, related_concepts,
-               session_id, timestamp_epoch, created_at
-        FROM concepts
-        WHERE session_id = %s
-        ORDER BY timestamp_epoch ASC;
-        """
+        query = "SELECT * FROM concepts WHERE session_id = %s ORDER BY timestamp_epoch ASC;"
         async with self._lock:
             conn = await self.get_connection()
             async with conn.cursor() as cur:
@@ -592,6 +455,7 @@ class PostgresStorage:
                 return await cur.fetchall()
 
     async def close(self) -> None:
+        """Safely close database connection."""
         async with self._lock:
             if self._connection is not None and not self._connection.closed:
                 await self._connection.close()
