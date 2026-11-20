@@ -188,12 +188,16 @@ The algorithms responsible for state-of-the-art benchmarks remain **100% untouch
 | **Phase 3: Perception** | `lecturelens/agents/base_agent.py` + workers | - | 60 lines (base) | **SOLID** | `test_screen_agent.py` (17 passed), `test_audio_agent.py` (25 passed) |
 | **Phase 4: Synthesis** | `lecturelens/agents/synthesis_agent.py` | 1,960 lines | 423 lines | **-78%** | `test_structuring_agent.py` (37 passed), LangGraph StateGraph FSM verified |
 | **Phase 5: Gateway** | `lecturelens/gateway/server.py` | 904 lines | +FastAPI app | **Modular** | `test_gateway.py` (51 passed) |
-| **Total Test Suite** | Full Project Refactor Suite | - | - | - | **210 PASSED**, 5 skipped in 43.71s |
+| **Phase 6: Student Stack** | `knowledge/` & `client/student_client.py` | 1,624 lines | 904 lines | **-44% (1,000 deletions)** | `test_student_chat_and_graph.py` (9 passed), `test_student_client.py` (27 passed), `test_qa_engine.py` (10 passed) |
+| **Total Test Suite** | Full Project Refactor Suite | - | - | - | **256 PASSED**, 5 skipped |
 
-### Git Milestone Commits on `refactor/lean-architecture`:
+### Git Milestone Commits on `master`:
 - `d307f08`: `refactor(dbms): streamline postgres.py with ACID transactions & B+ Tree indexes`
 - `a59d5c7`: `refactor(os): introduce explicit PCB dataclass and clean zombie-reaping supervisor`
 - `12589c4`: `fix(cli): use run_async and add connect_timeout=2 to prevent Postgres hang on Windows`
 - `43cf27c`: `refactor(core): streamline redis_bus.py with clean consumer groups and resilient outbox`
 - `759373e`: `refactor(agents): integrate BaseAgent abstraction into ScreenAgent and AudioAgent`
 - `1de1407`: `feat(synthesis,gateway): introduce LangGraph SynthesisAgent FSM and FastAPI gateway endpoints`
+- `c4d8fb7`: `refactor(agents): expose canonical 3-Agent architecture from lecturelens.agents`
+- `6428717`: `refactor(student): prune boilerplate in student graph, chat, and client via Repository and Strategy patterns`
+- `89a24b0`: `refactor(knowledge): prune boilerplate in qa_engine via clean helpers`
