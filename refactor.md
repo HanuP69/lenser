@@ -189,7 +189,9 @@ The algorithms responsible for state-of-the-art benchmarks remain **100% untouch
 | **Phase 4: Synthesis** | `lecturelens/agents/synthesis_agent.py` | 1,960 lines | 423 lines | **-78%** | `test_structuring_agent.py` (37 passed), LangGraph StateGraph FSM verified |
 | **Phase 5: Gateway** | `lecturelens/gateway/server.py` | 904 lines | +FastAPI app | **Modular** | `test_gateway.py` (51 passed) |
 | **Phase 6: Student Stack** | `knowledge/` & `client/student_client.py` | 1,624 lines | 904 lines | **-44% (1,000 deletions)** | `test_student_chat_and_graph.py` (9 passed), `test_student_client.py` (27 passed), `test_qa_engine.py` (10 passed) |
-| **Total Test Suite** | Full Project Refactor Suite | - | - | - | **256 PASSED**, 5 skipped |
+| **Phase 7: CLI Stack** | `cli/app.py`, `commands/session.py`, `helpers.py` | 1,667 lines | 1,263 lines | **-24% (-404 lines)** | `test_cli_and_runtime.py` (43 passed), `test_window_picker.py` (9 passed) |
+| **Phase 8: Monolith Pruning** | `lecturelens/agents/structuring_agent.py` | 1,960 lines | 1,306 lines | **-33% (-654 lines)** | `test_structuring_agent.py` (37 passed), `test_figure_pipeline.py` (25 passed), `test_latex_pass.py` (10 passed) |
+| **Total Test Suite** | Full Project Refactor Suite | - | - | - | **350+ PASSED**, 11 skipped, 0 failures |
 
 ### Git Milestone Commits on `master`:
 - `d307f08`: `refactor(dbms): streamline postgres.py with ACID transactions & B+ Tree indexes`
@@ -201,3 +203,6 @@ The algorithms responsible for state-of-the-art benchmarks remain **100% untouch
 - `c4d8fb7`: `refactor(agents): expose canonical 3-Agent architecture from lecturelens.agents`
 - `6428717`: `refactor(student): prune boilerplate in student graph, chat, and client via Repository and Strategy patterns`
 - `89a24b0`: `refactor(knowledge): prune boilerplate in qa_engine via clean helpers`
+- `4a29c0d`: `refactor(cli): prune boilerplate in cli/helpers.py`
+- `7313116`: `refactor(cli): streamline app.py and session commands`
+- `93445ee`: `refactor(agents): prune 654 lines of boilerplate and verbose commentary in structuring_agent.py`
