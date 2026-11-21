@@ -37,78 +37,42 @@ OVERLAP_WINDOW_SECONDS = 20.0
 MAX_OVERLAP_ITEMS = 15
 MAX_BATCH_RETRIES = 3
 MAX_CONSECUTIVE_PASS_FAILURES = 10
-# How often a batch is split in half when the provider says that the
-# message is too long. The limit of a message is different for every
-# provider, so the batch is made smaller until it fits.
 MAX_BATCH_SPLITS = 6
 
 
 def is_message_too_long_error(error: BaseException) -> bool:
-    """Whether the provider refused the message because it was too long.
-
-    The free providers put a limit on the length of a single message. A
-    long batch is refused with a plain error, and the whole lecture would
-    be left without notes. The batch is split instead.
-    """
     message = str(error).lower()
-    if "limits the length of a single message" in message:
+    if "limits the length of a single message" in message or "shorten your last message" in message:
         return True
-    if "shorten your last message" in message:
-        return True
-    for signature in (
-        "context length",
-        "maximum context",
-        "too many tokens",
-        "request too large",
-        "payload too large",
-        "input is too long",
-        "prompt is too long",
-        "string too long",
-    ):
-        if signature in message:
-            return True
-    return False
+    return any(
+        sig in message
+        for sig in (
+            "context length", "maximum context", "too many tokens", "request too large",
+            "payload too large", "input is too long", "prompt is too long", "string too long"
+        )
+    )
 
 
 class StructuringBatchError(RuntimeError):
-    """Raised when a batch could not be synthesised into notes.
-
-    The batch is retried; the byte offset is not advanced until the batch
-    either succeeds or falls back to the raw timeline content.
-    """
+    pass
 
 
 def extract_overlap_entries(
     entries: list[dict[str, Any]],
     window_seconds: float = OVERLAP_WINDOW_SECONDS
 ) -> list[dict[str, Any]]:
-    if len(entries) == 0:
+    if not entries:
         return []
-    max_timestamp = 0.0
-    for entry in entries:
-        ts = float(entry.get("timestamp_epoch", 0.0))
-        if ts > max_timestamp:
-            max_timestamp = ts
-
-    cutoff = max_timestamp - window_seconds
-    overlap: list[dict[str, Any]] = []
-    for entry in entries:
-        ts = float(entry.get("timestamp_epoch", 0.0))
-        if ts >= cutoff:
-            overlap.append(entry)
-    if len(overlap) > MAX_OVERLAP_ITEMS:
-        overlap = overlap[-MAX_OVERLAP_ITEMS:]
-    return overlap
+    max_ts = max((float(e.get("timestamp_epoch", 0.0)) for e in entries), default=0.0)
+    cutoff = max_ts - window_seconds
+    overlap = [e for e in entries if float(e.get("timestamp_epoch", 0.0)) >= cutoff]
+    return overlap[-MAX_OVERLAP_ITEMS:] if len(overlap) > MAX_OVERLAP_ITEMS else overlap
 
 
 @dataclass
 class SliceBatch:
     entries: list[dict[str, Any]]
     end_offset: int
-    # Where the batch starts in the timeline file. It does not change when
-    # more events arrive, so it identifies the batch across retries. The end
-    # offset does change, because the last event of the batch may be a new
-    # one, and a counter keyed by it never reached the retry limit.
     start_offset: int = 0
 
 
@@ -163,16 +127,12 @@ def extract_json_payload(raw_output: str, expect_list: bool = True) -> Any:
                     return obj
         except ValueError:
             continue
-    if best_candidate is not None:
-        return best_candidate
-    return None
+    return best_candidate
 
 
 def truncate_text(text: str, limit: int) -> str:
     cleaned = text.strip()
-    if len(cleaned) <= limit:
-        return cleaned
-    return cleaned[:limit] + "..."
+    return cleaned if len(cleaned) <= limit else cleaned[:limit] + "..."
 
 
 def format_group_content(group: dict[str, Any]) -> str:
@@ -195,20 +155,14 @@ def format_group_content(group: dict[str, Any]) -> str:
                 fig_cap = str(metadata.get("figure_caption", "") or "").strip()
                 fig_token = f" [FIGURE {fig_id}: {fig_cap}]" if fig_cap else f" [FIGURE {fig_id}]"
             if revisited > 0:
-                truncated = truncate_text(content, REVISIT_TEXT_LIMIT)
-                parts.append(f"[SLIDE:REVISIT#{revisited}] {truncated}{fig_token}")
+                parts.append(f"[SLIDE:REVISIT#{revisited}] {truncate_text(content, REVISIT_TEXT_LIMIT)}{fig_token}")
             else:
                 parts.append(f"[SLIDE] {content}{fig_token}")
     return " | ".join(parts)
 
 
 def format_timeline_slice(groups: list[dict[str, Any]]) -> str:
-    lines: list[str] = []
-    for group in groups:
-        formatted = format_group_content(group)
-        if len(formatted) > 0:
-            lines.append(formatted)
-    return "\n".join(lines)
+    return "\n".join(filter(None, (format_group_content(g) for g in groups)))
 
 
 def split_entries_into_batches(
@@ -222,7 +176,7 @@ def split_entries_into_batches(
 
     for entry in entries:
         content_length = len(str(entry.get("content", "")))
-        if current_length + content_length > max_characters and len(current_entries) > 0:
+        if current_length + content_length > max_characters and current_entries:
             batches.append(SliceBatch(
                 entries=current_entries,
                 end_offset=int(current_entries[-1].get("_line_end_offset", final_offset)),
@@ -233,7 +187,7 @@ def split_entries_into_batches(
         current_entries.append(entry)
         current_length += content_length
 
-    if len(current_entries) > 0:
+    if current_entries:
         batches.append(SliceBatch(
             entries=current_entries,
             end_offset=final_offset,
@@ -268,72 +222,19 @@ TEXT:
 %%SUMMARY%%
 """
 
-
-# Things in a text that show that there is mathematics in it. The pass
-# that writes the mathematics in LaTeX is only worth its request when
-# there is something to write.
 MATHEMATICS_MARKERS: tuple[str, ...] = (
-    "O(",
-    "$",
-    "^",
-    "%",
-    "∫",
-    "≤",
-    "≥",
-    "≠",
-    "≈",
-    "×",
-    "÷",
-    "π",
-    "∈",
-    "⊂",
-    "∞",
-    "λ",
-    "α",
-    "β",
-    "θ",
-    "Δ",
-    "Σ",
+    "O(", "$", "^", "%", "∫", "≤", "≥", "≠", "≈", "×", "÷", "π", "∈", "⊂", "∞", "λ", "α", "β", "θ", "Δ", "Σ"
 )
-
-# The words of the mathematical notation are searched with their own
-# boundaries. A plain substring match answered "yes" to any prose with
-# "assume" (sum), "catalog" (log), "dialogue" (log) or "100% sure" in it,
-# and every one of those answers cost an extra request to a provider on
-# a free tier for nothing.
-MATHEMATICS_WORDS = re.compile(
-    r"\b(log|mod|sqrt|ln)\b|\bsum\s+(of|over)\b", re.IGNORECASE
-)
-
-# A letter followed by a bracket, such as H(x) or f(n), is a function.
+MATHEMATICS_WORDS = re.compile(r"\b(log|mod|sqrt|ln)\b|\bsum\s+(of|over)\b", re.IGNORECASE)
 FUNCTION_MARKER = re.compile(r"\b[A-Za-z]\([A-Za-z0-9_]")
 
 
 def text_has_mathematics(text: str) -> bool:
-    """Whether the text has something in it that is mathematics."""
-    if FUNCTION_MARKER.search(text):
-        return True
-    if MATHEMATICS_WORDS.search(text):
-        return True
-    return any(marker in text for marker in MATHEMATICS_MARKERS)
+    return bool(FUNCTION_MARKER.search(text) or MATHEMATICS_WORDS.search(text) or any(m in text for m in MATHEMATICS_MARKERS))
 
 
-# A heading at the start of a line, so the count is right for a heading
-# that is the first thing in the text as well.
 HEADING_PATTERN = re.compile(r"^#{1,6}\s", re.MULTILINE)
-
-# The token that says where the picture of a diagram goes in the notes.
-# Written with or without the colon: [FIGURE fig_1] and [FIGURE: fig_1]
-# both name the picture fig_1.
-FIGURE_TOKEN_PATTERN = re.compile(
-    r"\[FIGURE\s*:?\s*([a-zA-Z0-9_\-]+)", re.IGNORECASE
-)
-
-
-# Words that say nothing about where a picture belongs. A caption built
-# from the title of the slide ("Binary Search: Insertion and Deletion")
-# must be matched by the words of the topic, not by the small words of
-# any sentence.
+FIGURE_TOKEN_PATTERN = re.compile(r"\[FIGURE\s*:?\s*([a-zA-Z0-9_\-]+)", re.IGNORECASE)
 FIGURE_CAPTION_STOP_WORDS = frozenset({
     "the", "a", "an", "of", "and", "or", "to", "in", "on", "at", "by", "for",
     "with", "from", "as", "is", "are", "was", "were", "be", "into", "about",
@@ -344,148 +245,67 @@ FIGURE_CAPTION_STOP_WORDS = frozenset({
 
 
 def caption_keywords(caption: str) -> list[str]:
-    """The words of a caption that can find the paragraph it belongs to."""
     words = re.findall(r"\w+", caption.lower(), re.UNICODE)
-    return [word for word in words if len(word) >= 3 and word not in FIGURE_CAPTION_STOP_WORDS]
+    return [w for w in words if len(w) >= 3 and w not in FIGURE_CAPTION_STOP_WORDS]
 
 
-def best_paragraph_for_caption(
-    paragraphs: list[str],
-    caption: str
-) -> Optional[int]:
-    """The paragraph of the notes a figure belongs after.
-
-    The token ([FIGURE id]) is the spoken sentence of the model, and the
-    model does not always answer it. The caption of the picture, which is
-    the title of the slide it was cut from, is then compared with every
-    paragraph of the section: the paragraph that shares the words of the
-    caption is the one that talks about the picture. Two shared words, or
-    one long word (such as backpropagation), count as a place worth
-    putting the picture at. One short word is a coincidence of language
-    and does not move anything.
-    """
+def best_paragraph_for_caption(paragraphs: list[str], caption: str) -> Optional[int]:
     keywords = caption_keywords(caption)
-    if len(keywords) == 0 or len(paragraphs) == 0:
+    if not keywords or not paragraphs:
         return None
     unique_keywords = list(dict.fromkeys(keywords))
-    long_words = [word for word in unique_keywords if len(word) >= 6]
+    long_words = [w for w in unique_keywords if len(w) >= 6]
     best_index: Optional[int] = None
     best_hits = 0
     best_long_hit = False
     for index, paragraph in enumerate(paragraphs):
-        if len(paragraph.strip()) == 0:
+        if not paragraph.strip():
             continue
         lowered = paragraph.lower()
-        hits = sum(
-            1 for word in unique_keywords
-            if re.search(rf"\b{re.escape(word)}", lowered) is not None
-        )
+        hits = sum(1 for w in unique_keywords if re.search(rf"\b{re.escape(w)}", lowered))
         if hits == 0:
             continue
-        long_hit = any(
-            re.search(rf"\b{re.escape(word)}", lowered) is not None
-            for word in long_words
-        )
-        # One short hit answers too easily ("tree" is in every talk about
-        # trees). A picture moves only for two words, or for one long
-        # word. A single short hit on the first paragraph is not enough:
-        # it used to put unrelated pictures under the opening paragraph.
-        confident = hits >= 2 or long_hit
-        if not confident:
+        long_hit = any(re.search(rf"\b{re.escape(w)}", lowered) for w in long_words)
+        if not (hits >= 2 or long_hit):
             continue
         if hits > best_hits or (hits == best_hits and long_hit and not best_long_hit):
-            best_hits = hits
-            best_long_hit = long_hit
-            best_index = index
+            best_hits, best_long_hit, best_index = hits, long_hit, index
     return best_index if best_hits > 0 else None
 
 
 def figure_token_ids(text: str) -> set[str]:
-    """The names of the pictures the text asks for."""
-    return {match.group(1).lower() for match in FIGURE_TOKEN_PATTERN.finditer(text)}
+    return {m.group(1).lower() for m in FIGURE_TOKEN_PATTERN.finditer(text)}
 
 
 def latex_result_is_usable(original: str, rewritten: str) -> bool:
-    """Whether the rewritten text can be used.
-
-    The pass rewrites the notes of a section, so a reply that lost the
-    headings or most of the text is not used. The notes that are already
-    there are worth more than a broken rewrite.
-    """
     candidate = rewritten.strip()
     if len(candidate) < 20:
         return False
     original_length = len(original.strip())
-    if original_length == 0:
+    if original_length == 0 or len(candidate) < original_length * 0.6 or len(candidate) > original_length * 2.0:
         return False
-    if len(candidate) < original_length * 0.6:
+    if len(HEADING_PATTERN.findall(candidate)) < len(HEADING_PATTERN.findall(original)):
         return False
-    if len(candidate) > original_length * 2.0:
-        return False
-    # Every heading of the section has to be there.
-    original_headings = len(HEADING_PATTERN.findall(original))
-    if len(HEADING_PATTERN.findall(candidate)) < original_headings:
-        return False
-    # Every picture token has to be there too. The pass was asked for
-    # mathematics and the model sometimes swallowed the [FIGURE id]
-    # lines while it rewrote, and then the picture had no place in the
-    # notes and was pushed to the end of the section instead.
-    missing_tokens = figure_token_ids(original) - figure_token_ids(candidate)
-    if missing_tokens:
-        return False
-    return True
+    return not (figure_token_ids(original) - figure_token_ids(candidate))
 
 
-# The line between the notes and the structured block in the answer of
-# the one call per batch. It is chosen to look like nothing that a
-# lecturer would say and nothing that lands in the notes itself.
 STRUCTURED_DELIMITER = "===NOTES_END==="
-
-# The lists that ride behind the delimiter, extracted into the segment.
 STRUCTURED_KEYS = ("definitions", "action_items", "key_points")
-
-# The running context handed to the next batch is built by counting
-# lines, not by asking a model: the headings used so far, the terms
-# that were defined, and the key points of the last batch, clipped to
-# about this size.
 RUNNING_CONTEXT_TARGET = 1200
-
-# Chunks of speech repeat the umm and uhh of the speaker, and the whole
-# text of a revisited slide repeats the text of the slide. The model
-# pays input tokens for all of it, so the text of the prompt is
-# trimmed, while the entries behind it stay whole. The words dropped
-# here are the ones that carry no meaning in any lecture.
 FILLER_WORDS = re.compile(r"\b(?:um+|uh+|hm+|hmm+|err+)\b[,:;.!?]*\s*", re.IGNORECASE)
-
-# A word said three times or more in a row is the stammer of the
-# transcription (often a cut between two chunks). It collapses to the
-# word once.
 STAMMERED_WORD = re.compile(r"\b(\w+)((?:[,\s]+)\1\b){2,}", re.IGNORECASE)
-
-# The text of a heading, for the list of topics in the running context.
 HEADING_TEXT_PATTERN = re.compile(r"^#{1,6}\s+(.+?)\s*$", re.MULTILINE)
 
 
 def normalize_for_match(text: str) -> str:
-    """The words of a text, lowered and stripped, so two chunks of speech
-    that only differ in punctuation can be told apart from two topics."""
-    lowered = re.sub(r"[^a-z0-9 ]+", " ", text.lower())
-    return re.sub(r"\s+", " ", lowered).strip()
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", text.lower())).strip()
 
 
 def tail_head_overlap(first: str, second: str, maximum: int = 96, minimum: int = 20) -> int:
-    """How many characters the two chunks of speech share at the seam.
-
-    The transcriber cuts the audio into chunks that carry the last few
-    seconds of the chunk before them again. The longest shared stretch
-    costs a walk over at most a hundred characters, so it is cheaper
-    than asking a model to ignore it.
-    """
     scan = min(maximum, len(first), len(second))
-    lowered_first = first.lower()
-    lowered_second = second.lower()
+    f_low, s_low = first.lower(), second.lower()
     for size in range(scan, minimum - 1, -1):
-        if lowered_first[-size:] == lowered_second[:size]:
+        if f_low[-size:] == s_low[:size]:
             return size
     return 0
 
@@ -494,63 +314,33 @@ def correlate_events(
     slice_entries: list[dict[str, Any]],
     overlap_entries: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """The events that belong to one moment of the lecture, together.
-
-    The entries carry a correlation id handed out by the sync agent: the
-    speech of a sentence and the slide that was on the screen during it
-    share one id. The events without an id each stand alone. The overlap
-    comes first, so the reading order of the prompt stays the order of
-    the lecture.
-    """
     combined = list(overlap_entries) + list(slice_entries)
-
-    by_correlation: dict[str, list[dict[str, Any]]] = {}
+    by_corr: dict[str, list[dict[str, Any]]] = {}
     ordered_keys: list[str] = []
-    unassigned_index = 0
+    unassigned = 0
 
     for entry in combined:
-        correlation_id = entry.get("correlation_id")
-        if correlation_id is not None and len(str(correlation_id).strip()) > 0:
-            key = str(correlation_id).strip()
-        else:
-            key = f"unassigned_{unassigned_index}"
-            unassigned_index += 1
-        if key not in by_correlation:
-            by_correlation[key] = []
+        cid = entry.get("correlation_id")
+        key = str(cid).strip() if cid and str(cid).strip() else f"unassigned_{unassigned}"
+        if key.startswith("unassigned_"):
+            unassigned += 1
+        if key not in by_corr:
+            by_corr[key] = []
             ordered_keys.append(key)
-        by_correlation[key].append(entry)
+        by_corr[key].append(entry)
 
-    groups: list[dict[str, Any]] = []
-    for key in ordered_keys:
-        groups.append({
-            "correlation_id": key,
-            "items": by_correlation[key]
-        })
-    return groups
+    return [{"correlation_id": k, "items": by_corr[k]} for k in ordered_keys]
 
 
 def trim_prompt_groups(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The text of the prompt, made cheaper by counting, not by asking.
-
-    Chunks of speech repeat the seconds before them, the revisited slide
-    repeats the slide it belongs to, filler words fill the pauses. Every
-    copy of that is input tokens for nothing. The entries themselves are
-    not touched: their offsets, flags and figures stay exactly as they
-    were written down.
-    """
-    # First walk: the full text of every slide of the batch, so a revisit
-    # that repeats one of them word for word can be found later.
     full_slide_texts: set[str] = set()
     for group in groups:
         for item in group.get("items", []):
-            metadata = item.get("metadata", {}) or {}
-            if str(item.get("source_type", "")) != "slide":
-                continue
-            if int(metadata.get("revisited_slide_number", 0) or 0) > 0:
-                continue
-            normal = normalize_for_match(str(item.get("content", "")))
-            if normal:
-                full_slide_texts.add(normal)
+            if str(item.get("source_type", "")) == "slide":
+                if int((item.get("metadata", {}) or {}).get("revisited_slide_number", 0) or 0) == 0:
+                    normal = normalize_for_match(str(item.get("content", "")))
+                    if normal:
+                        full_slide_texts.add(normal)
 
     seen_transcripts: set[str] = set()
     trimmed: list[dict[str, Any]] = []
@@ -559,7 +349,6 @@ def trim_prompt_groups(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for item in group.get("items", []):
             content = str(item.get("content", "")).strip()
             if not content:
-                # An entry without words only costs its own tokens.
                 continue
             source_type = str(item.get("source_type", ""))
             normal = normalize_for_match(content)
@@ -571,15 +360,11 @@ def trim_prompt_groups(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     continue
                 normal = normalize_for_match(cleaned)
                 if normal in seen_transcripts:
-                    # The same words were handed over before.
                     continue
                 last = items[-1] if items else None
-                if last is not None and str(last.get("source_type", "")) == "transcript":
+                if last and str(last.get("source_type", "")) == "transcript":
                     shared = tail_head_overlap(str(last.get("content", "")), cleaned)
                     if shared:
-                        # The seam of two chunks holds the same seconds
-                        # twice; the copy is cut out and the chunk is
-                        # glued onto the text before it.
                         merged = f"{str(last.get('content', ''))} {cleaned[shared:]}".strip()
                         last["content"] = merged
                         seen_transcripts.add(normalize_for_match(merged))
@@ -588,9 +373,7 @@ def trim_prompt_groups(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 items.append({**item, "content": cleaned})
             elif source_type == "slide":
                 revisited = int((item.get("metadata", {}) or {}).get("revisited_slide_number", 0) or 0)
-                if revisited > 0 and normal and normal in full_slide_texts:
-                    # The revisit repeats the slide that is already in
-                    # the prompt, truncation or not.
+                if revisited > 0 and normal in full_slide_texts:
                     continue
                 items.append({**item, "content": content})
             else:
@@ -657,37 +440,22 @@ NOTES:
 
 
 def structured_from_payload(payload: Any) -> Optional[dict[str, Any]]:
-    """The three lists, in the shape the notes are built from.
-
-    Whatever shape the answer came in, the lists come out whole. Terms
-    keep their own spelling: the lookups elsewhere are case insensitive,
-    so "TCP" stays "TCP". An answer that carries none of the three keys
-    is None, not an empty block, because an empty block would lie about
-    having been understood.
-    """
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or not any(k in payload for k in STRUCTURED_KEYS):
         return None
-    if not any(key in payload for key in STRUCTURED_KEYS):
-        return None
-    definitions: list[dict[str, str]] = []
-    for item in payload.get("definitions") or []:
-        if isinstance(item, dict) and "term" in item and "definition" in item:
-            definitions.append({
-                "term": str(item["term"]).strip(),
-                "definition": str(item["definition"]).strip()
-            })
-    action_items = [str(item).strip() for item in payload.get("action_items") or [] if str(item).strip()]
-    key_points = [str(item).strip() for item in payload.get("key_points") or [] if str(item).strip()]
+    defs: list[dict[str, str]] = [
+        {"term": str(i["term"]).strip(), "definition": str(i["definition"]).strip()}
+        for i in (payload.get("definitions") or [])
+        if isinstance(i, dict) and "term" in i and "definition" in i
+    ]
     return {
-        "definitions": definitions,
-        "action_items": action_items,
-        "key_points": key_points,
-        "concept_tags": [item["term"] for item in definitions],
+        "definitions": defs,
+        "action_items": [str(i).strip() for i in (payload.get("action_items") or []) if str(i).strip()],
+        "key_points": [str(i).strip() for i in (payload.get("key_points") or []) if str(i).strip()],
+        "concept_tags": [i["term"] for i in defs],
     }
 
 
 def extract_structured_dict(raw_output: str) -> Optional[dict[str, Any]]:
-    """Read the structured block out of an answer."""
     cleaned = raw_output.strip()
     if "```json" in cleaned:
         cleaned = cleaned.split("```json")[1].split("```")[0].strip()
@@ -697,14 +465,6 @@ def extract_structured_dict(raw_output: str) -> Optional[dict[str, Any]]:
 
 
 def split_notes_and_structured(raw_output: str) -> tuple[str, Optional[dict[str, Any]]]:
-    """The notes and the lists, taken apart.
-
-    The delimiter is the cheap path. When the model lost the delimiter
-    it usually still put the object somewhere in the answer, so the
-    objects are searched from the right: the last one that names one of
-    the three lists is taken, and everything before it stays the notes.
-    A JSON example inside the notes then does not cut the notes in half.
-    """
     text = raw_output.strip()
     marker = re.search(rf"^\s*{re.escape(STRUCTURED_DELIMITER)}\s*$", text, re.MULTILINE)
     if marker:
@@ -718,9 +478,7 @@ def split_notes_and_structured(raw_output: str) -> tuple[str, Optional[dict[str,
             continue
         structured = structured_from_payload(candidate)
         if structured is not None:
-            notes_before = re.sub(
-                rf"\s*{re.escape(STRUCTURED_DELIMITER)}\s*$", "", text[:match.start()]
-            )
+            notes_before = re.sub(rf"\s*{re.escape(STRUCTURED_DELIMITER)}\s*$", "", text[:match.start()])
             return notes_before.strip(), structured
     return text, None
 
@@ -732,59 +490,42 @@ def build_running_context(
     key_points: list[str],
     max_lines: int = 50
 ) -> str:
-    """The context of the next batch, built by counting, not by asking.
-
-    The old chain spent a request per batch on compressing the notes;
-    the thread of a lecture does not need a model for that. The
-    headings used so far carry the thread, the defined terms carry the
-    vocabulary, and the key points of the last batch carry the detail
-    of what was just said, all clipped to a small budget of characters.
-    """
     topics: list[str] = []
     seen_topics: set[str] = set()
     for line in (previous or "").splitlines():
-        if not line.startswith("Topics so far:"):
-            continue
-        for topic in line[len("Topics so far:"):].split(";"):
-            topic = topic.strip()
-            normal = normalize_for_match(topic)
-            if topic and normal and normal not in seen_topics:
-                topics.append(topic)
-                seen_topics.add(normal)
+        if line.startswith("Topics so far:"):
+            for topic in line[len("Topics so far:"):].split(";"):
+                t = topic.strip()
+                norm = normalize_for_match(t)
+                if t and norm and norm not in seen_topics:
+                    topics.append(t)
+                    seen_topics.add(norm)
     for heading in HEADING_TEXT_PATTERN.findall(summary or ""):
-        heading = heading.strip()
-        normal = normalize_for_match(heading)
-        if heading and normal and normal not in seen_topics:
-            topics.append(heading)
-            seen_topics.add(normal)
+        h = heading.strip()
+        norm = normalize_for_match(h)
+        if h and norm and norm not in seen_topics:
+            topics.append(h)
+            seen_topics.add(norm)
     topics = topics[-12:]
 
     lines: list[str] = []
     if topics:
         lines.append("Topics so far: " + "; ".join(topics))
-    terms: list[str] = []
-    for item in (definitions or [])[:6]:
-        term = str(item.get("term", "")).strip()
-        if not term:
-            continue
-        definition = truncate_text(str(item.get("definition", "")), 70)
-        terms.append(f"{term} = {definition}" if definition else term)
+    terms = [
+        f"{str(d['term']).strip()} = {truncate_text(str(d.get('definition', '')), 70)}"
+        if d.get("definition") else str(d["term"]).strip()
+        for d in (definitions or [])[:6] if d.get("term")
+    ]
     if terms:
         lines.append("Terms: " + "; ".join(terms))
-    points = [truncate_text(str(point), 110) for point in (key_points or [])[:4]]
-    points = [point for point in points if point]
+    points = [truncate_text(str(p), 110) for p in (key_points or [])[:4] if str(p).strip()]
     if points:
-        lines.append("Recent key points:")
-        for point in points:
-            lines.append(f"- {point}")
+        lines.append("Recent key points:\n" + "\n".join(f"- {p}" for p in points))
+
     if not lines:
         text = truncate_text(previous or "", RUNNING_CONTEXT_TARGET)
-        if max_lines > 0:
-            split_lines = text.splitlines()
-            if len(split_lines) > max_lines:
-                text = "\n".join(split_lines[-max_lines:])
-        return text
-    text = "\n".join(lines)
+    else:
+        text = "\n".join(lines)
     if max_lines > 0:
         split_lines = text.splitlines()
         if len(split_lines) > max_lines:
@@ -795,95 +536,41 @@ def build_running_context(
 
 
 def math_left_unformatted(text: str) -> bool:
-    """Whether mathematics is still standing outside the dollar signs.
-
-    The rules moved into the main prompt, so most sections come back
-    already written in LaTeX. The rewrite is only worth a request when
-    something that is clearly mathematics is still plain text after the
-    fenced code and the dollar signs are taken out: a function call
-    such as O(n) or H(x), a caret such as 2^n, or the words of the
-    notation.
-    """
     sliced = re.sub(r"```.*?```", " ", text, flags=re.S)
     sliced = re.sub(r"\$\$.*?\$\$", " ", sliced, flags=re.S)
     sliced = re.sub(r"\$[^$\n]*\$", " ", sliced)
     sliced = re.sub(r"\[FIGURE[^\]]*\]", " ", sliced, flags=re.IGNORECASE)
-    if FUNCTION_MARKER.search(sliced):
-        return True
-    if re.search(r"[A-Za-z0-9]\^\(?[0-9A-Za-z(]", sliced):
-        return True
-    return bool(MATHEMATICS_WORDS.search(sliced))
+    return bool(FUNCTION_MARKER.search(sliced) or re.search(r"[A-Za-z0-9]\^\(?[0-9A-Za-z(]", sliced) or MATHEMATICS_WORDS.search(sliced))
 
 
-# A line of the notes that starts with one of the self-talk openers. The
-# small models answer the contract by thinking out loud: they correct
-# their own LaTeX, check the JSON they are about to write, quote the
-# prompt back, or walk the contract checklist line by line. A student
-# reading the notes must never see any of it.
 SELF_TALK_STARTERS = re.compile(
-    r"^\s*\*?\s*(?:"
-    r"wait\b|hm+\b|let'?s\b|let me\b|note to self\b|"
-    r"self-correction\b|double check\b|one more check\b|"
-    r"final check\b|finali[sz]\b|json check\b|the prompt says\b"
-    r")",
+    r"^\s*\*?\s*(?:wait\b|hm+\b|let'?s\b|let me\b|note to self\b|self-correction\b|double check\b|one more check\b|final check\b|finali[sz]\b|json check\b|the prompt says\b)",
     re.IGNORECASE,
 )
-
-# A line that is only a label wrapped in stars: *JSON check:*, *Note to
-# self:*. The section builders add italic lines of their own (the
-# captions of the pictures), so the scrub runs before they are added.
 ITALIC_LABEL_LINE = re.compile(r"^\s*\*[^*\n]{0,90}:?\*\s*$")
-
-# The structured lists restated inside the notes text. The lists are
-# carried behind the delimiter and read into the segment; a copy of
-# them inside the prose is chatter about the work, not content.
-RESTATED_STRUCTURED_LIST = re.compile(
-    r"^\s*\*?\s*`?(?:definitions|action_items|key_points)`?\s*[:=]", re.IGNORECASE
-)
-
-# A JSON dump of the three lists sitting anywhere in a line, such as
-# `{"definitions": [], "action_items": [...]}` pasted as a self-check.
-STRUCTURED_LIST_DUMP = re.compile(
-    r'\{"(?:definitions|action_items|key_points)"\s*:', re.IGNORECASE
-)
-
-# The contract checklist ticked off item by item: "1. Markdown (...) -
-# Yes.". Real notes never end a line with "- Yes.".
+RESTATED_STRUCTURED_LIST = re.compile(r"^\s*\*?\s*`?(?:definitions|action_items|key_points)`?\s*[:=]", re.IGNORECASE)
+STRUCTURED_LIST_DUMP = re.compile(r'\{"(?:definitions|action_items|key_points)"\s*:', re.IGNORECASE)
 CHECKLIST_TICK = re.compile(r"^\s*\d+\.\s+.{0,140}-\s*Yes\b")
 
 
 def is_self_talk_line(line: str) -> bool:
-    """Whether one line of the notes is the model talking to itself."""
-    return (
-        SELF_TALK_STARTERS.match(line) is not None
-        or ITALIC_LABEL_LINE.match(line) is not None
-        or RESTATED_STRUCTURED_LIST.match(line) is not None
-        or CHECKLIST_TICK.match(line) is not None
-        or STRUCTURED_LIST_DUMP.search(line) is not None
+    return bool(
+        SELF_TALK_STARTERS.match(line)
+        or ITALIC_LABEL_LINE.match(line)
+        or RESTATED_STRUCTURED_LIST.match(line)
+        or CHECKLIST_TICK.match(line)
+        or STRUCTURED_LIST_DUMP.search(line)
         or STRUCTURED_DELIMITER in line
     )
 
 
 def scrub_reasoning_chatter(notes: str) -> str:
-    """The reasoning of the model, taken out of the notes.
-
-    The chatter is found by counting, never by asking a model. The
-    lines that continue a chatter line are dropped with it, so a quote
-    of the transcript and its translation die with their header — but a
-    markdown heading or a picture marker after the chatter is always
-    kept, because the live model once wrote *Finalizing content:* right
-    above the heading of the real notes.
-    """
     kept: list[str] = []
     skipping_body = False
     for line in notes.splitlines():
         if skipping_body:
             stripped = line.strip()
-            if stripped == "":
-                skipping_body = False
-                kept.append(line)
-            elif stripped.startswith("#") or stripped.startswith("[FIGURE"):
-                # The real notes resumed straight after the chatter.
+            if stripped == "" or stripped.startswith("#") or stripped.startswith("[FIGURE"):
                 skipping_body = False
                 kept.append(line)
             continue
@@ -891,9 +578,7 @@ def scrub_reasoning_chatter(notes: str) -> str:
             skipping_body = True
             continue
         kept.append(line)
-    cleaned = "\n".join(kept)
-    # The dropped lines leave behind stacked empty lines.
-    return re.sub(r"\n{3,}", "\n\n", cleaned)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept))
 
 
 class StructuringAgent:
@@ -906,19 +591,19 @@ class StructuringAgent:
         storage: Any = None,
         drift_filter: Optional[ContextDriftFilter] = None
     ) -> None:
-        self.settings: Settings = settings
-        self.session_id: str = session_id
-        self.llm_router: Any = llm_router
-        self.redis_bus: Any = redis_bus
-        self.storage: Any = storage
-        self.is_running: bool = False
+        self.settings = settings
+        self.session_id = session_id
+        self.llm_router = llm_router
+        self.redis_bus = redis_bus
+        self.storage = storage
+        self.is_running = False
 
         if drift_filter is not None:
-            self.drift_filter: Optional[ContextDriftFilter] = drift_filter
+            self.drift_filter = drift_filter
         elif settings.enable_drift_filter:
-            resolved_ollama_url = settings.ollama_url or os.environ.get("LECTURELENS_OLLAMA_URL", "http://127.0.0.1:11434")
+            ollama_url = settings.ollama_url or os.environ.get("LECTURELENS_OLLAMA_URL", "http://127.0.0.1:11434")
             self.drift_filter = ContextDriftFilter(
-                ollama_url=resolved_ollama_url,
+                ollama_url=ollama_url,
                 embed_model=settings.drift_embed_model or settings.embedding_model,
                 drift_threshold=settings.drift_similarity_threshold,
                 sustain_consecutive=settings.drift_consecutive_shift,
@@ -929,62 +614,45 @@ class StructuringAgent:
             self.drift_filter = None
 
         session_dir = settings.create_session_directories(session_id)
-        self.session_dir: Path = session_dir
-        self.timeline_path: Path = session_dir / "timeline.jsonl"
-        self.notes_path: Path = session_dir / "notes.md"
-        # The same notes as a page that draws the formulas. Most Markdown
-        # viewers only show the LaTeX as it is written.
-        self.notes_html_path: Path = session_dir / "notes.html"
-        self.context_path: Path = session_dir / "context.json"
-        self.notes_marker_path: Path = session_dir / "notes_marker.json"
-        self.batch_attempts_path: Path = session_dir / "batch_attempts.json"
-        self.quarantine_path: Path = session_dir / "timeline_quarantine.jsonl"
-        self.control: AgentControl = AgentControl(session_dir, "structuring_agent", FINALIZE_FLAG_NAME)
+        self.session_dir = session_dir
+        self.timeline_path = session_dir / "timeline.jsonl"
+        self.notes_path = session_dir / "notes.md"
+        self.notes_html_path = session_dir / "notes.html"
+        self.context_path = session_dir / "context.json"
+        self.notes_marker_path = session_dir / "notes_marker.json"
+        self.batch_attempts_path = session_dir / "batch_attempts.json"
+        self.quarantine_path = session_dir / "timeline_quarantine.jsonl"
+        self.control = AgentControl(session_dir, "structuring_agent", FINALIZE_FLAG_NAME)
 
-        # There is no graph any more: the steps of the synthesis are plain
-        # functions, and one call to the model writes the notes and the
-        # structured lists together. The method itself is kept on the
-        # instance, so a test can stand in for the whole synthesis.
-        self.latex_pass_enabled: bool = bool(getattr(settings, "structuring_latex_pass", True))
+        self.latex_pass_enabled = bool(getattr(settings, "structuring_latex_pass", True))
         self.synthesis = self.run_synthesis
-        self.consecutive_failures: int = 0
-        self.max_batch_retries: int = MAX_BATCH_RETRIES
-        self.max_consecutive_failures: int = MAX_CONSECUTIVE_PASS_FAILURES
-        # The notes are timestamped with the elapsed lecture time, not with
-        # the wall clock time of the moment.
-        self.session_clock: SessionClock = SessionClock.load_or_create(self.session_dir / "clock.json")
-        initial_state_data = self.load_state()
-        self._batch_attempts: dict[int, int] = self.load_batch_attempts()
-        self.current_overlap: list[dict[str, Any]] = list(initial_state_data.get("overlap_entries", []))
-        self.sequence_number: int = int(initial_state_data.get("sequence_number", 0))
-        # How often the current batch was already split, so a provider with
-        # a very small limit cannot make it split forever.
-        self._split_depth: int = 0
+        self.consecutive_failures = 0
+        self.max_batch_retries = MAX_BATCH_RETRIES
+        self.max_consecutive_failures = MAX_CONSECUTIVE_PASS_FAILURES
+        self.session_clock = SessionClock.load_or_create(self.session_dir / "clock.json")
+        initial_state = self.load_state()
+        self._batch_attempts = self.load_batch_attempts()
+        self.current_overlap = list(initial_state.get("overlap_entries", []))
+        self.sequence_number = int(initial_state.get("sequence_number", 0))
+        self._split_depth = 0
 
     def load_notes_marker(self) -> int:
         if not self.notes_marker_path.exists():
             return -1
         try:
-            payload = json.loads(self.notes_marker_path.read_text(encoding="utf-8"))
-            return int(payload.get("written_end_offset", -1))
+            return int(json.loads(self.notes_marker_path.read_text(encoding="utf-8")).get("written_end_offset", -1))
         except (ValueError, OSError):
             return -1
 
     def save_notes_marker(self, written_end_offset: int) -> None:
-        payload = {"written_end_offset": written_end_offset}
-        atomic_write_text(self.notes_marker_path, json.dumps(payload))
+        atomic_write_text(self.notes_marker_path, json.dumps({"written_end_offset": written_end_offset}))
 
     def load_state(self) -> dict[str, Any]:
         if not self.context_path.exists():
-            return {
-                "running_context": "",
-                "timeline_byte_offset": 0,
-                "overlap_entries": [],
-                "sequence_number": 0
-            }
+            return {"running_context": "", "timeline_byte_offset": 0, "overlap_entries": [], "sequence_number": 0}
         try:
-            with open(self.context_path, "r", encoding="utf-8") as file_handle:
-                data = json.load(file_handle)
+            with open(self.context_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
             if self.drift_filter is not None and "drift_filter_state" in data:
                 self.drift_filter.load_dict(data["drift_filter_state"])
             return {
@@ -995,81 +663,43 @@ class StructuringAgent:
             }
         except (ValueError, OSError) as error:
             logger.warning("failed to load structuring state: %s", error)
-            return {
-                "running_context": "",
-                "timeline_byte_offset": 0,
-                "overlap_entries": [],
-                "sequence_number": 0
-            }
+            return {"running_context": "", "timeline_byte_offset": 0, "overlap_entries": [], "sequence_number": 0}
 
     def save_state(self, running_context: str, timeline_byte_offset: int, overlap_entries: list[dict[str, Any]]) -> None:
-        max_context = self.settings.context_max_characters
-        max_lines = getattr(self.settings, "context_max_lines", 0)
-        trimmed_context = running_context
-        if max_lines > 0:
-            lines = trimmed_context.splitlines()
-            if len(lines) > max_lines:
-                trimmed_context = "\n".join(lines[-max_lines:])
-        if max_context > 0 and len(trimmed_context) > max_context:
-            trimmed_context = trimmed_context[-max_context:]
-        payload = {
-            "running_context": trimmed_context,
+        state: dict[str, Any] = {
+            "running_context": running_context,
             "timeline_byte_offset": timeline_byte_offset,
             "overlap_entries": overlap_entries,
             "sequence_number": self.sequence_number
         }
         if self.drift_filter is not None:
-            payload["drift_filter_state"] = self.drift_filter.to_dict()
-        atomic_write_text(self.context_path, json.dumps(payload, indent=2))
+            state["drift_filter_state"] = self.drift_filter.to_dict()
+        atomic_write_text(self.context_path, json.dumps(state, indent=2, ensure_ascii=False))
 
     def persist_batch_attempts(self) -> None:
-        """Persist the attempt counter without advancing the byte offset.
-
-        The counter lives in its own file: the reprocess command restores
-        context.json from a backup when a run fails, which would wipe the
-        counter and make the retry cap restart from zero every time.
-        """
-        atomic_write_text(
-            self.batch_attempts_path,
-            json.dumps({str(key): value for key, value in self._batch_attempts.items()})
-        )
+        try:
+            atomic_write_text(self.batch_attempts_path, json.dumps({str(k): v for k, v in self._batch_attempts.items()}))
+        except OSError as error:
+            logger.warning("could not persist batch retry attempts: %s", error)
 
     def load_batch_attempts(self) -> dict[int, int]:
         if not self.batch_attempts_path.exists():
             return {}
         try:
-            raw = json.loads(self.batch_attempts_path.read_text(encoding="utf-8"))
-        except (ValueError, OSError):
+            with open(self.batch_attempts_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return {int(k): int(v) for k, v in data.items()} if isinstance(data, dict) else {}
+        except (ValueError, OSError) as error:
+            logger.warning("could not load batch retry attempts: %s", error)
             return {}
-        if not isinstance(raw, dict):
-            return {}
-        attempts: dict[int, int] = {}
-        for key, value in raw.items():
-            try:
-                attempts[int(key)] = int(value)
-            except (TypeError, ValueError):
-                continue
-        return attempts
 
     def read_pending_batches(self) -> list[SliceBatch]:
         if not self.timeline_path.exists():
             return []
         state = self.load_state()
         offset = state["timeline_byte_offset"]
-        # A saved offset can point past the end of the file, when the
-        # timeline was deleted or shortened without clearing the state of
-        # the agent. readline from there reads nothing forever, and the
-        # offset saved back was the impossible one, so the agent lived but
-        # never wrote another note without a word in the log. The offset
-        # is clamped to the file, so at least the appended entries are
-        # read from now on.
         file_size = self.timeline_path.stat().st_size
         if offset > file_size:
-            logger.warning(
-                "saved timeline offset %d is past the end of the file (%d bytes); "
-                "reading again from the end of the file",
-                offset, file_size
-            )
             offset = file_size
 
         records: list[dict[str, Any]] = []
@@ -1087,7 +717,7 @@ class StructuringAgent:
                     break
                 line_end = file_handle.tell()
                 stripped = line.strip()
-                if len(stripped) == 0:
+                if not stripped:
                     continue
                 try:
                     record = json.loads(stripped)
@@ -1098,12 +728,9 @@ class StructuringAgent:
                 except ValueError:
                     logger.warning("skipping corrupt timeline line at byte %d", line_start)
                     final_offset = line_end
-                    continue
 
-        batches = split_entries_into_batches(
-            records, self.settings.max_slice_characters, final_offset
-        )
-        if len(batches) == 0:
+        batches = split_entries_into_batches(records, self.settings.max_slice_characters, final_offset)
+        if not batches:
             self.save_state(state["running_context"], final_offset, self.current_overlap)
         for batch in batches:
             batch.entries.sort(key=lambda entry: float(entry.get("timestamp_epoch", 0.0)))
@@ -1112,26 +739,14 @@ class StructuringAgent:
     def collect_flag_excerpts(self, entries: list[dict[str, Any]], flag_name: str) -> list[str]:
         excerpts: list[str] = []
         for entry in entries:
-            if flag_name not in (entry.get("importance_flags", []) or []):
-                continue
-            if entry.get("source_type") != "transcript":
-                continue
-            excerpts.append(truncate_text(str(entry.get("content", "")), FLAG_EXCERPT_LIMIT))
-            if len(excerpts) >= MAX_FLAG_EXCERPTS:
-                break
+            if flag_name in (entry.get("importance_flags", []) or []) and entry.get("source_type") == "transcript":
+                excerpts.append(truncate_text(str(entry.get("content", "")), FLAG_EXCERPT_LIMIT))
+                if len(excerpts) >= MAX_FLAG_EXCERPTS:
+                    break
         return excerpts
 
     def section_start_timestamp(self, entries: list[dict[str, Any]]) -> float:
-        """When the section of the lecture starts.
-
-        The speech of the lecturer is what the time mark points at. A
-        slide that was published late can be much older than the rest of
-        the section, because the text of a slide is read by a model that
-        takes a while, and then the slide sits in front of a section that
-        is about something else entirely. That put a mark of 00:00:22 on
-        a section that was about the fifth minute of the lecture.
-        """
-        if len(entries) == 0:
+        if not entries:
             return 0.0
         for entry in entries:
             if str(entry.get("source_type", "transcript")) == "transcript":
@@ -1139,188 +754,137 @@ class StructuringAgent:
         return float(entries[0].get("timestamp_epoch", 0.0))
 
     def collect_figure_references(self, entries: list[dict[str, Any]]) -> list[str]:
-        """The pictures of the diagrams that were on the screen.
-
-        The path is relative to the notes, so that the notes and the
-        pictures can be moved together.
-        """
         lines: list[str] = []
         seen: set[str] = set()
         for entry in entries:
-            if str(entry.get("source_type", "")) != "slide":
-                continue
-            metadata = entry.get("metadata", {}) or {}
-            figure_path = str(metadata.get("figure_file_path", "") or "")
-            if not figure_path or figure_path in seen:
-                continue
-            seen.add(figure_path)
-            caption = str(metadata.get("figure_caption", "") or "").strip()
-            relative = self.relative_figure_path(figure_path)
-            if caption:
-                lines.append(f"![{caption}]({relative})")
-                lines.append(f"*{caption}*")
-            else:
-                lines.append(f"![the picture on the screen]({relative})")
+            if str(entry.get("source_type", "")) == "slide":
+                metadata = entry.get("metadata", {}) or {}
+                fig_path = str(metadata.get("figure_file_path", "") or "")
+                if fig_path and fig_path not in seen:
+                    seen.add(fig_path)
+                    caption = str(metadata.get("figure_caption", "") or "").strip()
+                    rel = self.relative_figure_path(fig_path)
+                    if caption:
+                        lines.extend([f"![{caption}]({rel})", f"*{caption}*"])
+                    else:
+                        lines.append(f"![the picture on the screen]({rel})")
         return lines
 
     def relative_figure_path(self, figure_path: str) -> str:
-        """The path of a picture, relative to the notes."""
         try:
             return Path(figure_path).resolve().relative_to(self.session_dir.resolve()).as_posix()
         except (ValueError, OSError):
             return Path(figure_path).name
 
-    def build_notes_section(
-        self,
-        batch: SliceBatch,
-        result_state: dict[str, Any]
-    ) -> str:
+    def build_notes_section(self, batch: SliceBatch, result_state: dict[str, Any]) -> str:
         summary = str(result_state.get("summary", "")).strip()
-        if len(summary) == 0:
+        if not summary:
             return ""
-        cleaned_summary = format_clean_markdown(summary).strip()
-        first_timestamp = self.section_start_timestamp(batch.entries)
-        heading_time = self.session_clock.format_epoch_as_elapsed(first_timestamp)
+        cleaned = format_clean_markdown(summary).strip()
+        first_ts = self.section_start_timestamp(batch.entries)
+        heading_time = self.session_clock.format_epoch_as_elapsed(first_ts)
         divider = "\n---\n\n" if (self.notes_path.exists() and self.notes_path.stat().st_size > 0) else ""
-        section_lines: list[str] = [f"{divider}### {heading_time}", ""]
+        section_lines = [f"{divider}### {heading_time}", ""]
 
-        exam_excerpts = self.collect_flag_excerpts(batch.entries, "exam_relevant")
-        if len(exam_excerpts) > 0:
+        exam = self.collect_flag_excerpts(batch.entries, "exam_relevant")
+        if exam:
             section_lines.append("> **Important Exam Topic**")
-            for excerpt in exam_excerpts:
-                section_lines.append(f"> - {excerpt}")
+            for e in exam:
+                section_lines.append(f"> - {e}")
             section_lines.append("")
 
-        confusion_excerpts = self.collect_flag_excerpts(batch.entries, "confusion")
-        for excerpt in confusion_excerpts:
-            section_lines.append(f"> **Review**: {excerpt}")
-        if len(confusion_excerpts) > 0:
+        confusion = self.collect_flag_excerpts(batch.entries, "confusion")
+        for c in confusion:
+            section_lines.append(f"> **Review**: {c}")
+        if confusion:
             section_lines.append("")
 
         valid_figures: dict[str, dict[str, str]] = {}
         for entry in batch.entries:
-            if str(entry.get("source_type", "")) != "slide":
-                continue
-            metadata = entry.get("metadata", {}) or {}
-            fig_path = str(metadata.get("figure_file_path", "") or "")
-            if not fig_path:
-                continue
-            fig_id = str(metadata.get("figure_id", "") or Path(fig_path).stem)
-            raw_caption = str(metadata.get("figure_caption", "") or "").strip()
-            caption = re.sub(r"[\[\]\r\n]", " ", raw_caption).strip()
-            relative = self.relative_figure_path(fig_path)
-            info = {
-                "path": fig_path,
-                "relative": relative,
-                "caption": caption
-            }
-            valid_figures[fig_id] = info
-            valid_figures[Path(fig_path).stem] = info
+            if str(entry.get("source_type", "")) == "slide":
+                metadata = entry.get("metadata", {}) or {}
+                fig_path = str(metadata.get("figure_file_path", "") or "")
+                if fig_path:
+                    fig_id = str(metadata.get("figure_id", "") or Path(fig_path).stem)
+                    raw_cap = str(metadata.get("figure_caption", "") or "").strip()
+                    caption = re.sub(r"[\[\]\r\n]", " ", raw_cap).strip()
+                    info = {"path": fig_path, "relative": self.relative_figure_path(fig_path), "caption": caption}
+                    valid_figures[fig_id] = info
+                    valid_figures[Path(fig_path).stem] = info
 
-        referenced_figures: set[str] = set()
+        ref_figures: set[str] = set()
 
-        def replace_figure_token(match: re.Match) -> str:
+        def replace_token(match: re.Match) -> str:
             raw_id = match.group(1).strip()
             if raw_id in valid_figures:
                 info = valid_figures[raw_id]
-                if info["path"] in referenced_figures:
-                    # The same picture marked twice: the model answered
-                    # the token for the slide that holds it and then
-                    # repeated the token while the slide was discussed
-                    # again. The picture is shown where it was placed
-                    # the first time, so an extra copy is left out.
+                if info["path"] in ref_figures:
                     return ""
-                referenced_figures.add(info["path"])
-                cap = info["caption"]
-                rel = info["relative"]
-                if cap:
-                    return f"\n\n![{cap}]({rel})\n*{cap}*\n\n"
-                return f"\n\n![the picture on the screen]({rel})\n\n"
+                ref_figures.add(info["path"])
+                cap, rel = info["caption"], info["relative"]
+                return f"\n\n![{cap}]({rel})\n*{cap}*\n\n" if cap else f"\n\n![the picture on the screen]({rel})\n\n"
             return ""
 
-        # Written without or with the colon: [FIGURE fig_1] and
-        # [FIGURE: fig_1] both name the picture fig_1. The colon form was
-        # not accepted, and a note that the model answered in that form
-        # lost its picture to the end of the section.
-        token_regex = re.compile(r"\[FIGURE\s*:?\s*([a-zA-Z0-9_\-]+)(?::\s*[^\]]*)?\]", re.IGNORECASE)
-        processed_summary = token_regex.sub(replace_figure_token, cleaned_summary)
-        processed_summary = re.sub(r"\n{3,}", "\n\n", processed_summary).strip()
+        token_re = re.compile(r"\[FIGURE\s*:?\s*([a-zA-Z0-9_\-]+)(?::\s*[^\]]*)?\]", re.IGNORECASE)
+        processed = re.sub(r"\n{3,}", "\n\n", token_re.sub(replace_token, cleaned)).strip()
 
-        # The pictures the model never marked with a token are still part
-        # of the lecture, and throwing them into one pile at the end of
-        # the section tears them away from the paragraphs that talk about
-        # them. Each unplaced picture is put after the paragraph that
-        # matches the words of its caption (the title of the slide). One
-        # that matches nothing keeps the old place at the end.
-        ordered_figures: list[dict[str, str]] = []
-        seen_figure_paths: set[str] = set()
-        for _fig_id, info in valid_figures.items():
-            if info["path"] in referenced_figures or info["path"] in seen_figure_paths:
-                continue
-            seen_figure_paths.add(info["path"])
-            ordered_figures.append(info)
+        ordered_figs = [info for fid, info in valid_figures.items() if info["path"] not in ref_figures and fid == info["caption"]]
+        # Deduplicate by path
+        seen_paths: set[str] = set()
+        unique_figs = []
+        for info in valid_figures.values():
+            if info["path"] not in ref_figures and info["path"] not in seen_paths:
+                seen_paths.add(info["path"])
+                unique_figs.append(info)
 
-        def figure_markdown(info: dict[str, str]) -> list[str]:
-            cap = info["caption"]
-            rel = info["relative"]
-            if cap:
-                return [f"![{cap}]({rel})", f"*{cap}*"]
-            return [f"![the picture on the screen]({rel})"]
+        def fig_md(info: dict[str, str]) -> list[str]:
+            return [f"![{info['caption']}]({info['relative']})", f"*{info['caption']}*"] if info["caption"] else [f"![the picture on the screen]({info['relative']})"]
 
-        paragraphs = processed_summary.split("\n\n") if processed_summary else []
+        paragraphs = processed.split("\n\n") if processed else []
         insertions: dict[int, list[list[str]]] = {}
-        leftover_figures: list[dict[str, str]] = []
-        for info in ordered_figures:
-            paragraph_index = best_paragraph_for_caption(paragraphs, info["caption"])
-            if paragraph_index is None:
-                leftover_figures.append(info)
+        leftovers: list[dict[str, str]] = []
+        for info in unique_figs:
+            idx = best_paragraph_for_caption(paragraphs, info["caption"])
+            if idx is None:
+                leftovers.append(info)
             else:
-                insertions.setdefault(paragraph_index, []).append(figure_markdown(info))
+                insertions.setdefault(idx, []).append(fig_md(info))
+
         if insertions:
-            rebuilt: list[str] = []
-            for index, paragraph in enumerate(paragraphs):
-                rebuilt.append(paragraph)
-                if index in insertions:
-                    for lines in insertions[index]:
+            rebuilt = []
+            for i, p in enumerate(paragraphs):
+                rebuilt.append(p)
+                if i in insertions:
+                    for lines in insertions[i]:
                         rebuilt.extend(lines)
-            processed_summary = re.sub(r"\n{3,}", "\n\n", "\n\n".join(rebuilt)).strip()
+            processed = re.sub(r"\n{3,}", "\n\n", "\n\n".join(rebuilt)).strip()
 
-        section_lines.append(processed_summary)
+        section_lines.append(processed)
         section_lines.append("")
-
-        if len(leftover_figures) > 0:
-            for info in leftover_figures:
-                section_lines.extend(figure_markdown(info))
+        for info in leftovers:
+            section_lines.extend(fig_md(info))
             section_lines.append("")
 
         action_items = result_state.get("action_items", []) or []
-        if len(action_items) > 0:
+        if action_items:
             section_lines.append("**Action Items**")
-            for action_item in action_items:
-                section_lines.append(f"- {action_item}")
+            for a in action_items:
+                section_lines.append(f"- {a}")
             section_lines.append("")
         return "\n".join(section_lines) + "\n"
 
     def build_raw_section(self, batch: SliceBatch) -> str:
-        """Build a section from the raw timeline content.
-
-        Used when the language model keeps returning an empty summary. The
-        lecture material is kept verbatim instead of being dropped.
-        """
-        first_timestamp = self.section_start_timestamp(batch.entries)
-        heading_time = self.session_clock.format_epoch_as_elapsed(first_timestamp)
+        first_ts = self.section_start_timestamp(batch.entries)
+        heading_time = self.session_clock.format_epoch_as_elapsed(first_ts)
         divider = "\n---\n\n" if (self.notes_path.exists() and self.notes_path.stat().st_size > 0) else ""
-        section_lines: list[str] = [f"{divider}### {heading_time}", ""]
+        lines = [f"{divider}### {heading_time}", ""]
         for entry in batch.entries:
-            content = str(entry.get("content", "")).strip()
-            if len(content) == 0:
-                continue
-            section_lines.append(content)
-            section_lines.append("")
-        return "\n".join(section_lines) + "\n"
+            c = str(entry.get("content", "")).strip()
+            if c:
+                lines.extend([c, ""])
+        return "\n".join(lines) + "\n"
 
     async def _call_llm(self, prompt: str, stage_name: str) -> str:
-        """One ask through the router, named for the usage account."""
         with usage_stage(stage_name):
             response = await self.llm_router.ainvoke([HumanMessage(content=prompt)])
             return response_to_text(response)
@@ -1331,34 +895,12 @@ class StructuringAgent:
         overlap_entries: list[dict[str, Any]],
         running_context: str
     ) -> dict[str, Any]:
-        """The work of the old graph, asked for in one call.
-
-        The chain used to ask the model six times per batch: summarize,
-        the LaTeX pass, the definitions, the action items, the key
-        points, the compression. One call now writes the notes and
-        carries the three lists behind a delimiter, so escaped backslashes
-        of LaTeX cannot corrupt the markdown or the JSON around them.
-        The lists are read back with two cheap delimiters of their own:
-        if the block is missing or broken, one small repair call reads
-        them out of the finished notes.
-        """
         groups = correlate_events(slice_entries, overlap_entries)
         slice_text = format_timeline_slice(trim_prompt_groups(groups))
-        if len(slice_text.strip()) == 0:
-            # A batch whose every word was filler or a repeat has nothing
-            # for a model to work on. Returning without a request also
-            # tells the caller that the batch is not a failed synthesis.
-            logger.info(
-                "the batch holds nothing with content after trimming; no model is asked"
-            )
+        if not slice_text.strip():
             return {
-                "summary": "",
-                "definitions": [],
-                "action_items": [],
-                "key_points": [],
-                "concept_tags": [],
-                "running_context": running_context,
-                "empty_slice": True,
+                "summary": "", "definitions": [], "action_items": [], "key_points": [],
+                "concept_tags": [], "running_context": running_context, "empty_slice": True
             }
 
         prompt = (
@@ -1368,30 +910,20 @@ class StructuringAgent:
         )
         notes_raw = await self._call_llm(prompt, "notes")
         notes_text, structured = split_notes_and_structured(notes_raw)
-        # The model sometimes thinks out loud in the notes: the reasoning
-        # is dropped by counting before anything else reads the text.
         notes_text = scrub_reasoning_chatter(notes_text)
-        if structured is None and len(notes_text.strip()) > 0:
-            # One repair at most. The notes themselves are complete
-            # already; only the lists were lost, and they are read out of
-            # the finished notes, so the repair does not see the events.
+
+        if structured is None and notes_text.strip():
             try:
-                repair_raw = await self._call_llm(
-                    REPAIR_PROMPT.replace("%%NOTES%%", notes_text), "repair"
-                )
+                repair_raw = await self._call_llm(REPAIR_PROMPT.replace("%%NOTES%%", notes_text), "repair")
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                logger.warning("the structure could not be repaired, the notes are kept: %s", error)
+                logger.warning("structure repair failed: %s", error)
                 repair_raw = ""
             structured = extract_structured_dict(repair_raw)
         if structured is None:
-            structured = {
-                "definitions": [],
-                "action_items": [],
-                "key_points": [],
-                "concept_tags": [],
-            }
+            structured = {"definitions": [], "action_items": [], "key_points": [], "concept_tags": []}
+
         notes_text = await self._rewrite_latex_if_needed(notes_text)
         max_lines = int(getattr(self.settings, "context_max_lines", 50))
         new_context = build_running_context(
@@ -1407,111 +939,69 @@ class StructuringAgent:
         }
 
     async def _rewrite_latex_if_needed(self, notes_text: str) -> str:
-        """Ask for a LaTeX pass only when the local checks say it is needed.
-
-        The rules live in the main prompt now. A section whose
-        mathematics is already inside the dollar signs costs no extra
-        request at all: the check below runs before any model is asked.
-        """
-        if not self.latex_pass_enabled:
+        if not self.latex_pass_enabled or not notes_text.strip():
             return notes_text
-        if len(notes_text.strip()) == 0:
-            return notes_text
-        if not text_has_mathematics(notes_text):
-            return notes_text
-        if not math_left_unformatted(notes_text):
+        if not text_has_mathematics(notes_text) or not math_left_unformatted(notes_text):
             return notes_text
         try:
-            rewritten = await self._call_llm(
-                LATEX_ENFORCEMENT_PROMPT.replace("%%SUMMARY%%", notes_text), "latex"
-            )
+            rewritten = await self._call_llm(LATEX_ENFORCEMENT_PROMPT.replace("%%SUMMARY%%", notes_text), "latex")
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            logger.warning("the latex pass failed, the notes are kept as they are: %s", error)
+            logger.warning("latex pass failed: %s", error)
             return notes_text
         cleaned = rewritten.strip()
-        # The model sometimes wraps the whole answer in a code fence.
         if cleaned.startswith("```"):
             cleaned = re.sub(r"^```[a-zA-Z]*\n", "", cleaned)
             if cleaned.endswith("```"):
                 cleaned = cleaned[:-3].rstrip()
-        if not latex_result_is_usable(notes_text, cleaned):
-            logger.warning("the latex pass did not keep the notes, they are kept as they are")
-            return notes_text
-        return cleaned
+        return cleaned if latex_result_is_usable(notes_text, cleaned) else notes_text
 
     @staticmethod
     def _quarantine_key(entry: dict[str, Any]) -> str:
-        """A stable key for a quarantined entry.
-
-        The event id is used when there is one. The timeline records do not
-        always carry one, so the content is used as the fallback.
-        """
-        event_id = str(entry.get("event_id") or "")
-        if len(event_id) > 0:
-            return event_id
-        raw = (
-            f"{entry.get('source_type', '')}|{entry.get('timestamp_epoch', '')}|"
-            f"{entry.get('content', '')}"
-        )
+        eid = str(entry.get("event_id") or "")
+        if eid:
+            return eid
+        raw = f"{entry.get('source_type', '')}|{entry.get('timestamp_epoch', '')}|{entry.get('content', '')}"
         return hashlib.sha1(raw.encode("utf-8", errors="replace"), usedforsecurity=False).hexdigest()
 
     async def persist_quarantined_entries(self) -> None:
-        """Write the entries that the ad or drift filter excluded to disk.
-
-        They are kept out of the notes, but they are not deleted either, so a
-        false positive on the heuristics does not lose the content. The write
-        happens once the batch is finished, so a batch that is retried does
-        not append the same entries again, and the entries are keyed so a
-        repeated write is skipped.
-        """
-        if self.drift_filter is None:
+        if self.drift_filter is None or not self.drift_filter.quarantined_entries:
             return
         quarantined = list(self.drift_filter.quarantined_entries)
-        if len(quarantined) == 0:
-            return
         self.drift_filter.quarantined_entries.clear()
-        known_keys = self._read_quarantine_keys()
+        known = self._read_quarantine_keys()
         lines = []
         for entry in quarantined:
             key = self._quarantine_key(entry)
-            if key in known_keys:
-                continue
+            if key not in known:
+                try:
+                    lines.append(json.dumps(entry, ensure_ascii=False, default=str))
+                    known.add(key)
+                except (TypeError, ValueError):
+                    continue
+        if lines:
             try:
-                lines.append(json.dumps(entry, ensure_ascii=False, default=str))
-            except (TypeError, ValueError):
-                continue
-            known_keys.add(key)
-        if len(lines) == 0:
-            return
-        try:
-            await run_in_thread_pool(
-                append_text_durably,
-                self.quarantine_path,
-                "\n".join(lines) + "\n"
-            )
-            self.control.increment_stat("quarantined_entries", len(lines))
-        except OSError as error:
-            logger.warning("could not write the quarantined entries: %s", error)
+                await run_in_thread_pool(append_text_durably, self.quarantine_path, "\n".join(lines) + "\n")
+                self.control.increment_stat("quarantined_entries", len(lines))
+            except OSError as error:
+                logger.warning("could not write quarantined entries: %s", error)
 
     def _read_quarantine_keys(self) -> set[str]:
-        """The keys that are already in the quarantine file."""
         if not self.quarantine_path.exists():
             return set()
-        keys: set[str] = set()
+        keys = set()
         try:
-            with open(self.quarantine_path, "r", encoding="utf-8") as handle:
-                for line in handle:
+            with open(self.quarantine_path, "r", encoding="utf-8") as h:
+                for line in h:
                     line = line.strip()
-                    if len(line) == 0:
-                        continue
-                    try:
-                        payload = json.loads(line)
-                    except ValueError:
-                        continue
-                    if isinstance(payload, dict):
-                        keys.add(self._quarantine_key(payload))
+                    if line:
+                        try:
+                            payload = json.loads(line)
+                            if isinstance(payload, dict):
+                                keys.add(self._quarantine_key(payload))
+                        except ValueError:
+                            continue
         except OSError:
             return keys
         return keys
@@ -1522,70 +1012,28 @@ class StructuringAgent:
         entries: list[dict[str, Any]],
         running_context: str
     ) -> Optional[str]:
-        """Do a batch in two halves, because the message was too long.
-
-        Returns the running context, or None when the batch cannot be
-        split any further.
-        """
-        if len(entries) < 2:
-            return None
-        if self._split_depth >= MAX_BATCH_SPLITS:
-            logger.error(
-                "the batch was split %d times and the provider still refuses the "
-                "message, falling back to the raw content",
-                self._split_depth
-            )
+        if len(entries) < 2 or self._split_depth >= MAX_BATCH_SPLITS:
             return None
         self._split_depth += 1
         try:
-            split_index = max(1, len(entries) // 2)
-            first_entries = entries[:split_index]
-            second_entries = entries[split_index:]
-
-            # The halves share the start, so the retry counter of the batch
-            # stays the same. The end of the first half is the end of its
-            # last entry, so the marker of the notes moves forward in order
-            # and the second half is not skipped as already written.
+            split_idx = max(1, len(entries) // 2)
+            first_entries, second_entries = entries[:split_idx], entries[split_idx:]
             first_end = int(first_entries[-1].get("_line_end_offset", batch.end_offset))
-            first_half = SliceBatch(
-                entries=first_entries,
-                end_offset=first_end,
-                start_offset=batch.start_offset
-            )
-            second_half = SliceBatch(
-                entries=second_entries,
-                end_offset=batch.end_offset,
-                start_offset=batch.start_offset
-            )
-
-            logger.warning(
-                "the provider cannot take a message of %d entries, splitting the batch",
-                len(entries)
-            )
+            first_half = SliceBatch(entries=first_entries, end_offset=first_end, start_offset=batch.start_offset)
+            second_half = SliceBatch(entries=second_entries, end_offset=batch.end_offset, start_offset=batch.start_offset)
             context = await self.process_single_batch(first_half, running_context)
             return await self.process_single_batch(second_half, context)
         finally:
             self._split_depth -= 1
 
     def write_html_notes(self) -> None:
-        """Write the notes as a page that draws the formulas.
-
-        Most Markdown viewers show a formula as the LaTeX it is written
-        in, because they do not draw it. The page draws it, so the notes
-        can be read in a browser without any other program.
-        """
         if not self.notes_path.exists():
             return
         try:
             from lecturelens.core.notes_html import render_notes_html
-
             notes_text = self.notes_path.read_text(encoding="utf-8")
             self.notes_html_path.write_text(
-                render_notes_html(
-                    notes_text,
-                    title=f"Lecture Notes - {self.session_id}",
-                    base_dir=self.session_dir
-                ),
+                render_notes_html(notes_text, title=f"Lecture Notes - {self.session_id}", base_dir=self.session_dir),
                 encoding="utf-8"
             )
         except Exception as error:
@@ -1596,57 +1044,46 @@ class StructuringAgent:
         if self.drift_filter is not None:
             entries = await run_in_thread_pool(self.drift_filter.filter_batch_entries, batch.entries)
 
-        if len(entries) == 0:
-            # Everything was filtered out, so the batch is finished and the
-            # quarantine can be written.
+        if not entries:
             await self.persist_quarantined_entries()
-            logger.info("all entries in batch ending at offset %d filtered as drift/ad; skipping synthesis", batch.end_offset)
             self.save_notes_marker(batch.end_offset)
             self.save_state(running_context, batch.end_offset, self.current_overlap)
             return running_context
 
         if self.notes_path.exists() and self.load_notes_marker() >= batch.end_offset:
-            logger.info(
-                "batch ending at byte %d already written to notes, republishing saved content without re-synthesis",
-                batch.end_offset
-            )
-            first_timestamp = self.section_start_timestamp(entries)
-            last_timestamp = float(entries[-1].get("timestamp_epoch", first_timestamp))
-            start_time_str = self.session_clock.format_epoch_as_elapsed(first_timestamp)
-            end_time_str = self.session_clock.format_epoch_as_elapsed(last_timestamp)
-            slide_references = []
-            for entry in entries:
-                if str(entry.get("source_type", "")) == "slide":
-                    slide_num = (entry.get("metadata", {}) or {}).get("slide_number")
-                    if slide_num is not None:
-                        try:
-                            slide_references.append(int(slide_num))
-                        except ValueError:
-                            pass
+            first_ts = self.section_start_timestamp(entries)
+            last_ts = float(entries[-1].get("timestamp_epoch", first_ts))
+            start_str = self.session_clock.format_epoch_as_elapsed(first_ts)
+            end_str = self.session_clock.format_epoch_as_elapsed(last_ts)
+            slide_refs = [
+                int(e.get("metadata", {}).get("slide_number"))
+                for e in entries
+                if str(e.get("source_type", "")) == "slide" and (e.get("metadata", {}) or {}).get("slide_number") is not None
+            ]
             saved_notes = self.notes_path.read_text(encoding="utf-8")
-            note_segment = GeneralNoteSegment(
+            segment = GeneralNoteSegment(
                 session_id=self.session_id,
                 lecture_id=self.settings.course_name,
                 sequence_number=self.sequence_number,
-                timestamp_epoch=first_timestamp,
-                start_time=start_time_str,
-                end_time=end_time_str,
-                heading=f"Section {self.sequence_number} ({start_time_str})",
+                timestamp_epoch=first_ts,
+                start_time=start_str,
+                end_time=end_str,
+                heading=f"Section {self.sequence_number} ({start_str})",
                 content=saved_notes,
                 key_points=[],
                 concept_tags=[],
-                slide_references=slide_references,
+                slide_references=slide_refs,
                 definitions=[]
             )
             if self.redis_bus is not None:
                 stream_name = f"lecturelens:{self.session_id}:stream:notes"
                 if hasattr(self.redis_bus, "publish_resilient"):
-                    await self.redis_bus.publish_resilient(stream_name, note_segment)
+                    await self.redis_bus.publish_resilient(stream_name, segment)
                 else:
                     try:
-                        await self.redis_bus.publish(stream_name, note_segment)
-                    except Exception as error:
-                        logger.warning("failed to republish note segment to redis: %s", error)
+                        await self.redis_bus.publish(stream_name, segment)
+                    except Exception:
+                        pass
             self.sequence_number += 1
             self._batch_attempts.pop(batch.start_offset, None)
             self._batch_attempts.pop(batch.end_offset, None)
@@ -1655,20 +1092,11 @@ class StructuringAgent:
             self.save_state(running_context, batch.end_offset, next_overlap)
             return running_context
 
-        active_batch = SliceBatch(
-            entries=entries,
-            end_offset=batch.end_offset,
-            start_offset=batch.start_offset
-        )
-
+        active_batch = SliceBatch(entries=entries, end_offset=batch.end_offset, start_offset=batch.start_offset)
         synthesis_error: Optional[BaseException] = None
         result_state: dict[str, Any] = {
-            "summary": "",
-            "definitions": [],
-            "action_items": [],
-            "key_points": [],
-            "concept_tags": [],
-            "running_context": running_context
+            "summary": "", "definitions": [], "action_items": [], "key_points": [],
+            "concept_tags": [], "running_context": running_context
         }
         try:
             result_state = await self.synthesis(entries, self.current_overlap, running_context)
@@ -1678,120 +1106,63 @@ class StructuringAgent:
             synthesis_error = error
 
         if synthesis_error is None and result_state.get("empty_slice"):
-            # The trimming found nothing with content. A model was not
-            # asked and none will be asked on a retry either, because the
-            # answer would be the same always. The offset moves ahead, so
-            # the batch is never read again, and the material that was
-            # there is still on the transcript.
-            logger.info(
-                "batch ending at offset %d holds nothing to synthesize; skipping it",
-                batch.end_offset
-            )
             self.control.increment_stat("empty_batches_skipped")
             self.control.set_stat("empty_batches_offset", batch.end_offset)
             await self.persist_quarantined_entries()
             self.save_notes_marker(batch.end_offset)
             next_overlap = extract_overlap_entries(entries, OVERLAP_WINDOW_SECONDS)
             self.current_overlap = next_overlap
-            self.save_state(result_state.get("running_context", running_context), batch.end_offset, next_overlap)
-            return str(result_state.get("running_context", running_context))
+            ctx = str(result_state.get("running_context", running_context))
+            self.save_state(ctx, batch.end_offset, next_overlap)
+            return ctx
 
         if synthesis_error is not None and is_message_too_long_error(synthesis_error):
-            # The provider cannot take a message this long. The batch is
-            # split in half and each half is done on its own, which gives
-            # two sections with a time mark each instead of no notes at
-            # all. A whole lecture of eleven minutes is one batch when
-            # nothing was processed while it was recorded, and the
-            # provider refused it.
-            split_result = await self.process_split_batch(
-                batch, entries, running_context
-            )
+            split_result = await self.process_split_batch(batch, entries, running_context)
             if split_result is not None:
                 return split_result
 
         section_text = "" if synthesis_error is not None else self.build_notes_section(active_batch, result_state)
 
-        if len(section_text) == 0:
-            # The model produced nothing usable for this slice. Publishing an
-            # empty note would burn a sequence number and writing nothing
-            # would drop the batch, so the batch is retried instead. The
-            # attempt counter bounds the retries: once it is exhausted the raw
-            # timeline content is used so the lecture material is never lost.
-            # The counter is keyed by where the batch starts, so it keeps
-            # counting across retries even when more events arrived and the
-            # end of the batch moved. Keyed by the end offset it always
-            # looked like the first attempt, and the raw content fallback
-            # never happened.
+        if not section_text:
             attempt_key = batch.start_offset
             attempts = self._batch_attempts.get(attempt_key, 0) + 1
             self._batch_attempts[attempt_key] = attempts
-            # The attempt counter is persisted, so the cap also applies across
-            # restarts and across separate reprocess invocations. The byte
-            # offset is deliberately left untouched.
             self.persist_batch_attempts()
             reason = synthesis_error if synthesis_error is not None else "empty summary"
             if attempts <= self.max_batch_retries:
-                logger.error(
-                    "structuring batch ending at offset %d produced no notes (%s); "
-                    "attempt %d/%d, will retry",
-                    batch.end_offset, reason, attempts, self.max_batch_retries
-                )
-                raise StructuringBatchError(
-                    f"batch ending at offset {batch.end_offset} produced no notes: {reason}"
-                ) from synthesis_error
-            logger.error(
-                "structuring batch ending at offset %d produced no notes after %d attempts; "
-                "falling back to the raw timeline content",
-                batch.end_offset, attempts
-            )
-            # The raw content is a fallback, not a synthesis. It is worth
-            # pointing out, because the notes for that part of the lecture
-            # are unedited transcript until the batch is reprocessed.
+                raise StructuringBatchError(f"batch ending at offset {batch.end_offset} produced no notes: {reason}") from synthesis_error
             self.control.increment_stat("raw_fallback_batches")
             self.control.set_stat("raw_fallback_offset", batch.end_offset)
             section_text = self.build_raw_section(active_batch)
-            result_state = dict(result_state)
-            result_state["summary"] = section_text
-            result_state["key_points"] = []
-            result_state["concept_tags"] = []
-            result_state["definitions"] = []
-            result_state["action_items"] = []
+            result_state = {**result_state, "summary": section_text, "key_points": [], "concept_tags": [], "definitions": [], "action_items": []}
 
         definitions = result_state.get("definitions", []) or []
         key_points = result_state.get("key_points", []) or []
         concept_tags = result_state.get("concept_tags", []) or [d["term"] for d in definitions if "term" in d]
 
-        first_timestamp = self.section_start_timestamp(entries)
-        last_timestamp = float(entries[-1].get("timestamp_epoch", first_timestamp))
-        start_time_str = self.session_clock.format_epoch_as_elapsed(first_timestamp)
-        end_time_str = self.session_clock.format_epoch_as_elapsed(last_timestamp)
+        first_ts = self.section_start_timestamp(entries)
+        last_ts = float(entries[-1].get("timestamp_epoch", first_ts))
+        start_str = self.session_clock.format_epoch_as_elapsed(first_ts)
+        end_str = self.session_clock.format_epoch_as_elapsed(last_ts)
 
-        if self.notes_path.exists() and self.load_notes_marker() >= batch.end_offset:
-            logger.info(
-                "batch ending at byte %d already written to notes, skipping append", batch.end_offset
-            )
-        else:
-            with open(self.notes_path, "a", encoding="utf-8", newline="\n") as file_handle:
-                file_handle.write(section_text)
+        if not (self.notes_path.exists() and self.load_notes_marker() >= batch.end_offset):
+            with open(self.notes_path, "a", encoding="utf-8", newline="\n") as f:
+                f.write(section_text)
             self.save_notes_marker(batch.end_offset)
             self.write_html_notes()
 
         self.sequence_number += 1
         self._batch_attempts.pop(batch.start_offset, None)
         self._batch_attempts.pop(batch.end_offset, None)
-        # The batch is finished, so the quarantined entries are written now.
-        # Writing them before the synthesis would append them again on every
-        # retry of a failed batch.
         await self.persist_quarantined_entries()
 
-        slide_references: list[int] = []
-        for entry in entries:
-            if entry.get("source_type") == "slide":
-                metadata = entry.get("metadata", {}) or {}
-                slide_num = metadata.get("slide_number")
-                if slide_num is not None:
+        slide_refs: list[int] = []
+        for e in entries:
+            if e.get("source_type") == "slide":
+                snum = (e.get("metadata", {}) or {}).get("slide_number")
+                if snum is not None:
                     try:
-                        slide_references.append(int(slide_num))
+                        slide_refs.append(int(snum))
                     except ValueError:
                         pass
 
@@ -1799,14 +1170,14 @@ class StructuringAgent:
             session_id=self.session_id,
             lecture_id=self.settings.course_name,
             sequence_number=self.sequence_number,
-            timestamp_epoch=first_timestamp,
-            start_time=start_time_str,
-            end_time=end_time_str,
-            heading=f"Section {self.sequence_number} ({start_time_str})",
+            timestamp_epoch=first_ts,
+            start_time=start_str,
+            end_time=end_str,
+            heading=f"Section {self.sequence_number} ({start_str})",
             content=section_text,
             key_points=key_points,
             concept_tags=concept_tags,
-            slide_references=slide_references,
+            slide_references=slide_refs,
             definitions=result_state.get("definitions", [])
         )
 
@@ -1818,7 +1189,7 @@ class StructuringAgent:
                 try:
                     await self.redis_bus.publish(stream_name, note_segment)
                 except Exception as error:
-                    logger.warning("failed to publish note segment to redis: %s", error)
+                    logger.warning("failed to publish note segment: %s", error)
 
         next_overlap = extract_overlap_entries(entries, OVERLAP_WINDOW_SECONDS)
         self.current_overlap = next_overlap
@@ -1836,42 +1207,33 @@ class StructuringAgent:
         return new_context
 
     async def process_all_pending(self) -> int:
-        processed_batches = 0
+        processed = 0
         max_batches = self.settings.structuring_max_batches_per_run
-        while processed_batches < max_batches:
+        while processed < max_batches:
             batches = self.read_pending_batches()
-            if len(batches) == 0:
+            if not batches:
                 break
-            state = self.load_state()
-            running_context = state["running_context"]
-            for batch in batches:
-                if processed_batches >= max_batches:
+            running_context = self.load_state()["running_context"]
+            for b in batches:
+                if processed >= max_batches:
                     break
-                running_context = await self.process_single_batch(batch, running_context)
-                processed_batches += 1
-                self.control.set_stat("batches_processed", processed_batches)
-        return processed_batches
+                running_context = await self.process_single_batch(b, running_context)
+                processed += 1
+                self.control.set_stat("batches_processed", processed)
+        return processed
 
     async def process_batch(self) -> int:
         return await self.process_all_pending()
 
     def reset_outputs(self) -> None:
         for path in (
-            self.notes_path,
-            self.notes_html_path,
-            self.context_path,
-            self.notes_marker_path,
-            self.batch_attempts_path,
-            # The quarantine belongs to the run. Leaving it behind made a
-            # reprocess append the same entries to the old file again.
-            self.quarantine_path,
+            self.notes_path, self.notes_html_path, self.context_path,
+            self.notes_marker_path, self.batch_attempts_path, self.quarantine_path
         ):
             if path.exists():
                 path.unlink()
         self.current_overlap = []
         self.sequence_number = 0
-        # A deliberate rebuild starts from scratch, so the retry counter is
-        # cleared as well.
         self._batch_attempts = {}
         if self.drift_filter is not None:
             self.drift_filter.reset()
@@ -1887,46 +1249,30 @@ class StructuringAgent:
             self.control.set_stat("consecutive_failures", self.consecutive_failures)
             logger.error("structuring pass failed (%d), will retry: %s", self.consecutive_failures, error)
             if self.consecutive_failures >= self.max_consecutive_failures:
-                # The counter used to be written but never read, so the same
-                # failing call was retried forever. Surface the condition in
-                # the heartbeat instead of retrying silently; the per-batch
-                # retry cap still guarantees forward progress.
-                logger.error(
-                    "structuring pass failed %d times in a row; the failing batch is "
-                    "retried up to %d times before falling back to the raw timeline content",
-                    self.consecutive_failures, self.max_batch_retries
-                )
                 self.control.write_heartbeat("failed")
 
     async def run(self) -> None:
         self.is_running = True
         interval = float(self.settings.structuring_interval_seconds)
-        last_pass_time = time.monotonic()
+        last_pass = time.monotonic()
         heartbeat_interval = 2.0
-        last_heartbeat_time = 0.0
+        last_heartbeat = 0.0
         while self.is_running:
             now = time.monotonic()
-            if (now - last_heartbeat_time) >= heartbeat_interval:
-                # How often each fault happened is in the heartbeat, so a
-                # fault that is said once is not forgotten. The filter is
-                # optional, so the loop cannot count on it being there.
+            if (now - last_heartbeat) >= heartbeat_interval:
                 if self.drift_filter is not None:
                     for name, count in self.drift_filter.guards().counts().items():
                         self.control.set_stat(f"fault_{name}", count)
-                if self.consecutive_failures >= self.max_consecutive_failures:
-                    # Keep reporting the failure instead of flipping straight
-                    # back to "live" on the next heartbeat.
-                    self.control.write_heartbeat("failed")
-                else:
-                    self.control.write_heartbeat("live")
-                last_heartbeat_time = now
+                state = "failed" if self.consecutive_failures >= self.max_consecutive_failures else "live"
+                self.control.write_heartbeat(state)
+                last_heartbeat = now
             if self.control.stop_requested():
                 logger.info("finalize requested, running final structuring pass")
                 await self.run_guarded_pass()
                 return
-            if (now - last_pass_time) >= interval:
+            if (now - last_pass) >= interval:
                 await self.run_guarded_pass()
-                last_pass_time = time.monotonic()
+                last_pass = time.monotonic()
             await asyncio.sleep(1.0)
 
     def stop(self) -> None:
