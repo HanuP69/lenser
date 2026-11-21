@@ -55,31 +55,69 @@ from lecturelens.core.clock import SessionClock
 from lecturelens.core.process_manager import AgentProcessManager as AgentMonitor
 from lecturelens.core.validation import is_valid_course_name, is_valid_session_id
 
+LIVE_HEARTBEAT_MAX_AGE_SECONDS: float = 15.0
+
 
 def has_cloud_provider(settings: Settings) -> bool:
-    """Whether at least one cloud provider has a key configured.
+    for provider in ("unorouter", "openrouter", "google", "gemini"):
+        for suffix in ("api_key", "api_keys"):
+            val = getattr(settings, f"{provider}_{suffix}", None)
+            if isinstance(val, str) and val.strip():
+                return True
+    return False
 
-    The chain of the hybrid mode ends at the local model, so a hybrid
-    session without a single cloud key is a local session by other means,
-    and the warning about a missing Ollama has to say so instead of
-    promising a cloud provider that is not there.
-    """
-    for key in (
-        settings.unorouter_api_key,
-        settings.unorouter_api_keys,
-        settings.openrouter_api_key,
-        settings.openrouter_api_keys,
-        settings.google_api_key,
-        settings.google_api_keys,
-        settings.gemini_api_key,
-        settings.gemini_api_keys,
-    ):
-        if isinstance(key, str) and len(key.strip()) > 0:
+
+def _process_is_alive(pid: int) -> bool:
+    if os.name == "nt":
+        try:
+            import ctypes
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                return bool(ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value == 259)
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
+def agents_are_gone(session_dir: Path) -> bool:
+    heartbeats = read_heartbeats(session_dir)
+    if not heartbeats:
+        return False
+    pids = [int(p.get("pid", 0)) for p in heartbeats.values() if str(p.get("pid", "")).isdigit()]
+    pids = [pid for pid in pids if pid > 0]
+    return bool(pids and not any(_process_is_alive(pid) for pid in pids))
+
+
+def session_has_live_agents(session_dir: Path) -> bool:
+    now = time.time()
+    for heartbeat in read_heartbeats(session_dir).values():
+        if heartbeat.get("state") in ("stopped", "finished", "failed"):
+            continue
+        if now - float(heartbeat.get("time", 0.0)) <= LIVE_HEARTBEAT_MAX_AGE_SECONDS:
             return True
     return False
 
-# How old a heartbeat may be before the agent is taken to be gone.
-LIVE_HEARTBEAT_MAX_AGE_SECONDS: float = 15.0
+
+def _remember_window(window_handle: int, window_title: Optional[str]) -> None:
+    try:
+        from lecturelens.core.env_file import set_env_value
+        set_env_value("LECTURELENS_CAPTURE_TARGET", "window")
+        set_env_value("LECTURELENS_WINDOW_HANDLE", str(window_handle))
+        if window_title:
+            set_env_value("LECTURELENS_WINDOW_TITLE", window_title)
+    except Exception as error:
+        logger.warning("the chosen window could not be remembered: %s", error)
 
 
 @app.command()
@@ -92,21 +130,12 @@ def start(
     session: Optional[str] = typer.Option(None, "--session"),
     course: Optional[str] = typer.Option(None, "--course"),
     monitor_index: Optional[int] = typer.Option(None, "--monitor"),
-    window: Optional[str] = typer.Option(
-        None,
-        "--window",
-        help="The window to record, by number or by title. Without it the whole screen is recorded."
-    ),
+    window: Optional[str] = typer.Option(None, "--window", help="The window to record, by number or title."),
     llm_mode: Optional[str] = typer.Option(None, "--llm-mode", help="local, hybrid or cloud"),
     resume: bool = typer.Option(False, "--resume", help="continue an existing session"),
     video: Optional[Path] = typer.Option(None, "--video", help="Lecture video file to process directly"),
 ) -> None:
     settings = Settings()
-
-    # The option defaults used to be exported to the agents unconditionally,
-    # so a value configured in .env (for example LECTURELENS_AUDIO_SOURCE)
-    # was always overridden by the CLI default. The options now default to
-    # None and fall back to the configured settings.
     audio_source = option_value(audio_source)
     monitor_index = option_value(monitor_index)
     llm_mode = option_value(llm_mode)
@@ -115,6 +144,7 @@ def start(
     resolved_monitor_index = monitor_index if monitor_index is not None else settings.monitor_index
     resolved_llm_mode = llm_mode if llm_mode is not None else settings.llm_mode
     video_opt = option_value(video)
+
     if video_opt is not None:
         from lecturelens.cli.commands.offline import offline
         offline(
@@ -144,19 +174,13 @@ def start(
 
     session_dir = settings.get_session_output_dir(session_id)
     if (session_dir / "session_meta.json").exists() and not resume:
-        # The check is done before the window is chosen, so a name that is
-        # already taken does not throw the choice of the window away.
         fail(f"Session '{session_id}' already exists. Use --resume to continue it or pick another name.")
 
-    # The window that is recorded is chosen before the session starts, so
-    # the screen agent records the right thing from the first frame. The
-    # question is only asked when nothing has been chosen yet.
     capture_target = "screen"
     window_handle: Optional[int] = None
     window_title: Optional[str] = None
     if not no_screen and not audio_only:
         from lecturelens.cli.window_picker import resolve_capture_target
-
         capture_target, window_handle, window_title = resolve_capture_target(
             console,
             window_query=window,
@@ -168,24 +192,15 @@ def start(
             settings.window_handle = window_handle
             settings.window_title = window_title
             if window is None:
-                # The window was chosen by answering the question, so it is
-                # remembered. The question is only asked once.
                 _remember_window(window_handle, window_title)
 
     if not check_redis(settings):
         fail(f"Redis is not reachable at {settings.redis_url}")
     if resolved_llm_mode != "cloud" and not check_ollama(settings):
         if resolved_llm_mode == "hybrid" and has_cloud_provider(settings):
-            console.print(
-                f"[yellow]Ollama is not reachable at {settings.ollama_url}. "
-                "The cloud providers carry the work; the local model is only "
-                "a fallback and will be asked when it is back.[/yellow]"
-            )
+            console.print(f"[yellow]Ollama is not reachable at {settings.ollama_url}. The cloud providers carry the work.[/yellow]")
         else:
-            console.print(
-                f"[yellow]Ollama not reachable at {settings.ollama_url}. "
-                "Capture continues; structuring will retry when it returns.[/yellow]"
-            )
+            console.print(f"[yellow]Ollama not reachable at {settings.ollama_url}. Capture continues; structuring will retry.[/yellow]")
 
     settings.create_session_directories(session_id)
     disk_warning = format_low_disk_warning(get_free_disk_bytes(settings.output_dir), settings.low_disk_bytes)
@@ -201,20 +216,12 @@ def start(
 
     should_persist = persist
     if should_persist and not check_postgres(settings):
-        console.print(
-            f"[yellow]Postgres is not reachable at {settings.postgres_url}. "
-            "Persister disabled; session will run without Postgres storage.[/yellow]"
-        )
+        console.print(f"[yellow]Postgres is not reachable at {settings.postgres_url}. Persister disabled.[/yellow]")
         should_persist = False
 
     planned_agents = plan_agents(mode, audio_only, no_screen, enable_persister=should_persist)
 
-    # An agent that cannot import what it needs dies at once and the
-    # reason is only in its log. The capture goes on and everything is
-    # recorded, but the notes are never written, so the check is done
-    # before the session starts.
     from lecturelens.cli.helpers import check_agent_dependencies
-
     dependency_problems = check_agent_dependencies(planned_agents)
     if dependency_problems:
         for problem in dependency_problems:
@@ -234,10 +241,6 @@ def start(
             "llm_mode": resolved_llm_mode,
             "audio_only": audio_only,
             "no_screen": no_screen,
-            # What was decided after the Postgres check, not what the flag
-            # asked for: a session that was started with --persist but
-            # without a reachable Postgres runs without it, and the
-            # metadata used to say otherwise.
             "persist": should_persist
         },
         planned_agents
@@ -258,12 +261,7 @@ def start(
         command = [sys.executable, "-m", module_for_agent(agent_name)]
         if agent_name != "gateway":
             command.extend(["--session", session_id, "--audio-source", resolved_audio_source])
-        monitor.register_agent(
-            agent_name,
-            command,
-            environment,
-            session_dir / "logs" / f"{agent_name}.log"
-        )
+        monitor.register_agent(agent_name, command, environment, session_dir / "logs" / f"{agent_name}.log")
         monitor.start_agent(agent_name)
 
     settings.llm_mode = resolved_llm_mode
@@ -273,86 +271,7 @@ def start(
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted.[/yellow]")
     finally:
-        # The shutdown sequence is the only path that writes the stop flags
-        # and terminates the child processes. It must run for *every* exit,
-        # otherwise a failure in the dashboard loop leaves the capture agents
-        # running with no stop flag.
         run_shutdown(monitor, session_dir, planned_agents)
-
-
-def session_has_live_agents(session_dir: Path) -> bool:
-    now = time.time()
-    for heartbeat in read_heartbeats(session_dir).values():
-        state = str(heartbeat.get("state", ""))
-        if state in ("stopped", "finished", "failed"):
-            continue
-        if now - float(heartbeat.get("time", 0.0)) <= LIVE_HEARTBEAT_MAX_AGE_SECONDS:
-            return True
-    return False
-
-
-def _remember_window(window_handle: int, window_title: Optional[str]) -> None:
-    """Keep the window that was chosen, so the question is asked once."""
-    from lecturelens.core.env_file import set_env_value
-
-    try:
-        set_env_value("LECTURELENS_CAPTURE_TARGET", "window")
-        set_env_value("LECTURELENS_WINDOW_HANDLE", str(window_handle))
-        if window_title:
-            set_env_value("LECTURELENS_WINDOW_TITLE", window_title)
-    except Exception as error:
-        logger.warning("the chosen window could not be remembered: %s", error)
-
-
-def agents_are_gone(session_dir: Path) -> bool:
-    """Whether every agent of the session has stopped.
-
-    The heartbeat files hold the process id of each agent. When none of
-    them is running any more the session cannot make any more progress,
-    so waiting for it is pointless. This happens when the process that
-    owns the session dies.
-    """
-    heartbeats = read_heartbeats(session_dir)
-    if not heartbeats:
-        return False
-    pids: list[int] = []
-    for payload in heartbeats.values():
-        try:
-            pids.append(int(payload.get("pid", 0)))
-        except (TypeError, ValueError):
-            continue
-    pids = [pid for pid in pids if pid > 0]
-    if not pids:
-        return False
-    return not any(_process_is_alive(pid) for pid in pids)
-
-
-def _process_is_alive(pid: int) -> bool:
-    if os.name == "nt":
-        try:
-            import ctypes
-
-            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
-            if not handle:
-                return False
-            try:
-                exit_code = ctypes.c_ulong()
-                if ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                    return exit_code.value == 259
-                return True
-            finally:
-                ctypes.windll.kernel32.CloseHandle(handle)
-        except Exception:
-            return True
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return True
-    return True
 
 
 @app.command()
@@ -367,30 +286,18 @@ def stop(
     session_id = resolve_session(settings, session)
     session_dir = ensure_session_exists(settings, session_id)
     if agents_are_gone(session_dir):
-        # No process of the session is alive, so a shutdown flag would
-        # never be read by anybody. A second stop on a session that ended
-        # a while ago used to clear the finished flag, wait out the whole
-        # grace period and then report that the session was "still
-        # finishing".
         if flag_exists(session_dir, SESSION_FINISHED_FLAG_NAME):
             console.print(f"[green]Session {session_id} already stopped.[/green]")
             display_session_output_summary(session_dir, console)
         else:
             console.print(f"[yellow]Session {session_id} is not running.[/yellow]")
         return
-    # The finished flag of an earlier run of the session would end the
-    # wait below immediately, so it is cleared exactly when a shutdown
-    # request goes out to agents that are actually running.
     clear_flag(session_dir, SESSION_FINISHED_FLAG_NAME)
     set_flag(session_dir, SHUTDOWN_REQUEST_FLAG_NAME)
     console.print(f"Shutdown requested for session {session_id}.")
     if not wait:
         return
-    deadline = (
-        time.monotonic() + timeout_seconds
-        if (timeout_seconds is not None and timeout_seconds > 0)
-        else None
-    )
+    deadline = (time.monotonic() + timeout_seconds) if (timeout_seconds is not None and timeout_seconds > 0) else None
     agents_gone_since: Optional[float] = None
     while deadline is None or time.monotonic() < deadline:
         if flag_exists(session_dir, SESSION_FINISHED_FLAG_NAME):
@@ -401,24 +308,13 @@ def stop(
             if agents_gone_since is None:
                 agents_gone_since = time.monotonic()
             elif time.monotonic() - agents_gone_since >= AGENTS_GONE_GRACE_SECONDS:
-                console.print(
-                    "[yellow]The agents of the session are not running any more, "
-                    "so the session cannot be finished.[/yellow]"
-                )
+                console.print("[yellow]The agents of the session are not running any more.[/yellow]")
                 break
         else:
             agents_gone_since = None
         time.sleep(1.0)
-    # The session is not killed by the timeout. The agents keep running and
-    # the notes are written when the final structuring pass is done, which
-    # takes a while when the provider is on a free tier.
-    console.print(
-        "[yellow]The session is still finishing. The notes are written when the "
-        "final structuring pass is done.[/yellow]"
-    )
-    console.print(
-        f"[yellow]Check it with: lecturelens status --session {session_id}[/yellow]"
-    )
+    console.print("[yellow]The session is still finishing. The notes are written when the final structuring pass is done.[/yellow]")
+    console.print(f"[yellow]Check it with: lecturelens status --session {session_id}[/yellow]")
     raise typer.Exit(code=1)
 
 
@@ -480,17 +376,9 @@ def export(
 
     if export_format == "html":
         from lecturelens.core.notes_html import render_notes_html
-
         destination = target_dir / f"{session_id}_notes.html"
-        notes_text = notes_path.read_text(encoding="utf-8")
-        # The pictures of the diagrams go inside the page, so that the
-        # page stands on its own.
         destination.write_text(
-            render_notes_html(
-                notes_text,
-                title=f"Lecture Notes - {session_id}",
-                base_dir=session_dir
-            ),
+            render_notes_html(notes_path.read_text(encoding="utf-8"), title=f"Lecture Notes - {session_id}", base_dir=session_dir),
             encoding="utf-8"
         )
         console.print(f"HTML: {destination}")
@@ -500,9 +388,6 @@ def export(
     destination = target_dir / f"{session_id}_notes.md"
     destination.write_bytes(notes_path.read_bytes())
     console.print(f"Markdown: {destination}")
-    # The notes point at the pictures of the diagrams by a path that is
-    # relative to them. The pictures are copied next to the notes, so
-    # that the links keep working.
     copied = copy_figure_assets(session_dir, target_dir)
     if copied > 0:
         console.print(f"Pictures: {copied} copied to {target_dir / 'assets'}")
@@ -514,8 +399,6 @@ def reprocess(
     llm_mode: Optional[str] = typer.Option(None, "--llm-mode"),
 ) -> None:
     settings = Settings()
-    # The option default used to be exported unconditionally, so the value
-    # configured in .env was always overridden.
     settings.llm_mode = llm_mode if llm_mode is not None else settings.llm_mode
     if not is_valid_session_id(session):
         fail(f"Invalid session name: {session}")
@@ -536,17 +419,13 @@ def reprocess(
             shutil.copy2(p, backup_p)
             backup_files[filename] = (p, backup_p)
 
-    # Redis reachability must be probed *outside* the event loop: check_redis()
-    # spins up its own loop via asyncio.run(), which cannot be called from
-    # inside a running loop.
     redis_reachable = check_redis(settings)
 
     async def run() -> int:
         from lecturelens.agents.structuring_agent import StructuringAgent
         from lecturelens.router.llm_router import build_router_for_task, load_router_config
 
-        bus = None
-        redis_client = None
+        bus, redis_client = None, None
         if redis_reachable:
             bus = create_redis_bus(settings, component_name="reprocess")
             redis_client = bus.client
